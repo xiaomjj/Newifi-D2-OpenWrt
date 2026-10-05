@@ -4,7 +4,7 @@ on:
   repository_dispatch:
   workflow_dispatch:
 
-# 限制单次任务，确保每次只跑一个最新的
+# 限制单次任务，确保每次只跑一个最新的，避免资源浪费
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    # 赋予写权限，以便自动创建 Release 和上传文件
+    # 赋予写权限，以便自动创建 Release 和上传固件
     permissions:
       contents: write
 
@@ -40,41 +40,43 @@ jobs:
       run: |
         cp .config openwrt/.config
         cd openwrt
+        # 更新与安装扩展 feeds，确保所有插件和依赖包声明完整
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
 
-    - name: 下载第三方依赖与软件包
+    - name: 下载第三方依赖与软件包 (Download dl)
       run: |
         cd openwrt
         make download -j8
 
-    - name: 预先编译关键底层依赖
+    - name: 预先编译关键底层依赖（解决 libselinux 缺少 pcre2.h 的报错）
       run: |
         cd openwrt
+        echo "正在强制预先编译 pcre2 依赖..."
         make package/libs/libpcre2/compile V=s || true
 
     - name: 开始多线程编译固件
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
+        echo -e "当前系统可用核心数: $(nproc)"
+        # 优先多线程并发编译；若因偶发时序报错中断，自动降级为单线程排查并输出详细日志 (V=s)
         make -j$(nproc) || make -j1 V=s
 
-    - name: 收集固件重命名以区分
+    - name: 收集并整理固件产物路径
       id: organize
       run: |
         cd openwrt/bin/targets/ramips/mt7621/
         echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
-        # 获取当前北京时间作为版本标签后缀
         echo "TAG_DATE=$(date +'\%Y\%m\%d-\%H\%M')" >> $GITHUB_ENV
 
-    - name: 提取并备份编译产物
+    - name: 提取并备份编译产物 (Artifacts - 完整包)
       uses: actions/upload-artifact@v4
       with:
-        name: OpenWrt-Newifi-D2-LEDE
-        path: ${{ env.FIRMWARE_DIR }}/*
+        name: OpenWrt-Newifi-D2-LEDE-All
+        path: ${{ env.FIRMWARE_DIR }}/
 
-    - name: 自动发布固件到 Releases 页面
+    - name: 自动发布纯净 .bin 固件到 Releases 页面
       uses: softprops/action-gh-release@v2
       with:
         tag_name: auto-build-${{ env.TAG_DATE }}
@@ -85,4 +87,7 @@ jobs:
           * **源码来源**: Lean LEDE
           * **集成插件**: PassWall + Sing-Box, Argon 主题, USB挂载, 4G/网络共享支持
           * **默认 IP**: `192.168.2.1`
-        files: ${{ env.FIRMWARE_DIR }}/*
+          * **说明**: 此处直接提供 `.bin` 格式刷机固件，免去解压烦恼。
+        files: |
+          ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
+          ${{ env.FIRMWARE_DIR }}/*factory*.bin
