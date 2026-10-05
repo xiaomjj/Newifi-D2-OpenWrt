@@ -45,7 +45,7 @@ jobs:
         cp .config openwrt/.config
         cd openwrt
         
-        # 强制将默认 LAN 口 IP 修改为 192.168.2.1，彻底解决不生效问题
+        # 强制将默认 LAN 口 IP 修改为 192.168.2.1
         sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
         
         # 更新并安装 Feeds
@@ -62,7 +62,6 @@ jobs:
       run: |
         cd openwrt
         echo -e "当前系统可用核心数: $(nproc)"
-        # 优先多线程编译；若遇偶发时序报错，自动降级为单线程排查 (V=s)
         make -j$(nproc) || make -j1 V=s
 
     - name: 收集并整理固件产物路径
@@ -70,11 +69,10 @@ jobs:
       run: |
         cd openwrt/bin/targets/ramips/mt7621/
         echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
-        # 使用纯正斜杠和纯数字获取时间戳，杜绝生成非法 Tag 字符
         TAG_TIME=$(date +'%Y%m%d-%H%M')
         echo "TAG_DATE=$TAG_TIME" >> $GITHUB_ENV
 
-    - name: 提取并备份编译产物 (Artifacts - 完整包)
+    - name: 提取并备份编译产物 (Artifacts)
       uses: actions/upload-artifact@v4
       with:
         name: OpenWrt-Newifi-D2-LEDE-All
@@ -84,13 +82,12 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: auto-build-${{ env.TAG_DATE }}
-        name: Newifi-D2 LEDE 纯净稳定固件 [${{ env.TAG_DATE }}]
+        name: Newifi-D2 LEDE 固件 (PassWall+sing-box) [${{ env.TAG_DATE }}]
         body: |
           ### 💡 固件详情
           * **设备型号**: Newifi-D2 (MT7621)
-          * **源码来源**: Lean LEDE (官方自带稳定 Feeds，零外部源干扰)
-          * **集成功能**: 默认主题、USB 打印机服务、USB 存储挂载、4G/网络共享
+          * **源码来源**: Lean LEDE + PassWall (仅 sing-box 核心)
+          * **集成功能**: 默认主题、USB 打印机、USB 存储挂载、4G/网络共享、PassWall
           * **默认 IP**: `192.168.2.1`
-          * **说明**: 极致稳定、零网络波折的纯净刷机固件。
         files: |
           ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
