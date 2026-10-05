@@ -85,9 +85,9 @@ jobs:
           ### 💡 固件详情
           * **设备型号**: Newifi-D2 (MT7621)
           * **源码来源**: Lean LEDE
-          * **集成插件**: PassWall + Sing-Box, Argon 主题, USB挂载, 4G/网络共享支持
+          * **集成功能**: 默认主题、USB 打印机服务、PassWall + Sing-Box、USB 存储挂载、4G/网络共享
           * **默认 IP**: `192.168.2.1`
-          * **说明**: 此处直接提供 `.bin` 格式刷机固件，免去解压烦恼。
+          * **说明**: 此处直接提供精简的 `.bin` 刷机固件，方便直接刷入。
         files: |
           ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
           ${{ env.FIRMWARE_DIR }}/*factory*.bin
