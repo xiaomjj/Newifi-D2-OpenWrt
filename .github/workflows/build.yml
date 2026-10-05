@@ -17,13 +17,14 @@ jobs:
     - name: 检查代码仓库
       uses: actions/checkout@v4
 
-    - name: 初始化并安装编译依赖环境
+    - name: 初始化并安装编译依赖环境（已补充 libelf 等必要库）
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -y update
         sudo -E apt-get -y install $(curl -fsSL https://is.gd/depends_ubuntu_2204)
+        sudo -E apt-get -y install libelf-dev libssl-dev
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get clean
         sudo timedatectl set-timezone "Asia/Shanghai"
