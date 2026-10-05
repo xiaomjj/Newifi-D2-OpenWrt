@@ -34,11 +34,21 @@ jobs:
       run: |
         git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
 
-    - name: 加载自定义的 .config 配置文件与自带 Feeds
+    - name: 添加 PassWall 第三方软件源
+      run: |
+        cd openwrt
+        echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
+        echo 'src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages' >> feeds.conf.default
+
+    - name: 加载自定义的 .config 配置文件与 Feeds
       run: |
         cp .config openwrt/.config
         cd openwrt
-        # 仅更新与安装源码自带的标准 feeds，彻底规避第三方源网络超时及克隆报错
+        
+        # 强制将默认 LAN 口 IP 修改为 192.168.2.1，彻底解决不生效问题
+        sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
+        
+        # 更新并安装 Feeds
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
