@@ -1,0 +1,57 @@
+name: Build Newifi-D2 LEDE
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+
+# 限制单次任务，确保每次只跑一个最新的
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 检查代码仓库
+      uses: actions/checkout@v4
+
+    - name: 初始化并安装编译依赖环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install $(curl -fsSL https://is.gd/depends_ubuntu_2204)
+        sudo -E apt-get -y autoremove --purge
+        sudo -E apt-get clean
+        sudo timedatectl set-timezone "Asia/Shanghai"
+
+    - name: 克隆 Lean 大佬的 LEDE 源码
+      run: |
+        git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
+
+    - name: 加载自定义的 .config 配置文件
+      run: |
+        cp .config openwrt/.config
+        cd openwrt
+        make defconfig
+
+    - name: 下载第三方依赖与软件包 (Download dl)
+      run: |
+        cd openwrt
+        make download -j8
+
+    - name: 开始多线程编译固件
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        # 第一次编译如果报错，会自动启用单线程详细日志重试 (V=s)
+        make -j$(nproc) || make -j1 V=s
+
+    - name: 提取并打包编译产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt-Newifi-D2-LEDE
+        path: openwrt/bin/targets/ramips/mt7621/*
