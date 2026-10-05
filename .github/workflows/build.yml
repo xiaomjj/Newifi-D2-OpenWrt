@@ -34,12 +34,11 @@ jobs:
       run: |
         git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
 
-    - name: 添加必要的第三方软件仓库源（防止插件遗漏或被删）
+    - name: 添加必要的第三方软件仓库源（带去重判断，防止重复定义报错）
       run: |
         cd openwrt
-        # 在默认 feeds 文件中追加主流插件仓库，确保 PassWall 及相关依赖 100% 稳定加载
-        echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
-        echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
+        grep -q "helloworld" feeds.conf.default || echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
+        grep -q "passwall" feeds.conf.default || echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
 
     - name: 加载自定义的 .config 配置文件与 Feeds
       run: |
@@ -91,7 +90,7 @@ jobs:
         body: |
           ### 💡 固件详情
           * **设备型号**: Newifi-D2 (MT7621)
-          * **源码来源**: Lean LEDE (自带 Feeds + 官方 PassWall 仓库源)
+          * **源码来源**: Lean LEDE (自带 Feeds + 第三方 PassWall 软件源)
           * **集成功能**: 默认主题、USB 打印机服务、PassWall + Sing-Box、USB 存储挂载、4G/网络共享
           * **默认 IP**: `192.168.2.1`
           * **说明**: 此处直接提供精简的 `.bin` 刷机固件，方便直接刷入。
