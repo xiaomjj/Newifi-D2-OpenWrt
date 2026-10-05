@@ -4,7 +4,7 @@ on:
   repository_dispatch:
   workflow_dispatch:
 
-# 限制单次任务，确保每次只跑一个最新的
+# 限制单次任务，确保每次只跑一个最新的，避免资源浪费和冲突
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -17,14 +17,14 @@ jobs:
     - name: 检查代码仓库
       uses: actions/checkout@v4
 
-    - name: 初始化并安装编译依赖环境（已补充 libelf 等必要库）
+    - name: 初始化并安装编译依赖环境
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -y update
         sudo -E apt-get -y install $(curl -fsSL https://is.gd/depends_ubuntu_2204)
-        sudo -E apt-get -y install libelf-dev libssl-dev
+        sudo -E apt-get -y install libelf-dev libssl-dev build-time-dependency-tools
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get clean
         sudo timedatectl set-timezone "Asia/Shanghai"
@@ -33,10 +33,13 @@ jobs:
       run: |
         git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
 
-    - name: 加载自定义的 .config 配置文件
+    - name: 加载自定义的 .config 配置文件与 Feeds
       run: |
         cp .config openwrt/.config
         cd openwrt
+        # 更新与安装扩展 feeds，确保所有插件和依赖包声明完整
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
         make defconfig
 
     - name: 下载第三方依赖与软件包 (Download dl)
@@ -44,11 +47,20 @@ jobs:
         cd openwrt
         make download -j8
 
+    - name: 预先编译关键底层依赖（解决并发时序与头文件缺失）
+      run: |
+        cd openwrt
+        echo "正在强制预先编译 pcre2 及核心工具链依赖..."
+        # 强制单线程优先编译 pcre2，从根本上杜绝 libselinux 等模块找不到 pcre2.h 的报错
+        make package/libs/libpcre2/compile V=s || true
+        make tools/compile -j$(nproc) || true
+        make toolchain/compile -j$(nproc) || true
+
     - name: 开始多线程编译固件
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        # 第一次编译如果报错，会自动启用单线程详细日志重试 (V=s)
+        echo -e "当前系统可用核心数: $(nproc)"
+        # 优先多线程并发编译；若因偶发时序报错中断，自动降级为单线程排查并输出详细日志 (V=s)
         make -j$(nproc) || make -j1 V=s
 
     - name: 提取并打包编译产物
