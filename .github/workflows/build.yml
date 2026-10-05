@@ -34,16 +34,19 @@ jobs:
       run: |
         git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
 
-    - name: 添加必要的第三方软件仓库源（带容错与镜像加速）
+    - name: 添加必要的第三方软件仓库源（强制清洗与绝对路径写入）
       run: |
         cd openwrt
-        # 去重追加 helloworld
-        grep -q "helloworld" feeds.conf.default || echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
+        # 1. 先清理掉可能残留或写错的错误 passwall 行
+        sed -i '/passwall/d' feeds.conf.default
         
-        # 使用加速镜像源或者官方源追加 passwall，确保能稳定克隆
-        if ! grep -q "passwall" feeds.conf.default; then
-          echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
-        fi
+        # 2. 规范追加正确的第三方源
+        grep -q "helloworld" feeds.conf.default || echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
+        echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
+        
+        # 3. 打印确认内容，方便在日志中核对
+        echo "当前 feeds.conf.default 内容："
+        cat feeds.conf.default
 
     - name: 加载自定义的 .config 配置文件与 Feeds
       run: |
