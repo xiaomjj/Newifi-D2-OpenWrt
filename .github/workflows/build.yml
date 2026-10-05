@@ -34,36 +34,16 @@ jobs:
       run: |
         git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
 
-    - name: 添加必要的第三方软件仓库源（强制清洗与绝对路径写入）
-      run: |
-        cd openwrt
-        # 1. 先清理掉可能残留或写错的错误 passwall 行
-        sed -i '/passwall/d' feeds.conf.default
-        
-        # 2. 规范追加正确的第三方源
-        grep -q "helloworld" feeds.conf.default || echo 'src-git helloworld https://github.com/fw876/helloworld' >> feeds.conf.default
-        echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >> feeds.conf.default
-        
-        # 3. 打印确认内容，方便在日志中核对
-        echo "当前 feeds.conf.default 内容："
-        cat feeds.conf.default
-
-    - name: 加载自定义的 .config 配置文件与 Feeds
+    - name: 加载自定义的 .config 配置文件与自带 Feeds
       run: |
         cp .config openwrt/.config
         cd openwrt
-        # 更新与安装扩展 feeds
+        # 仅更新与安装源码自带的标准 feeds，彻底规避第三方源网络超时及克隆报错
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
 
-    - name: 验证核心插件是否加载成功（防遗漏安全检查）
-      run: |
-        cd openwrt
-        echo "检查 PassWall 编译配置状态："
-        grep -i "passwall" .config || echo "提示: 未检测到 passwall 显式配置，请确认 .config"
-
-    - name: 下载第三方依赖与软件包 (Download dl)
+    - name: 下载依赖与软件包 (Download dl)
       run: |
         cd openwrt
         make download -j8
@@ -72,7 +52,7 @@ jobs:
       run: |
         cd openwrt
         echo -e "当前系统可用核心数: $(nproc)"
-        # 优先多线程并发编译；若因时序报错自动降级为单线程排查 (V=s)
+        # 优先多线程编译；若遇偶发时序报错，自动降级为单线程排查 (V=s)
         make -j$(nproc) || make -j1 V=s
 
     - name: 收集并整理固件产物路径
@@ -80,7 +60,7 @@ jobs:
       run: |
         cd openwrt/bin/targets/ramips/mt7621/
         echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
-        # 严格使用正斜杠和纯数字时间戳，杜绝生成非法 Tag 字符
+        # 使用纯正斜杠和纯数字获取时间戳，杜绝生成非法 Tag 字符
         TAG_TIME=$(date +'%Y%m%d-%H%M')
         echo "TAG_DATE=$TAG_TIME" >> $GITHUB_ENV
 
@@ -94,13 +74,13 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: auto-build-${{ env.TAG_DATE }}
-        name: Newifi-D2 LEDE 自动编译固件 [${{ env.TAG_DATE }}]
+        name: Newifi-D2 LEDE 纯净稳定固件 [${{ env.TAG_DATE }}]
         body: |
           ### 💡 固件详情
           * **设备型号**: Newifi-D2 (MT7621)
-          * **源码来源**: Lean LEDE (自带 Feeds + 第三方 PassWall 软件源)
-          * **集成功能**: 默认主题、USB 打印机服务、PassWall + Sing-Box、USB 存储挂载、4G/网络共享
+          * **源码来源**: Lean LEDE (官方自带稳定 Feeds，零外部源干扰)
+          * **集成功能**: 默认主题、USB 打印机服务、USB 存储挂载、4G/网络共享
           * **默认 IP**: `192.168.2.1`
-          * **说明**: 此处直接提供精简的 `.bin` 刷机固件，方便直接刷入。
+          * **说明**: 极致稳定、零网络波折的纯净刷机固件。
         files: |
           ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
