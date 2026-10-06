@@ -39,7 +39,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 更新基础 Feeds 并下载安装 PassWall 官方 Zip 源码包
+      - name: 5. 更新基础 Feeds 并直接克隆 PassWall 源码
         run: |
           cd openwrt
           
@@ -47,12 +47,12 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 2. 用 wget 直接下载 PassWall 主程序与依赖包的 main 分支 zip 压缩包 (避开 git clone 凭证错误)
-          mkdir -p package/passwall package/passwall_packages
-
-          wget -qO- https://github.com/xiaorouji/openwrt-passwall/archive/refs/heads/main.tar.gz | tar -xz -C package/passwall --strip-components=1
-          wget -qO- https://github.com/xiaorouji/openwrt-passwall-packages/archive/refs/heads/main.tar.gz | tar -xz -C package/passwall_packages --strip-components=1
-
+          # 2. 直接克隆 PassWall 官方最新源码到 package 目录下 (带重试逻辑，防止网络抖动)
+          mkdir -p package/passwall_packages package/passwall
+          
+          for i in {1..3}; do git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/passwall_packages && break || sleep 5; done
+          for i in {1..3}; do git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git package/passwall && break || sleep 5; done
+          
       - name: 6. 载入 .config 配置并设定默认 IP (192.168.2.1)
         run: |
           [ -f .config ] && cp .config openwrt/.config
