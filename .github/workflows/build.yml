@@ -1,97 +1,69 @@
-name: Build Newifi-D2 LEDE
+name: Build Newifi-D2 LEDE Full-Config
 
 on:
   repository_dispatch:
   workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
 
     steps:
     - name: 检查代码仓库
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
 
-    - name: 初始化并安装编译依赖环境
-      env:
-        DEBIAN_FRONTEND: noninteractive
+    - name: 安装编译依赖环境
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -y update
-        sudo -E apt-get -y install $(curl -fsSL https://is.gd/depends_ubuntu_2204)
-        sudo -E apt-get -y install libelf-dev libssl-dev
-        sudo -E apt-get -y autoremove --purge
-        sudo -E apt-get clean
-        sudo timedatectl set-timezone "Asia/Shanghai"
+        sudo apt-get update
+        sudo apt-get install -y build-out build-essential libncurses5-dev libncursesw5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3 python3-pip
 
-    - name: 克隆 Lean 大佬的 LEDE 源码
+    - name: 克隆 LEDE 源码
       run: |
-        git clone --depth 1 https://github.com/coolsnowwolf/lede openwrt
+        git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-    - name: 本地克隆 PassWall 第三方源码到 package 目录
+    - name: 自动下载并解压 PassWall 源码到 package 目录
       run: |
         rm -rf openwrt/package/passwall-packages openwrt/package/passwall
-        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git openwrt/package/passwall-packages
-        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git openwrt/package/passwall
+        mkdir -p openwrt/package/passwall-packages openwrt/package/passwall
+        
+        # 自动下载并解压 PassWall 依赖包
+        wget -qO passwall-packages.zip https://github.com/Openwrt-Passwall/openwrt-passwall-packages/archive/refs/heads/main.zip
+        unzip -q passwall-packages.zip -d /tmp/
+        cp -r /tmp/openwrt-passwall-packages-main/* openwrt/package/passwall-packages/
+        
+        # 自动下载并解压 PassWall 主程序
+        wget -qO passwall.zip https://github.com/Openwrt-Passwall/openwrt-passwall/archive/refs/heads/main.zip
+        unzip -q passwall.zip -d /tmp/
+        cp -r /tmp/openwrt-passwall-main/* openwrt/package/passwall/
 
-    - name: 加载自定义配置文件并强制设定网关 IP
+    - name: 注入自定义配置文件 (.config)
       run: |
-        cp .config openwrt/.config
-        cd openwrt
-        
-        # 强制将默认 LAN 口 IP 修改为 192.168.2.1，彻底解决不生效问题
-        sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
-        
-        # 更新并安装自带 Feeds
+        [ -f .config ] && cp .config openwrt/.config
+
+    - name: 更新与安装 Feeds 软件包
+      working-directory: ./openwrt
+      run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
+
+    - name: 加载配置并生成完整菜单
+      working-directory: ./openwrt
+      run: |
         make defconfig
 
-    - name: 下载源码依赖包 (Download dl)
+    - name: 开始编译固件
+      working-directory: ./openwrt
       run: |
-        cd openwrt
-        make download -j8
-
-    - name: 多线程编译固件
-      run: |
-        cd openwrt
-        echo -e "当前系统可用核心数: $(nproc)"
         make -j$(nproc) || make -j1 V=s
 
-    - name: 收集编译产物路径
-      id: organize
-      run: |
-        cd openwrt/bin/targets/ramips/mt7621/
-        echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
-        TAG_TIME=$(date +'%Y%m%d-%H%M')
-        echo "TAG_DATE=$TAG_TIME" >> $GITHUB_ENV
-
-    - name: 上传完整编译产物 (Artifacts)
-      uses: actions/upload-artifact@v4
+    - name: 收集并上传编译好的固件
+      uses: actions/upload-artifact@v3
       with:
-        name: OpenWrt-Newifi-D2-All-Features
-        path: ${{ env.FIRMWARE_DIR }}/
-
-    - name: 自动发布纯净 .bin 固件到 Releases 页面
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: auto-build-${{ env.TAG_DATE }}
-        name: Newifi-D2 LEDE 全功能定制固件 [${{ env.TAG_DATE }}]
-        body: |
-          ### 💡 固件特性清单
-          * **设备型号**: Newifi-D2 (MT7621 硬件精准锁定)
-          * **源码来源**: Lean LEDE + PassWall (本地集成 sing-box 核心)
-          * **核心功能**: 
-            - 🌍 PassWall 科学上网代理
-            - 🖨️ USB 网络打印机支持 (P910nd)
-            - 💾 USB 存储挂载 (NTFS 读写与 FAT32)
-            - 📶 4G/5G 蜂窝网络与 USB 共享
-          * **默认管理 IP**: `192.168.2.1`
-        files: |
-          ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
+        name: Newifi-D2-Firmware
+        path: openwrt/bin/targets/*/*/*.bin
