@@ -39,19 +39,17 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 更新并安装 Feeds 源，拉取 PassWall 最新源码
+      - name: 5. 配置 Feeds 并安装 PassWall 插件源
         run: |
           cd openwrt
+          
+          # 追加 PassWall 依赖仓库与主应用仓库至 feeds.conf.default
+          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
+          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
+
+          # 更新并安装所有 feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-          # 清理自带可能冲突的旧版 passwall 包
-          rm -rf feeds/packages/net/passwall*
-          rm -rf package/feeds/packages/passwall*
-
-          # 克隆 PassWall 官方最新配套源码
-          git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/openwrt-passwall-packages
-          git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git package/openwrt-passwall
 
       - name: 6. 载入 .config 配置并设定默认 IP (192.168.2.1)
         run: |
@@ -66,7 +64,7 @@ jobs:
           make download -j8
           find dl -size -1024c -exec rm -f {} +
 
-      - name: 8. 执行编译固件
+      - name: 8. 执行多线程编译固件
         run: |
           cd openwrt
           echo -e "$(nproc) 线程并行编译中..."
@@ -76,10 +74,10 @@ jobs:
         run: |
           TARGET_DIR="openwrt/bin/targets/ramips/mt7621"
           echo "FIRMWARE_DIR=$TARGET_DIR" >> $GITHUB_ENV
-          echo "================ 编译出的文件列表 ================"
-          ls -lh $TARGET_DIR/
+          echo "================ 编译出的固件清单 ================"
+          ls -lh $TARGET_DIR/*.bin || true
 
-      - name: 10. 自动发布固件到 Releases 页面
+      - name: 10. 自动发布纯净固件到 Releases 页面
         uses: softprops/action-gh-release@v2
         with:
           tag_name: auto-build-${{ env.TAG_DATE }}
