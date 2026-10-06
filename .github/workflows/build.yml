@@ -39,12 +39,13 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 更新并安装原厂 Feeds (使用 LEDE 自带 PassWall)
+      - name: 5. 引入 PassWall 官方最新 Feed 源并安装
         run: |
           cd openwrt
           
-          # 取消 helloworld 订阅源的注释（LEDE自带的科学上网套件源）
-          sed -i 's/^#\(.*helloworld\)/\1/' feeds.conf.default
+          # 追加 PassWall 官方依赖包源与主应用源 (必须显式指定 ;main 分支)
+          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
+          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
 
           # 更新并安装所有 feeds
           ./scripts/feeds update -a
@@ -84,9 +85,9 @@ jobs:
           body: |
             ### 💡 固件特性清单
             * **设备型号**: Newifi-D2 (MT7621 硬件精准锁定)
-            * **源码来源**: Lean LEDE (原生整合 PassWall / SSR-Plus)
+            * **源码来源**: Lean LEDE + PassWall 官方最新版
             * **核心功能**: 
-              - 🌍 PassWall 科学上网代理
+              - 🌍 PassWall 科学上网代理 (官方最新版)
               - 🖨️ USB 网络打印机支持 (P910nd)
               - 💾 USB 存储挂载 (NTFS 读写 / exFAT / EXT4)
               - 📶 4G/5G 蜂窝网络 / USB 共享与 WWAN 中继
