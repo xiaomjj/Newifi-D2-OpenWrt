@@ -39,18 +39,19 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 更新 Feeds 并拉取 PassWall 官方最新源码
+      - name: 5. 更新基础 Feeds 并下载安装 PassWall 官方 Zip 源码包
         run: |
           cd openwrt
           
-          # 1. 先更新安装 LEDE 原厂基础 Feeds
+          # 1. 更新并安装 LEDE 官方基础 Feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 2. 静默拉取 PassWall 官方最新主程序与依赖包到 package 目录中
-          export GIT_TERMINAL_PROMPT=0
-          git clone --depth 1 -b main https://github.com/xiaorouji/openwrt-passwall-packages.git package/passwall_packages
-          git clone --depth 1 -b main https://github.com/xiaorouji/openwrt-passwall.git package/passwall
+          # 2. 用 wget 直接下载 PassWall 主程序与依赖包的 main 分支 zip 压缩包 (避开 git clone 凭证错误)
+          mkdir -p package/passwall package/passwall_packages
+
+          wget -qO- https://github.com/xiaorouji/openwrt-passwall/archive/refs/heads/main.tar.gz | tar -xz -C package/passwall --strip-components=1
+          wget -qO- https://github.com/xiaorouji/openwrt-passwall-packages/archive/refs/heads/main.tar.gz | tar -xz -C package/passwall_packages --strip-components=1
 
       - name: 6. 载入 .config 配置并设定默认 IP (192.168.2.1)
         run: |
