@@ -36,9 +36,9 @@ jobs:
 
     - name: 本地克隆 PassWall 第三方源码到 package 目录
       run: |
-        cd openwrt/package
-        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git passwall-packages
-        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git passwall
+        export GIT_TERMINAL_PROMPT=0
+        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git ./openwrt/package/passwall-packages
+        git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git ./openwrt/package/passwall
 
     - name: 加载自定义配置文件并强制设定网关 IP
       run: |
