@@ -77,9 +77,12 @@ jobs:
           echo -e "$(nproc) 线程并行编译中..."
           make -j$(nproc) || make -j1 V=s
 
-      - name: 9. 定位固件输出目录
+      - name: 9. 定位固件输出目录并打印文件
         run: |
-          echo "FIRMWARE_DIR=openwrt/bin/targets/ramips/mt7621" >> $GITHUB_ENV
+          FIRMWARE_DIR="openwrt/bin/targets/ramips/mt7621"
+          echo "FIRMWARE_DIR=$FIRMWARE_DIR" >> $GITHUB_ENV
+          echo "================ 编译出的固件列表 ================"
+          ls -lh $FIRMWARE_DIR/*.bin
 
       - name: 10. 自动发布纯净 .bin 固件到 Releases 页面
         uses: softprops/action-gh-release@v2
@@ -98,4 +101,4 @@ jobs:
               - 🛠️ UPnP / DDNS / Samba4 / ZeroTier / 网页终端 TTYD
             * **默认管理 IP**: `192.168.2.1`
           files: |
-            ${{ env.FIRMWARE_DIR }}/*sysupgrade*.bin
+            ${{ env.FIRMWARE_DIR }}/*.bin
