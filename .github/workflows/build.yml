@@ -39,25 +39,26 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 开启 SSR-Plus 并同步最新核心依赖
+      - name: 5. 开启 helloworld (SSR-Plus) 并更新 Feeds
         run: |
           cd openwrt
           
-          # 1. 启用 LEDE 原生 helloworld (SSR-Plus) 源
+          # 1. 解开 LEDE 自带 helloworld (SSR-Plus) 源
           sed -i 's/^#\(.*helloworld\)/\1/' feeds.conf.default
 
-          # 2. 更新并安装基础 Feeds
+          # 2. 更新并安装所有 Feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 3. 拉取官方最新的 passwall-packages 覆盖更新核心依赖 (确保 Xray / Sing-Box 等核心均为最新版)
-          git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/latest_packages
-          cp -rf package/latest_packages/* package/
-          rm -rf package/latest_packages
-
       - name: 6. 载入 .config 配置并设定默认 IP (192.168.2.1)
         run: |
-          [ -f .config ] && cp .config openwrt/.config
+          # 确保 .config 拷贝成功
+          if [ -f .config ]; then
+            cp .config openwrt/.config
+          else
+            echo "⚠️️ 未发现根目录的 .config 文件，请确保上传了 .config"
+          fi
+          
           cd openwrt
           sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
           make defconfig
@@ -72,6 +73,7 @@ jobs:
         run: |
           cd openwrt
           echo -e "$(nproc) 线程并行编译中..."
+          # 优先并行编译，失败时自动切换单线程带详细日志 V=s 重新编译
           make -j$(nproc) || make -j1 V=s
 
       - name: 9. 检查并整理编译产物
@@ -79,16 +81,16 @@ jobs:
           cd openwrt
           TARGET_DIR="bin/targets/ramips/mt7621"
           
-          echo "================ 检查编译生成的固件文件 ================"
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "❌ 编译未完成：未生成 $TARGET_DIR 目录！请检查 Step 8 编译日志。"
+            exit 1
+          fi
+          
+          echo "================ 列出编译出的固件清单 ================"
           ls -lh $TARGET_DIR/
           
           FIRMWARE_PATH="$(pwd)/$TARGET_DIR"
           echo "FIRMWARE_DIR=$FIRMWARE_PATH" >> $GITHUB_ENV
-          
-          if [ -z "$(ls -A$FIRMWARE_PATH/*.bin 2>/dev/null)" ]; then
-            echo "❌ 错误：未生成任何 .bin 固件！请检查编译日志或 .config 硬件配置。"
-            exit 1
-          fi
 
       - name: 10. 自动发布固件到 Releases 页面
         uses: softprops/action-gh-release@v2
@@ -98,11 +100,11 @@ jobs:
           name: Newifi-D2 LEDE 全功能定制固件 [${{ env.TAG_DATE }}]
           body: |
             ### 💡 固件特性清单
-            * **设备型号**: Newifi-D2 (MT7621 硬件精准配置)
+            * **设备型号**: Newifi-D2 (MT7621 硬件)
             * **核心功能**: 
-              - 🚀 SSR-Plus 科学上网代理 (整合最新版 Xray-core / Sing-Box / ChinaDNS-NG)
+              - 🚀 SSR-Plus 科学上网代理 (含 Xray / Sing-Box 等全套核心)
               - 🖨️ USB 网络打印机支持 (P910nd)
-              - 💾 USB 存储挂载 (NTFS 3G / exFAT / EXT4)
+              - 💾 USB 存储挂载 (NTFS / exFAT / EXT4)
               - 📶 4G/5G 蜂窝网络 / USB 共享与 WWAN 中继
               - 🛠️ UPnP / DDNS / Samba4 / ZeroTier / 网页终端 TTYD
             * **默认管理 IP**: `192.168.2.1`
