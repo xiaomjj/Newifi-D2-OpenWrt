@@ -39,20 +39,22 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/coolsnowwolf/lede.git openwrt
 
-      - name: 5. 更新基础 Feeds 并直接克隆 PassWall 源码
+      - name: 5. 开启 SSR-Plus 并同步最新核心依赖
         run: |
           cd openwrt
           
-          # 1. 更新并安装 LEDE 官方基础 Feeds
+          # 1. 启用 LEDE 原生 helloworld (SSR-Plus) 源
+          sed -i 's/^#\(.*helloworld\)/\1/' feeds.conf.default
+
+          # 2. 更新并安装基础 Feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 2. 直接克隆 PassWall 官方最新源码到 package 目录下 (带重试逻辑，防止网络抖动)
-          mkdir -p package/passwall_packages package/passwall
-          
-          for i in {1..3}; do git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/passwall_packages && break || sleep 5; done
-          for i in {1..3}; do git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git package/passwall && break || sleep 5; done
-          
+          # 3. 拉取官方最新的 passwall-packages 覆盖更新核心依赖 (确保 Xray / Sing-Box 等核心均为最新版)
+          git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git package/latest_packages
+          cp -rf package/latest_packages/* package/
+          rm -rf package/latest_packages
+
       - name: 6. 载入 .config 配置并设定默认 IP (192.168.2.1)
         run: |
           [ -f .config ] && cp .config openwrt/.config
@@ -74,24 +76,33 @@ jobs:
 
       - name: 9. 检查并整理编译产物
         run: |
-          TARGET_DIR="openwrt/bin/targets/ramips/mt7621"
-          echo "FIRMWARE_DIR=$TARGET_DIR" >> $GITHUB_ENV
-          echo "================ 编译出的固件清单 ================"
-          ls -lh $TARGET_DIR/*.bin || true
+          cd openwrt
+          TARGET_DIR="bin/targets/ramips/mt7621"
+          
+          echo "================ 检查编译生成的固件文件 ================"
+          ls -lh $TARGET_DIR/
+          
+          FIRMWARE_PATH="$(pwd)/$TARGET_DIR"
+          echo "FIRMWARE_DIR=$FIRMWARE_PATH" >> $GITHUB_ENV
+          
+          if [ -z "$(ls -A$FIRMWARE_PATH/*.bin 2>/dev/null)" ]; then
+            echo "❌ 错误：未生成任何 .bin 固件！请检查编译日志或 .config 硬件配置。"
+            exit 1
+          fi
 
       - name: 10. 自动发布固件到 Releases 页面
         uses: softprops/action-gh-release@v2
+        if: env.FIRMWARE_DIR != '' && !cancelled()
         with:
           tag_name: auto-build-${{ env.TAG_DATE }}
           name: Newifi-D2 LEDE 全功能定制固件 [${{ env.TAG_DATE }}]
           body: |
             ### 💡 固件特性清单
-            * **设备型号**: Newifi-D2 (MT7621 硬件精准锁定)
-            * **源码来源**: Lean LEDE + PassWall 官方最新版
+            * **设备型号**: Newifi-D2 (MT7621 硬件精准配置)
             * **核心功能**: 
-              - 🌍 PassWall 科学上网代理 (官方最新版)
+              - 🚀 SSR-Plus 科学上网代理 (整合最新版 Xray-core / Sing-Box / ChinaDNS-NG)
               - 🖨️ USB 网络打印机支持 (P910nd)
-              - 💾 USB 存储挂载 (NTFS 读写 / exFAT / EXT4)
+              - 💾 USB 存储挂载 (NTFS 3G / exFAT / EXT4)
               - 📶 4G/5G 蜂窝网络 / USB 共享与 WWAN 中继
               - 🛠️ UPnP / DDNS / Samba4 / ZeroTier / 网页终端 TTYD
             * **默认管理 IP**: `192.168.2.1`
