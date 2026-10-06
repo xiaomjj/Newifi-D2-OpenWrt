@@ -1,4 +1,4 @@
-name: Build Newifi-D2 LEDE Full-Config
+name: Build Newifi-D2 LEDE
 
 on:
   repository_dispatch:
@@ -36,8 +36,7 @@ jobs:
 
     - name: 本地克隆 PassWall 第三方源码到 package 目录
       run: |
-        mkdir -p openwrt/package/passwall-packages
-        mkdir -p openwrt/package/passwall
+        rm -rf openwrt/package/passwall-packages openwrt/package/passwall
         git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages.git openwrt/package/passwall-packages
         git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall.git openwrt/package/passwall
 
