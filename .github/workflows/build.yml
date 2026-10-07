@@ -15,6 +15,8 @@ env:
   REPO_BRANCH: master
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
+  # Newifi-D2 闪存为 32MB，安全上限设为 31.5MB (33030144 bytes) 以防刷入变砖
+  MAX_FIRMWARE_SIZE: 33030144
 
 jobs:
   build:
@@ -28,13 +30,14 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # 清理不必要的预装软件，释放磁盘空间
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/powershell /usr/local/share/chromium \
             /usr/local/news /usr/local/doc
           df -h
 
           sudo apt-get update
-
+          # 安装 OpenWrt 编译依赖
           sudo apt-get -y install \
             ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
             bzip2 ccache cmake cpio curl device-tree-compiler dwarves fastjar flex gawk gettext \
@@ -61,16 +64,27 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH openwrt
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: 4. 更新与安装软件源 (Feeds)
+      - name: 4. 缓存 ccache 和 dl 依赖包 (加速后续编译)
+        uses: actions/cache@v4
+        with:
+          path: |
+            /workdir/openwrt/.ccache
+            /workdir/openwrt/dl
+          key: ${{ runner.os }}-openwrt-${{ hashFiles('newifi-d2.config') }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-
+
+      - name: 5. 更新与安装软件源 (Feeds)
         run: |
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 5. 加载自定义配置文件
+      - name: 6. 加载自定义配置文件
         run: |
           if [ ! -f "$CONFIG_FILE" ]; then
-            echo "错误：未找到配置文件 $CONFIG_FILE"
+            echo "❌ 错误：未找到配置文件 $CONFIG_FILE"
+            echo "请确保仓库根目录下存在该文件。"
             exit 1
           fi
 
@@ -78,69 +92,107 @@ jobs:
           cd openwrt
           make defconfig
 
-      - name: 6. 修改默认管理 IP 为 192.168.2.1
+      - name: 7. 修改默认管理 IP 为 192.168.2.1
         run: |
           cd openwrt
-          sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate
-          sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/etc/config/network
-          echo "默认管理 IP 已改为 192.168.2.1"
+          echo "🔧 正在修改默认管理 IP..."
+          
+          # 修改核心生成脚本（首次启动时生成 network 配置的源头）
+          CONFIG_GEN="package/base-files/files/bin/config_generate"
+          if [ -f "$CONFIG_GEN" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$CONFIG_GEN"
+            echo "✅ 已修改 config_generate"
+          else
+            echo "⚠️ 警告：未找到 config_generate，跳过修改。"
+          fi
+          
+          # 如果存在预置的 network 配置文件，也一并修改（容错处理，防止报错中断）
+          NETWORK_CONF="package/base-files/files/etc/config/network"
+          if [ -f "$NETWORK_CONF" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NETWORK_CONF"
+            echo "✅ 已修改预置 network 配置文件"
+          else
+            echo "ℹ️ 未找到预置 network 文件（这是正常的，系统会动态生成）。"
+          fi
 
-      - name: 7. 下载预编译依赖包
+      - name: 8. 下载预编译依赖包
         run: |
           cd openwrt
           make download -j8
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 8. 开始编译固件
+      - name: 9. 开始编译固件
         id: compile
         run: |
           cd openwrt
-          echo "Starting build with $(nproc) threads..."
-
+          echo "🚀 开始编译，使用 $(nproc) 线程..."
+          
+          # 尝试并行编译，失败则使用单线程详细日志重试
           if make -j$(nproc); then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "并行编译失败，使用单线程详细日志重试..."
-            make -j1 V=s
-            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 并行编译失败，使用单线程详细日志重试..."
+            if make -j1 V=s; then
+              echo "status=success" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ 编译彻底失败，请查看日志排查。"
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
           fi
 
-      - name: 9. 检查固件大小是否超过 32MB
+      - name: 10. 检查固件大小 (32MB 闪存硬限制)
         id: check_size
         if: steps.compile.outputs.status == 'success' && !cancelled()
         run: |
           cd openwrt/bin/targets/ramips/mt7621
-          FIRMWARE=$(ls *.bin | head -n 1)
-          SIZE=$(stat -c%s "$FIRMWARE")
-          MAX_SIZE=$((32 * 1024 * 1024))
-          echo "固件 $FIRMWARE 大小: $((SIZE / 1024 / 1024)) MB"
-          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
-            echo "错误：固件超过 32MB，无法刷入 Newifi-D2！请进一步精简配置。"
+          
+          # 查找 sysupgrade 固件
+          FIRMWARE=$(ls *sysupgrade.bin 2>/dev/null | head -n 1)
+          
+          if [ -z "$FIRMWARE" ]; then
+            echo "❌ 错误：未找到 sysupgrade.bin 固件文件！"
             exit 1
           fi
-          echo "固件大小符合要求。"
+          
+          SIZE=$(stat -c%s "$FIRMWARE")
+          SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+          MAX_MB=$(echo "scale=2; $MAX_FIRMWARE_SIZE / 1024 / 1024" | bc)
+          
+          echo "📦 固件: $FIRMWARE"
+          echo "📊 大小: ${SIZE_MB} MB (最大允许: ${MAX_MB} MB)"
+          
+          if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then
+            echo "❌ 错误：固件超过 32MB，无法刷入 Newifi-D2！请进一步精简配置。"
+            echo "建议：移除 luci-app-ssr-plus 或减少内核模块。"
+            exit 1
+          fi
+          echo "✅ 固件大小符合要求。"
 
-      - name: 10. 整理固件产物
+      - name: 11. 整理固件产物
         id: organize
         if: steps.check_size.outcome == 'success' && !cancelled()
         run: |
           cd openwrt/bin/targets/ramips/mt7621
           rm -rf packages
+          
           echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
+          
           TAG_DATE=$(date +'%Y.%m.%d-%H%M')
           echo "TAG_DATE=$TAG_DATE" >> "$GITHUB_ENV"
+          
           echo "status=success" >> "$GITHUB_OUTPUT"
 
-      - name: 11. 上传固件至 Artifacts
+      - name: 12. 上传固件至 Artifacts (临时保存)
         uses: actions/upload-artifact@v4
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
           name: OpenWrt_NewifiD2_Firmware
-          path: ${{ env.FIRMWARE_PATH }}
+          path: ${{ env.FIRMWARE_PATH }}/*.bin
           if-no-files-found: error
 
-      - name: 12. 自动创建并发布 GitHub Release
+      - name: 13. 自动创建并发布 GitHub Release
         uses: softprops/action-gh-release@v2
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
