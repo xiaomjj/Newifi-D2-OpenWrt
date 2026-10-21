@@ -15,7 +15,8 @@ env:
   REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
-  MAX_FIRMWARE_SIZE: 33030144 # 31.5 MB 生死线
+  # Newifi-D2 闪存硬限制，安全上限设为 31.5MB (33030144 bytes)
+  MAX_FIRMWARE_SIZE: 33030144
 
 jobs:
   build:
@@ -77,36 +78,28 @@ jobs:
           echo "🔍 检查是否意外引入了 Rust..."
           grep "CONFIG_PACKAGE_rust" .config || echo "✅ 未发现强制 Rust 依赖。"
 
-      - name: 7. 修改默认 IP 为 192.168.2.1
+      - name: 7. 修改默认 IP 为 192.168.2.1 (兼容新版路径)
         run: |
           cd openwrt
           echo "🔧 正在修改默认管理 IP..."
-          
-          # 定义可能存在的两个文件路径
           OLD_PATH="package/base-files/files/bin/config_generate"
           NEW_PATH="package/base-files/luci2/bin/config_generate"
-          
           MODIFIED=false
           
-          # 优先尝试新路径 (ImmortalWrt 24.10 等新版)
           if [ -f "$NEW_PATH" ]; then
             sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NEW_PATH"
             echo "✅ 已通过新路径修改: $NEW_PATH"
             MODIFIED=true
-          # 如果新路径不存在，再尝试旧路径
           elif [ -f "$OLD_PATH" ]; then
             sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$OLD_PATH"
             echo "✅ 已通过旧路径修改: $OLD_PATH"
             MODIFIED=true
           fi
           
-          # 如果两个文件都没找到，则输出警告，但**不退出**，让编译继续
           if [ "$MODIFIED" = false ]; then
             echo "⚠️ 警告：未找到 config_generate 文件，跳过 IP 修改。"
-            echo "   这不影响编译，固件将使用默认 IP (192.168.1.1)"
           fi
           
-          # 同时，为了兼容性，可以尝试修改 network 配置文件
           NETWORK_CONF="package/base-files/files/etc/config/network"
           if [ -f "$NETWORK_CONF" ]; then
             sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NETWORK_CONF"
@@ -173,9 +166,10 @@ jobs:
           
           if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then
             echo "❌ 错误：固件体积超限，刷入会变砖！"
-            echo "👉 此时已无退路，请立刻修改 newifi-d2.config，优先移除："
-            echo "   1. CONFIG_PACKAGE_ntfs-3g=y (如果你只用 ext4/exfat U盘)"
-            echo "   2. CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=y (只留核心)"
+            echo "👉 请修改 newifi-d2.config，按优先级移除以下体积大户："
+            echo "   1. CONFIG_PACKAGE_ntfs-3g=y (若只需 ext4/exfat 挂载)"
+            echo "   2. CONFIG_PACKAGE_luci-app-eqos=y (内网限速)"
+            echo "   3. CONFIG_PACKAGE_luci-app-vsftpd=y (FTP 共享)"
             exit 1
           fi
           echo "✅ 大小合规，可以安全刷入。"
@@ -196,14 +190,15 @@ jobs:
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
           tag_name: Newifi-D2-Ultimate-${{ env.TAG_DATE }}
-          name: Newifi-D2 满血终极版固件 [${{ env.TAG_DATE }}]
+          name: Newifi-D2 终极全能版固件 [${{ env.TAG_DATE }}]
           body: |
             ### 💡 固件特性
             * **源码**: ImmortalWrt (`openwrt-24.10`)
-            * **代理**: PassWall 满血版 (Xray + 插件 + 透明代理)
-            * **USB**: 完整存储(NTFS/exFAT) + QMI/MBIM 4G/5G 拨号 + 手机共享
+            * **代理**: PassWall 满血版 (Xray + 插件)
+            * **USB**: 完整存储(NTFS/exFAT) + 自动挂载
+            * **网络**: 支持无线中继 (Relayd) / EQOS 限速 / UPnP
+            * **工具**: 流量监控 / 定时WiFi / FTP共享 / WOL / DDNS / TTYD
             * **默认 IP**: `192.168.2.1`
-            * **警告**: 固件体积处于 32MB 极限边缘。如果后续需要安装其他插件，建议使用 U 盘扩容 (Extroot)。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
