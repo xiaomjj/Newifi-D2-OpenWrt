@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2 Ultimate
+name: Build ImmortalWrt Newifi-D2 Stable
 
 on:
   workflow_dispatch:
@@ -15,8 +15,8 @@ env:
   REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
-  # Newifi-D2 闪存硬限制，安全上限设为 31.5MB (33030144 bytes)
-  MAX_FIRMWARE_SIZE: 33030144
+  MAX_FIRMWARE_SIZE: 33030144 # 31.5 MB
+  CCACHE_DIR: /workdir/openwrt/.ccache
 
 jobs:
   build:
@@ -33,13 +33,9 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/powershell /usr/local/share/chromium /usr/local/news /usr/local/doc
           df -h
-
-          echo "🚀 安装编译依赖..."
           sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.eu.org/init_build_environment.sh)'
-          
           sudo ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
           echo "$TZ" | sudo tee /etc/timezone > /dev/null
-
           sudo mkdir -p /workdir
           sudo chown -R "$USER":"$USER" /workdir
 
@@ -49,7 +45,7 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none openwrt
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: 4. 缓存 CCache 与 dl 依赖包
+      - name: 4. 缓存 CCache 与 dl
         uses: actions/cache@v4
         with:
           path: |
@@ -68,70 +64,66 @@ jobs:
       - name: 6. 加载配置并检查
         run: |
           if [ ! -f "$CONFIG_FILE" ]; then
-            echo "❌ 未找到配置文件 $CONFIG_FILE"
+            echo "❌ 未找到 $CONFIG_FILE"
             exit 1
           fi
           mv "$CONFIG_FILE" openwrt/.config
           cd openwrt
-          make defconfig
-          
-          echo "🔍 检查是否意外引入了 Rust..."
-          grep "CONFIG_PACKAGE_rust" .config || echo "✅ 未发现强制 Rust 依赖。"
 
-      - name: 7. 修改默认 IP 为 192.168.2.1 (兼容新版路径)
+          grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
+          make defconfig
+
+          echo "🔍 关键项检查..."
+          grep -q '^CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y' .config \
+            && echo "✅ PassWall Nftables 透明代理已启用" \
+            || { echo "❌ PassWall Nftables 透明代理未启用"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_miniupnpd-nftables=y' .config \
+            && echo "✅ miniupnpd-nftables 已启用" \
+            || { echo "❌ miniupnpd-nftables 未启用"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_miniupnpd is not set' .config \
+            && echo "✅ 泛指 miniupnpd 已关闭" \
+            || echo "⚠️ 泛指 miniupnpd 状态需确认"
+
+          grep -q '^CONFIG_PACKAGE_zram-swap=y' .config \
+            && echo "✅ ZRAM 已启用" \
+            || echo "⚠️ ZRAM 未启用"
+
+      - name: 7. 修改默认 IP 为 192.168.2.1
         run: |
           cd openwrt
-          echo "🔧 正在修改默认管理 IP..."
           OLD_PATH="package/base-files/files/bin/config_generate"
           NEW_PATH="package/base-files/luci2/bin/config_generate"
           MODIFIED=false
-          
           if [ -f "$NEW_PATH" ]; then
             sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NEW_PATH"
-            echo "✅ 已通过新路径修改: $NEW_PATH"
             MODIFIED=true
           elif [ -f "$OLD_PATH" ]; then
             sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$OLD_PATH"
-            echo "✅ 已通过旧路径修改: $OLD_PATH"
             MODIFIED=true
           fi
-          
-          if [ "$MODIFIED" = false ]; then
-            echo "⚠️ 警告：未找到 config_generate 文件，跳过 IP 修改。"
-          fi
-          
-          NETWORK_CONF="package/base-files/files/etc/config/network"
-          if [ -f "$NETWORK_CONF" ]; then
-            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NETWORK_CONF"
-            echo "✅ 已修改 network 配置文件"
-          fi
+          [ "$MODIFIED" = true ] && echo "✅ 默认 IP 已修改" || echo "⚠️ 未找到 config_generate"
 
       - name: 8. 配置 CCache 并下载源码
         run: |
           cd openwrt
+          mkdir -p "$CCACHE_DIR"
           ccache -M 2G
           ccache -s
-          echo "📥 下载依赖包..."
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 9. 开始编译 (带日志记录)
+      - name: 9. 开始编译固件 (并行 + 内存保护)
         id: compile
         run: |
           cd openwrt
-          echo "🚀 开始编译，使用 $(nproc) 线程..."
-          if make -j$(nproc) > build.log 2>&1; then
+          echo "🚀 使用 -j4 并行编译，单进程虚拟内存限制 3GB..."
+          if (ulimit -v 3000000; make -j4 V=s > build.log 2>&1); then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "⚠️ 并发失败，单线程重试..."
-            if make -j1 V=s > build_single.log 2>&1; then
-              echo "status=success" >> "$GITHUB_OUTPUT"
-            else
-              echo "❌ 编译彻底失败！"
-              echo "status=failed" >> "$GITHUB_OUTPUT"
-              tail -n 200 build_single.log
-              exit 1
-            fi
+            echo "❌ 编译失败！"
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            tail -n 200 build.log
+            exit 1
           fi
 
       - name: 9.5 失败时上传日志
@@ -139,49 +131,36 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
-          path: |
-            openwrt/build.log
-            openwrt/build_single.log
+          path: openwrt/build.log
 
-      - name: 10. 严格检查固件体积 (防变砖核心环节)
+      - name: 10. 检查固件体积
         id: check_size
         if: steps.compile.outputs.status == 'success' && !cancelled()
         run: |
           cd openwrt/bin/targets/ramips/mt7621
           FIRMWARE=$(ls *sysupgrade.bin 2>/dev/null | head -n 1)
-          if [ -z "$FIRMWARE" ]; then
-            echo "❌ 未找到 sysupgrade.bin！"
-            exit 1
-          fi
-          
+          [ -z "$FIRMWARE" ] && { echo "❌ 未找到 sysupgrade.bin"; exit 1; }
           SIZE=$(stat -c%s "$FIRMWARE")
           SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
           MAX_MB=$(echo "scale=2; $MAX_FIRMWARE_SIZE / 1024 / 1024" | bc)
           REMAINING=$(echo "scale=2; ($MAX_FIRMWARE_SIZE - $SIZE) / 1024 / 1024" | bc)
-          
-          echo "📦 固件: $FIRMWARE"
-          echo "📊 当前大小: ${SIZE_MB} MB"
-          echo "🛑 允许上限: ${MAX_MB} MB"
-          echo "💾 剩余安全空间: ${REMAINING} MB"
-          
+
+          echo "📦 $FIRMWARE"
+          echo "📊 ${SIZE_MB} MB / 上限 ${MAX_MB} MB / 剩余 ${REMAINING} MB"
+
           if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then
-            echo "❌ 错误：固件体积超限，刷入会变砖！"
-            echo "👉 请修改 newifi-d2.config，按优先级移除以下体积大户："
-            echo "   1. CONFIG_PACKAGE_ntfs-3g=y (若只需 ext4/exfat 挂载)"
-            echo "   2. CONFIG_PACKAGE_luci-app-eqos=y (内网限速)"
-            echo "   3. CONFIG_PACKAGE_luci-app-vsftpd=y (FTP 共享)"
+            echo "❌ 超限，刷入会变砖！"
             exit 1
           fi
-          echo "✅ 大小合规，可以安全刷入。"
-          
+          echo "✅ 大小合规"
           echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
           echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
 
-      - name: 11. 上传固件至 Artifacts
+      - name: 11. 上传 Artifacts
         uses: actions/upload-artifact@v4
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
-          name: ImmortalWrt_NewifiD2_Ultimate
+          name: ImmortalWrt_NewifiD2_Stable
           path: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
           if-no-files-found: error
 
@@ -189,16 +168,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
-          tag_name: Newifi-D2-Ultimate-${{ env.TAG_DATE }}
-          name: Newifi-D2 终极全能版固件 [${{ env.TAG_DATE }}]
+          tag_name: Newifi-D2-Stable-${{ env.TAG_DATE }}
+          name: Newifi-D2 精简稳定版 [${{ env.TAG_DATE }}]
           body: |
-            ### 💡 固件特性
-            * **源码**: ImmortalWrt (`openwrt-24.10`)
-            * **代理**: PassWall 满血版 (Xray + 插件)
-            * **USB**: 完整存储(NTFS/exFAT) + 自动挂载
-            * **网络**: 支持无线中继 (Relayd) / EQOS 限速 / UPnP
-            * **工具**: 流量监控 / 定时WiFi / FTP共享 / WOL / DDNS / TTYD
+            ### 固件特性
+            * **源码**: ImmortalWrt `openwrt-24.10`
+            * **代理**: PassWall + Xray（**nftables 透明代理**）
+            * **网络**: WWAN 无线中继 / USB 手机共享 (RNDIS/CDC/iPhone)
+            * **工具**: DDNS (DNSPod) / TTYD / 定时重启 / UPnP (nftables)
+            * **优化**: ZRAM / 默认主题 / IPv6 用户态裁剪 / 并行编译
             * **默认 IP**: `192.168.2.1`
+            * **注意**: 已剔除 NTFS、iptables/ipset、Turbo ACC。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
