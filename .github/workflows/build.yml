@@ -75,20 +75,24 @@ jobs:
 
           echo "🔍 关键项检查..."
 
-          # PassWall Nftables 透明代理：缺失则自动补全
-          if grep -q '^CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y' .config; then
-            echo "✅ PassWall Nftables 透明代理已启用"
+          # PassWall2 Nftables 透明代理
+          if grep -q '^CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy=y' .config; then
+            echo "✅ PassWall2 Nftables 透明代理已启用"
           else
-            echo "⚠️ PassWall Nftables 透明代理未启用，尝试自动补全..."
-            echo 'CONFIG_PACKAGE_firewall4=y' >> .config
-            echo 'CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y' >> .config
+            echo "⚠️ PassWall2 Nftables 透明代理未启用，尝试自动补全..."
+            echo 'CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy=y' >> .config
+            echo 'CONFIG_PACKAGE_dnsmasq_full_nftset=y' >> .config
             make defconfig
-            grep -q '^CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y' .config \
-              && echo "✅ 自动补全后 Nftables 透明代理已启用" \
-              || echo "⚠️ 自动补全失败，请检查 newifi-d2.config 中 firewall4 相关配置"
+            grep -q '^CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy=y' .config \
+              && echo "✅ 补全成功" \
+              || echo "⚠️ 补全失败，请检查源码是否支持"
           fi
 
-          # miniupnpd-nftables 检查（警告，不阻断）
+          # 检查其他关键依赖
+          grep -q '^CONFIG_PACKAGE_dnsmasq_full_nftset=y' .config \
+            && echo "✅ dnsmasq-full nftset 已启用" \
+            || echo "⚠️ dnsmasq-full nftset 未启用"
+
           grep -q '^CONFIG_PACKAGE_miniupnpd-nftables=y' .config \
             && echo "✅ miniupnpd-nftables 已启用" \
             || echo "⚠️ miniupnpd-nftables 未启用"
@@ -182,12 +186,12 @@ jobs:
           body: |
             ### 固件特性
             * **源码**: ImmortalWrt `openwrt-24.10`
-            * **代理**: PassWall + Xray（**nftables 透明代理**）
+            * **代理**: PassWall2 + Xray（**Nftables 透明代理**）
             * **网络**: WWAN 无线中继 / USB 手机共享 (RNDIS/CDC/iPhone)
             * **工具**: DDNS (DNSPod) / TTYD / 定时重启 / UPnP (nftables)
             * **优化**: ZRAM / 默认主题 / IPv6 用户态裁剪 / 并行编译
             * **默认 IP**: `192.168.2.1`
-            * **注意**: 已剔除 NTFS、iptables/ipset、Turbo ACC。
+            * **注意**: 已剔除 NTFS、iptables/ipset、Turbo ACC。PassWall2 完美适配 nftables 环境。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
