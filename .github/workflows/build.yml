@@ -80,10 +80,38 @@ jobs:
       - name: 7. 修改默认 IP 为 192.168.2.1
         run: |
           cd openwrt
-          CONFIG_GEN="package/base-files/files/bin/config_generate"
-          [ -f "$CONFIG_GEN" ] && sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$CONFIG_GEN"
+          echo "🔧 正在修改默认管理 IP..."
+          
+          # 定义可能存在的两个文件路径
+          OLD_PATH="package/base-files/files/bin/config_generate"
+          NEW_PATH="package/base-files/luci2/bin/config_generate"
+          
+          MODIFIED=false
+          
+          # 优先尝试新路径 (ImmortalWrt 24.10 等新版)
+          if [ -f "$NEW_PATH" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NEW_PATH"
+            echo "✅ 已通过新路径修改: $NEW_PATH"
+            MODIFIED=true
+          # 如果新路径不存在，再尝试旧路径
+          elif [ -f "$OLD_PATH" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$OLD_PATH"
+            echo "✅ 已通过旧路径修改: $OLD_PATH"
+            MODIFIED=true
+          fi
+          
+          # 如果两个文件都没找到，则输出警告，但**不退出**，让编译继续
+          if [ "$MODIFIED" = false ]; then
+            echo "⚠️ 警告：未找到 config_generate 文件，跳过 IP 修改。"
+            echo "   这不影响编译，固件将使用默认 IP (192.168.1.1)"
+          fi
+          
+          # 同时，为了兼容性，可以尝试修改 network 配置文件
           NETWORK_CONF="package/base-files/files/etc/config/network"
-          [ -f "$NETWORK_CONF" ] && sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NETWORK_CONF"
+          if [ -f "$NETWORK_CONF" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$NETWORK_CONF"
+            echo "✅ 已修改 network 配置文件"
+          fi
 
       - name: 8. 配置 CCache 并下载源码
         run: |
