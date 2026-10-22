@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # ... (步骤1到9保持不变，确保清理干净) ...
       - name: 1. 检出源码仓库
         uses: actions/checkout@v4
 
@@ -63,7 +64,6 @@ jobs:
       - name: 6. 修补上游 feeds 中缺失的 exfat-oot 依赖
         run: |
           cd lede
-          echo "🔍 定位残留的 kmod-fs-exfat-oot 依赖..."
           HIT=0
           while IFS= read -r f; do
             HIT=1
@@ -74,7 +74,6 @@ jobs:
             echo "✅ 未发现 exfat-oot 依赖，跳过"
           else
             echo "✅ 依赖修补完成"
-            grep -rn 'kmod-fs-exfat-oot' feeds/ 2>/dev/null || echo "（无残留）"
           fi
 
       - name: 7. 加载配置并强制校验关键依赖
@@ -84,10 +83,8 @@ jobs:
           cd lede
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
 
+          # 强制重新生成一次配置，防止缓存污染
           make defconfig
-
-          echo "🔍 深度校验 PassWall、UPnP 与存储依赖..."
-          MISSING=0
 
           REQUIRED_PKGS=(
             "CONFIG_PACKAGE_luci-app-passwall"
@@ -99,7 +96,6 @@ jobs:
             "CONFIG_PACKAGE_ipset"
             "CONFIG_PACKAGE_luci-app-upnp"
             "CONFIG_PACKAGE_zram-swap"
-            # 存储相关 (block-mount 方案)
             "CONFIG_PACKAGE_kmod-usb-storage"
             "CONFIG_PACKAGE_kmod-usb-storage-extras"
             "CONFIG_PACKAGE_block-mount"
@@ -107,9 +103,10 @@ jobs:
             "CONFIG_PACKAGE_ntfs-3g"
           )
 
+          MISSING=0
           for pkg in "${REQUIRED_PKGS[@]}"; do
             if grep -q "^${pkg}=y" .config; then
-              echo "✅ ${pkg} 已成功保留"
+              echo "✅ ${pkg} 已保留"
             else
               echo "⚠️ ${pkg} 被 defconfig 丢弃，强制补全..."
               echo "${pkg}=y" >> .config
@@ -118,31 +115,22 @@ jobs:
           done
 
           if [ "$MISSING" -eq 1 ]; then
-            echo "🔄 补写完成，重新执行 make defconfig 验证依赖..."
             make defconfig
             for pkg in "${REQUIRED_PKGS[@]}"; do
-              grep -q "^${pkg}=y" .config \
-                || { echo "❌ 致命错误: ${pkg} 依赖树冲突无法解析，停止编译！"; exit 1; }
+              grep -q "^${pkg}=y" .config || { echo "❌ 致命错误: ${pkg} 依赖冲突！"; exit 1; }
             done
           fi
 
-          echo "🔍 补齐 UPnP 后端..."
           if ! grep -q '^CONFIG_PACKAGE_miniupnpd=y' .config; then
-            echo "✅ 强制写入 CONFIG_PACKAGE_miniupnpd-iptables=y"
             echo 'CONFIG_PACKAGE_miniupnpd-iptables=y' >> .config
             echo 'CONFIG_PACKAGE_miniupnpd=y' >> .config
+            make defconfig
           fi
 
       - name: 8. 修改默认 IP 为 192.168.2.1
         run: |
           cd lede
-          OLD_PATH="package/base-files/files/bin/config_generate"
-          if [ -f "$OLD_PATH" ]; then
-            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$OLD_PATH"
-            echo "✅ 默认 IP 已修改"
-          else
-            echo "⚠️ 未找到 config_generate，跳过"
-          fi
+          sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate
 
       - name: 9. 配置 CCache 与下载源码
         run: |
@@ -150,35 +138,51 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           export CCACHE_DIR="$CCACHE_DIR"
           ccache -M 5G
-          ccache -s
-          make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
+          make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 开始编译固件 (并行 + 内存保护)
+      - name: 10. 开始编译固件
         id: compile
         run: |
           cd lede
           export CCACHE_DIR="$CCACHE_DIR"
-          echo "🚀 使用 -j4 并行编译，单进程虚拟内存限制 3GB..."
-          if (ulimit -v 3000000; make -j4 V=s > build.log 2>&1); then
-            echo "status=success" >> "$GITHUB_OUTPUT"
-          else
-            echo "❌ 编译失败！"
-            echo "status=failed" >> "$GITHUB_OUTPUT"
-            tail -n 200 build.log
-            exit 1
-          fi
+          # 移除 ulimit -v 限制，让系统利用 Github Runner 的 16GB 内存，防止被 OOM 误杀
+          echo "🚀 使用 -j$(nproc) 并行编译..."
+          # 使用 tee 让日志既保存到文件，又能在控制台看到
+          make -j$(nproc) V=s 2>&1 | tee build.log
+          # 由于使用了 pipe，make 的返回值需要通过 PIPESTATUS 获取
+          exit ${PIPESTATUS[0]}
 
-      - name: 11. 失败时上传日志
-        if: failure() && steps.compile.outputs.status == 'failed'
+      - name: 11. 提取并上传详细错误报告 (仅在失败时执行)
+        if: failure() && steps.compile.outcome == 'failure'
+        run: |
+          cd lede
+          echo "🔍 正在从海量日志中提取核心报错信息..."
+          
+          # 生成精简的错误报告
+          echo "================ 编译失败摘要 ================" > error_report.txt
+          # 抓取包含 Error, Failed, Killed 等关键字及其前后 3 行
+          grep -n -B 3 -A 3 -E "Error [0-9]|ERROR:|failed|No such file|undefined reference|Killed" build.log | tail -n 150 >> error_report.txt
+          
+          echo -e "\n================ 崩溃前最后 50 行日志 ================" >> error_report.txt
+          tail -n 50 build.log >> error_report.txt
+          
+          # 将报告输出到 GitHub Actions 的网页 Summary 中
+          cat error_report.txt >> $GITHUB_STEP_SUMMARY
+
+      - name: 12. 上传精简错误报告及压缩日志
+        if: failure() && steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: build_error_logs
-          path: lede/build.log
+          name: error_report
+          path: |
+            lede/error_report.txt
+            lede/build.log
 
-      - name: 12. 严格检查固件体积
+      # ... (步骤13-15的检查大小与发布Release保持不变) ...
+      - name: 13. 严格检查固件体积
         id: check_size
-        if: steps.compile.outputs.status == 'success' && !cancelled()
+        if: steps.compile.outcome == 'success' && !cancelled()
         run: |
           cd lede/bin/targets/ramips/mt7621
           FIRMWARE=$(ls *sysupgrade.bin 2>/dev/null | head -n 1)
@@ -199,7 +203,7 @@ jobs:
           echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
           echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
 
-      - name: 13. 上传 Artifacts
+      - name: 14. 上传 Artifacts
         uses: actions/upload-artifact@v4
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
@@ -207,7 +211,7 @@ jobs:
           path: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
           if-no-files-found: error
 
-      - name: 14. 发布 Release
+      - name: 15. 发布 Release
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
@@ -217,11 +221,10 @@ jobs:
             ### 固件特性
             * **源码**: coolsnowwolf/lede (`master`)
             * **代理**: PassWall + Xray（Iptables 透明代理）
-            * **存储**: block-mount 原生挂载点，自动挂载 U 盘/移动硬盘（exFAT / NTFS / FAT32 / ext4）
-            * **USB**: USB 2.0 + USB 3.0 (xHCI, MT7621)
-            * **网络**: WWAN 无线中继 / USB 手机共享 (RNDIS/CDC/iPhone)
-            * **工具**: DDNS (DNSPod) / TTYD / 定时重启 / UPnP (iptables 后端)
-            * **优化**: ZRAM 防 OOM / ccache 5G / feeds 依赖修补 / 默认 IP 192.168.2.1
+            * **存储**: block-mount 原生挂载点（exFAT / NTFS / FAT32 / ext4）
+            * **USB**: USB 2.0 + USB 3.0
+            * **网络**: WWAN 无线中继 / USB 手机共享
+            * **优化**: ZRAM 防 OOM / 默认 IP 192.168.2.1
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
