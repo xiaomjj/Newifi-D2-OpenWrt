@@ -136,7 +136,7 @@ jobs:
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 强行预置 OpenClash 全套养老组件（内核+数据库+模版）
+      - name: 10. 强行预置 OpenClash 全套养老组件（带文件校验）
         run: |
           cd lede
           CORE_DIR="files/etc/openclash/core"
@@ -144,18 +144,21 @@ jobs:
           mkdir -p "$CORE_DIR" "$GEO_DIR"
           
           VERSION="v1.19.33"
-          MIHOMO_FILE="mihomo-linux-mipsle_softfloat-${VERSION}.gz"
+          MIHOMO_FILE="mihomo-linux-mipsle-softfloat-${VERSION}.gz"
           
           echo "📥 开始下载 Mihomo 内核 ($VERSION)..."
-          curl -sL --retry 3 --connect-timeout 20 "https://ghfast.top/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}" -o /tmp/mihomo.gz || \
-          curl -sL --retry 3 --connect-timeout 20 "https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}" -o /tmp/mihomo.gz
+          rm -f /tmp/mihomo.gz
+          
+          curl -sL --retry 3 --connect-timeout 20 "https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}" -o /tmp/mihomo.gz || \
+          curl -sL --retry 3 --connect-timeout 20 "https://ghfast.top/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}" -o /tmp/mihomo.gz
 
-          if [ -f /tmp/mihomo.gz ]; then
+          if file /tmp/mihomo.gz | grep -q "gzip compressed"; then
             gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"
             chmod 0755 "$CORE_DIR/clash_meta"
             echo "✅ Mihomo 内核已成功嵌入！大小: $(ls -lh $CORE_DIR/clash_meta | awk '{print $5}')"
           else
-            echo "❌ 内核下载失败！"
+            echo "❌ 下载的文件不是有效的 gzip 压缩包，以下是下载内容预览："
+            cat /tmp/mihomo.gz
             exit 1
           fi
 
