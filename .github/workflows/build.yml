@@ -145,19 +145,43 @@ jobs:
       - name: 10. 嵌入 Mihomo (Clash Meta) 专属内核
         run: |
           cd lede
-          echo "📥 下载 Mihomo 内核 (mipsle-softfloat)..."
+          echo "📥 正在获取 Mihomo 最新版本信息..."
           mkdir -p files/etc/openclash/core
           
-          # 获取最新版本，MT7621 固定使用 mipsle-softfloat
-          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-mipsle-softfloat.gz"
+          # 从 GitHub API 获取最新版本号和下载链接
+          API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+          VERSION=$(curl -s $API_URL | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
           
-          if wget -q -O /tmp/mihomo.gz "$MIHOMO_URL"; then
+          if [ -z "$VERSION" ]; then
+            echo "⚠️ 无法从 API 获取版本号，尝试备用地址..."
+            VERSION="v1.19.31" # 备用版本号
+          fi
+          
+          echo "🔖 最新版本号: $VERSION"
+          
+          # 构造精确的下载链接 (MT7621 使用 mipsle-softfloat)
+          MIHOMO_FILE="mihomo-linux-mipsle-softfloat-${VERSION}.gz"
+          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
+          
+          echo "📥 下载链接: $MIHOMO_URL"
+          
+          # 下载内核，并设置重试机制
+          if wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIHOMO_URL"; then
             gzip -dc /tmp/mihomo.gz > files/etc/openclash/core/clash_meta
             chmod 0755 files/etc/openclash/core/clash_meta
             echo "✅ Mihomo 内核已成功嵌入: $(ls -lh files/etc/openclash/core/clash_meta | awk '{print $5}')"
           else
-            echo "❌ 内核下载失败，请检查网络或源地址"
-            exit 1
+            echo "❌ 从 GitHub 下载失败，尝试使用备用镜像..."
+            # 备用镜像（如 ghproxy.com 或 mirrors.tuna.tsinghua.edu.cn 等，这里使用一个通用的反代示例）
+            MIRROR_URL="https://ghproxy.net/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
+            if wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIRROR_URL"; then
+              gzip -dc /tmp/mihomo.gz > files/etc/openclash/core/clash_meta
+              chmod 0755 files/etc/openclash/core/clash_meta
+              echo "✅ Mihomo 内核已通过镜像嵌入: $(ls -lh files/etc/openclash/core/clash_meta | awk '{print $5}')"
+            else
+              echo "⚠️ 内核下载失败，将跳过嵌入步骤（固件仍可通过 OpenClash 界面在线更新内核）"
+              exit 0
+            fi
           fi
 
       - name: 11. 开始编译固件
