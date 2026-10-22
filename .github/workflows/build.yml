@@ -80,9 +80,11 @@ jobs:
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
+          # 只清理非 kmod 的 =m
           sed -i '/^CONFIG_PACKAGE_kmod-/!s/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
           make defconfig
 
+          # 强制检查已选择项，防止被 make defconfig 误删
           REQUIRED_PKGS=(
             "CONFIG_PACKAGE_luci-app-passwall"
             "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray"
@@ -117,6 +119,7 @@ jobs:
           done
           make defconfig
 
+          # 强制关闭冲突及未选择的包
           sed -i 's/^CONFIG_PACKAGE_autosamba=y/# CONFIG_PACKAGE_autosamba is not set/' .config
           sed -i 's/^CONFIG_PACKAGE_samba4-server=y/# CONFIG_PACKAGE_samba4-server is not set/' .config
           sed -i 's/^CONFIG_PACKAGE_luci-app-samba4=y/# CONFIG_PACKAGE_luci-app-samba4 is not set/' .config
@@ -152,15 +155,19 @@ jobs:
 
           # ---- Xray mipsle 核心 ----
           mkdir -p files/usr/bin
-          XRAY_VERSION="v25.9.11"
-          XRAY_ZIP="Xray-linux-mipsle.zip"
+          XRAY_VERSION="latest"
+          XRAY_FILE_SF="Xray-linux-mipsle-softfloat.zip"
+          XRAY_FILE="Xray-linux-mipsle.zip"
+          
           echo "📥 下载 Xray mipsle 核心 ($XRAY_VERSION)..."
           rm -f /tmp/xray.zip
+          
+          # 优先尝试 softfloat 版本，失败则尝试普通版本
           curl -sL --retry 3 --connect-timeout 20 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ZIP}" \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE_SF}" \
             -o /tmp/xray.zip || \
           curl -sL --retry 3 --connect-timeout 20 \
-            "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_ZIP}" \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE}" \
             -o /tmp/xray.zip
 
           if file /tmp/xray.zip | grep -q "Zip archive"; then
@@ -169,21 +176,23 @@ jobs:
             chmod 0755 files/usr/bin/xray
             echo "✅ Xray 已嵌入: $(ls -lh files/usr/bin/xray | awk '{print $5}')"
           else
-            echo "❌ Xray 下载失败"; head -c 300 /tmp/xray.zip; exit 1
+            echo "❌ Xray 下载失败，请检查网络或确认最新版是否包含 mipsle"; head -c 300 /tmp/xray.zip; exit 1
           fi
 
-          # ---- PassWall 规则（预置到默认路径） ----
+          # ---- PassWall 规则 ----
           mkdir -p files/usr/share/passwall/rules
           RULES_DIR="files/usr/share/passwall/rules"
-
+          
           echo "📥 下载 gfwlist / chnlist / chnroute..."
-          curl -sL --retry 3 "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt" -o "$RULES_DIR/gfwlist"
-          curl -sL --retry 3 "https://ghfast.top/https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt" -o "$RULES_DIR/chnlist"
-          curl -sL --retry 3 "https://ghfast.top/https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt" -o "$RULES_DIR/chnroute"
+          # gfwlist 和 chnlist 使用 jsdelivr CDN
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
+          # chnroute 使用 ispip 专属源
+          curl -sL --retry 3 "https://ispip.clang.cn/all_cn.txt" -o "$RULES_DIR/chnroute"
 
           for f in gfwlist chnlist chnroute; do
             if [ ! -s "$RULES_DIR/$f" ]; then
-              echo "❌ $f 为空"; exit 1
+              echo "❌ $f 为空，检查下载源"; exit 1
             fi
             echo "✅ $f: $(wc -l < "$RULES_DIR/$f") 行"
           done
