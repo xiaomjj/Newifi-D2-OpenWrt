@@ -50,9 +50,9 @@ jobs:
           path: |
             /workdir/lede/.ccache
             /workdir/lede/dl
-          key: ${{ runner.os }}-lede-final-v3-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-lede-final-v4-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-lede-final-v3-
+            ${{ runner.os }}-lede-final-v4-
 
       - name: 5. 更新 Feeds
         run: |
@@ -60,7 +60,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 5.1 修补上游 feeds 中缺失的 exfat-oot 依赖
+      - name: 6. 修补上游 feeds 中缺失的 exfat-oot 依赖
         run: |
           cd lede
           echo "🔍 定位残留的 kmod-fs-exfat-oot 依赖..."
@@ -77,7 +77,7 @@ jobs:
             grep -rn 'kmod-fs-exfat-oot' feeds/ 2>/dev/null || echo "（无残留）"
           fi
 
-      - name: 6. 加载配置并强制校验关键依赖
+      - name: 7. 加载配置并强制校验关键依赖
         run: |
           if [ ! -f "$CONFIG_FILE" ]; then echo "❌ 未找到 $CONFIG_FILE"; exit 1; fi
           mv "$CONFIG_FILE" lede/.config
@@ -133,7 +133,7 @@ jobs:
             echo 'CONFIG_PACKAGE_miniupnpd=y' >> .config
           fi
 
-      - name: 7. 修改默认 IP 为 192.168.2.1
+      - name: 8. 修改默认 IP 为 192.168.2.1
         run: |
           cd lede
           OLD_PATH="package/base-files/files/bin/config_generate"
@@ -144,17 +144,17 @@ jobs:
             echo "⚠️ 未找到 config_generate，跳过"
           fi
 
-      - name: 8. 配置 CCache 与下载源码
+      - name: 9. 配置 CCache 与下载源码
         run: |
           cd lede
           mkdir -p "$CCACHE_DIR"
           export CCACHE_DIR="$CCACHE_DIR"
-          ccache -M 2G
+          ccache -M 5G
           ccache -s
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 9. 开始编译固件 (并行 + 内存保护)
+      - name: 10. 开始编译固件 (并行 + 内存保护)
         id: compile
         run: |
           cd lede
@@ -169,14 +169,14 @@ jobs:
             exit 1
           fi
 
-      - name: 9.5 失败时上传日志
+      - name: 11. 失败时上传日志
         if: failure() && steps.compile.outputs.status == 'failed'
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
           path: lede/build.log
 
-      - name: 10. 严格检查固件体积
+      - name: 12. 严格检查固件体积
         id: check_size
         if: steps.compile.outputs.status == 'success' && !cancelled()
         run: |
@@ -199,7 +199,7 @@ jobs:
           echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
           echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
 
-      - name: 11. 上传 Artifacts
+      - name: 13. 上传 Artifacts
         uses: actions/upload-artifact@v4
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
@@ -207,7 +207,7 @@ jobs:
           path: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
           if-no-files-found: error
 
-      - name: 12. 发布 Release
+      - name: 14. 发布 Release
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success' && !cancelled()
         with:
@@ -218,9 +218,10 @@ jobs:
             * **源码**: coolsnowwolf/lede (`master`)
             * **代理**: PassWall + Xray（Iptables 透明代理）
             * **存储**: block-mount 原生挂载点，自动挂载 U 盘/移动硬盘（exFAT / NTFS / FAT32 / ext4）
-            * **网络**: WWAN 无线中继 / USB 手机共享
-            * **工具**: DDNS (DNSPod) / TTYD / 定时重启 / UPnP (iptables)
-            * **优化**: ZRAM / feeds 依赖修补 / 默认 IP 192.168.2.1
+            * **USB**: USB 2.0 + USB 3.0 (xHCI, MT7621)
+            * **网络**: WWAN 无线中继 / USB 手机共享 (RNDIS/CDC/iPhone)
+            * **工具**: DDNS (DNSPod) / TTYD / 定时重启 / UPnP (iptables 后端)
+            * **优化**: ZRAM 防 OOM / ccache 5G / feeds 依赖修补 / 默认 IP 192.168.2.1
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
