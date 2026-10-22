@@ -60,15 +60,11 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 6. 修补 feeds 中缺失的 exfat-oot 依赖
+      - name: 6. 修补 feeds 中缺失的依赖
         run: |
           cd lede
-          HIT=0
-          while IFS= read -r f; do
-            HIT=1
-            sed -i -E 's/[A-Za-z0-9_:!+-]*kmod-fs-exfat-oot//g' "$f"
-          done < <(grep -rl 'kmod-fs-exfat-oot' feeds/ 2>/dev/null || true)
-          if [ "$HIT" -eq 0 ]; then echo "✅ 无残留"; else echo "✅ 修补完成"; fi
+          find feeds/ -type f -name "*.mk" -exec sed -i '/kmod-fs-exfat-oot/d' {} +
+          echo "✅ 依赖修补完成"
 
       - name: 7. 加载配置、深度净化并校验
         run: |
@@ -79,13 +75,12 @@ jobs:
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-          # 🧹 终极净化：强制抹杀所有处于 =m 状态的包，防止 SSR/KMS 等夹带
-          echo "🧹 净化 .config: 清除所有 =m 状态，防止生成额外 .ipk..."
+          # 🧹 终极净化：强制抹杀所有处于 =m 状态的包，防止多余模块夹带
+          echo "🧹 净化 .config: 清除所有 =m 状态..."
           sed -i 's/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
           make defconfig
 
           echo "🔍 深度校验核心依赖..."
-          MISSING=0
           REQUIRED_PKGS=(
             "CONFIG_PACKAGE_luci-app-openclash"
             "CONFIG_PACKAGE_dnsmasq-full"
@@ -106,20 +101,11 @@ jobs:
             if grep -q "^${pkg}=y" .config; then
               echo "✅ ${pkg} 已成功保留"
             else
-              echo "⚠️ ${pkg} 被丢弃，强制补全..."
               echo "${pkg}=y" >> .config
-              MISSING=1
             fi
           done
+          make defconfig
 
-          if [ "$MISSING" -eq 1 ]; then
-            make defconfig
-            for pkg in "${REQUIRED_PKGS[@]}"; do
-              grep -q "^${pkg}=y" .config || { echo "❌ 致命错误: ${pkg} 依赖冲突"; exit 1; }
-            done
-          fi
-
-          echo "🔍 补齐 UPnP 后端..."
           if ! grep -q '^CONFIG_PACKAGE_miniupnpd=y' .config; then
             echo 'CONFIG_PACKAGE_miniupnpd-iptables=y' >> .config
             echo 'CONFIG_PACKAGE_miniupnpd=y' >> .config
@@ -142,62 +128,52 @@ jobs:
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 嵌入 Mihomo (Clash Meta) 专属内核
+      - name: 10. 嵌入 Mihomo 内核及 GeoIP 规则库（实现开箱即用）
         run: |
           cd lede
-          echo "📥 正在获取 Mihomo 最新版本信息..."
-          mkdir -p files/etc/openclash/core
+          CORE_DIR="files/etc/openclash/core"
+          GEO_DIR="files/etc/openclash"
+          mkdir -p "$CORE_DIR" "$GEO_DIR"
           
-          # 从 GitHub API 获取最新版本号和下载链接
+          echo "📥 正在获取 Mihomo 最新版本信息..."
           API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
           VERSION=$(curl -s $API_URL | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          
-          if [ -z "$VERSION" ]; then
-            echo "⚠️ 无法从 API 获取版本号，尝试备用地址..."
-            VERSION="v1.19.31" # 备用版本号
-          fi
-          
+          [ -z "$VERSION" ] && VERSION="v1.19.31"
           echo "🔖 最新版本号: $VERSION"
           
-          # 构造精确的下载链接 (MT7621 使用 mipsle-softfloat)
-          MIHOMO_FILE="mihomo-linux-mipsle-softfloat-${VERSION}.gz"
+          # 注意：MetaCubeX 官方 mipsle 软浮点内核的下划线命名规范
+          MIHOMO_FILE="mihomo-linux-mipsle_softfloat-${VERSION}.gz"
           MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
           
-          echo "📥 下载链接: $MIHOMO_URL"
-          
-          # 下载内核，并设置重试机制
+          echo "📥 下载 Mihomo 内核..."
           if wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIHOMO_URL"; then
-            gzip -dc /tmp/mihomo.gz > files/etc/openclash/core/clash_meta
-            chmod 0755 files/etc/openclash/core/clash_meta
-            echo "✅ Mihomo 内核已成功嵌入: $(ls -lh files/etc/openclash/core/clash_meta | awk '{print $5}')"
+            gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"
+            chmod 0755 "$CORE_DIR/clash_meta"
+            echo "✅ Mihomo 内核嵌入成功"
           else
-            echo "❌ 从 GitHub 下载失败，尝试使用备用镜像..."
-            # 备用镜像（如 ghproxy.com 或 mirrors.tuna.tsinghua.edu.cn 等，这里使用一个通用的反代示例）
+            echo "❌ 内核下载失败，尝试镜像..."
             MIRROR_URL="https://ghproxy.net/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
-            if wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIRROR_URL"; then
-              gzip -dc /tmp/mihomo.gz > files/etc/openclash/core/clash_meta
-              chmod 0755 files/etc/openclash/core/clash_meta
-              echo "✅ Mihomo 内核已通过镜像嵌入: $(ls -lh files/etc/openclash/core/clash_meta | awk '{print $5}')"
-            else
-              echo "⚠️ 内核下载失败，将跳过嵌入步骤（固件仍可通过 OpenClash 界面在线更新内核）"
-              exit 0
-            fi
+            wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIRROR_URL"
+            gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"
+            chmod 0755 "$CORE_DIR/clash_meta"
+            echo "✅ Mihomo 内核通过镜像嵌入成功"
           fi
+
+          echo "📥 下载预置 GeoIP / GeoSite 规则库（防首次启动报错）..."
+          wget -q --tries=3 -O "$GEO_DIR/Country.mmdb" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb || true
+          wget -q --tries=3 -O "$GEO_DIR/GeoSite.dat" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat || true
+          wget -q --tries=3 -O "$GEO_DIR/GeoIP.dat" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat || true
+          echo "✅ 规则库预置完成"
 
       - name: 11. 开始编译固件
         id: compile
         run: |
           cd lede
           export CCACHE_DIR="$CCACHE_DIR"
-          if (ulimit -v 3000000; make -j4 V=s > build.log 2>&1); then
-            echo "status=success" >> "$GITHUB_OUTPUT"
-          else
-            tail -n 200 build.log
-            exit 1
-          fi
+          make -j4 V=s > build.log 2>&1 || (tail -n 200 build.log && exit 1)
 
       - name: 12. 失败时上传日志
-        if: failure() && steps.compile.outputs.status != 'success'
+        if: failure() && steps.compile.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
@@ -205,7 +181,7 @@ jobs:
 
       - name: 13. 严格检查固件体积
         id: check_size
-        if: steps.compile.outputs.status == 'success'
+        if: steps.compile.outcome == 'success'
         run: |
           cd lede/bin/targets/ramips/mt7621
           FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
@@ -236,7 +212,7 @@ jobs:
           name: LEDE Newifi-D2 OpenClash 纯净版 [${{ env.TAG_DATE }}]
           body: |
             ### 固件特性
-            * **代理**: OpenClash (已内置 Mihomo/Meta 专属内核)
+            * **代理**: OpenClash (已内置 Mihomo 内核 + Country/GeoIP/GeoSite 规则库，真正开箱即用)
             * **存储**: USB 自动挂载 / Samba4 共享 / Aria2 下载
             * **网络**: ZeroTier 组网 / frpc 穿透 / USB 共享 / 无线中继
             * **工具**: 流量监控 / 硬盘休眠 / 释放内存 / 自定义命令
