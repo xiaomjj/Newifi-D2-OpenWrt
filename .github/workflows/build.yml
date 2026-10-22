@@ -75,7 +75,7 @@ jobs:
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-          # 🧹 终极净化：强制抹杀所有处于 =m 状态的包，防止多余模块夹带
+          # 🧹 终极净化：强制抹杀所有处于 =m 状态的包
           echo "🧹 净化 .config: 清除所有 =m 状态..."
           sed -i 's/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
           make defconfig
@@ -128,7 +128,7 @@ jobs:
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 嵌入 Mihomo 内核及 GeoIP 规则库（实现开箱即用）
+      - name: 10. 嵌入 Mihomo 内核及 GeoIP 规则库（多路镜像重试）
         run: |
           cd lede
           CORE_DIR="files/etc/openclash/core"
@@ -138,28 +138,37 @@ jobs:
           echo "📥 正在获取 Mihomo 最新版本信息..."
           API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
           VERSION=$(curl -s $API_URL | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          [ -z "$VERSION" ] && VERSION="v1.19.31"
+          [ -z "$VERSION" ] && VERSION="v1.19.33"
           echo "🔖 最新版本号: $VERSION"
           
-          # 注意：MetaCubeX 官方 mipsle 软浮点内核的下划线命名规范
           MIHOMO_FILE="mihomo-linux-mipsle_softfloat-${VERSION}.gz"
-          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
           
-          echo "📥 下载 Mihomo 内核..."
-          if wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIHOMO_URL"; then
-            gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"
-            chmod 0755 "$CORE_DIR/clash_meta"
-            echo "✅ Mihomo 内核嵌入成功"
-          else
-            echo "❌ 内核下载失败，尝试镜像..."
-            MIRROR_URL="https://ghproxy.net/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
-            wget -q --tries=3 --timeout=60 -O /tmp/mihomo.gz "$MIRROR_URL"
-            gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"
-            chmod 0755 "$CORE_DIR/clash_meta"
-            echo "✅ Mihomo 内核通过镜像嵌入成功"
+          # 多路候选下载源
+          URLS=(
+            "https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
+            "https://ghfast.top/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
+            "https://mirror.ghproxy.com/https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/${MIHOMO_FILE}"
+          ]
+          
+          SUCCESS=0
+          for url in "${URLS[@]}"; do
+            echo "📥 尝试从以下地址下载内核: $url"
+            if wget -q --tries=2 --timeout=30 -O /tmp/mihomo.gz "$url"; then
+              if gzip -dc /tmp/mihomo.gz > "$CORE_DIR/clash_meta"; then
+                chmod 0755 "$CORE_DIR/clash_meta"
+                echo "✅ Mihomo 内核下载并解压成功！"
+                SUCCESS=1
+                break
+              fi
+            fi
+            echo "⚠️ 当前源下载失败，切换下一个..."
+          done
+          
+          if [ "$SUCCESS" -eq 0 ]; then
+            echo "❌ 所有下载源均失败，跳过预置内核（固件仍可正常编译，刷机后可在 OpenClash 后台更新）"
           fi
 
-          echo "📥 下载预置 GeoIP / GeoSite 规则库（防首次启动报错）..."
+          echo "📥 下载预置 GeoIP / GeoSite 规则库..."
           wget -q --tries=3 -O "$GEO_DIR/Country.mmdb" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb || true
           wget -q --tries=3 -O "$GEO_DIR/GeoSite.dat" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat || true
           wget -q --tries=3 -O "$GEO_DIR/GeoIP.dat" https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat || true
@@ -212,7 +221,7 @@ jobs:
           name: LEDE Newifi-D2 OpenClash 纯净版 [${{ env.TAG_DATE }}]
           body: |
             ### 固件特性
-            * **代理**: OpenClash (已内置 Mihomo 内核 + Country/GeoIP/GeoSite 规则库，真正开箱即用)
+            * **代理**: OpenClash (已内置 Mihomo 内核 + 规则库)
             * **存储**: USB 自动挂载 / Samba4 共享 / Aria2 下载
             * **网络**: ZeroTier 组网 / frpc 穿透 / USB 共享 / 无线中继
             * **工具**: 流量监控 / 硬盘休眠 / 释放内存 / 自定义命令
