@@ -1,4 +1,4 @@
-name: Build LEDE Newifi-D2 PassWall
+name: Build LEDE Newifi-D2 OpenClash
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # ... (步骤1到9保持不变，确保清理干净) ...
       - name: 1. 检出源码仓库
         uses: actions/checkout@v4
 
@@ -51,9 +50,9 @@ jobs:
           path: |
             /workdir/lede/.ccache
             /workdir/lede/dl
-          key: ${{ runner.os }}-lede-final-v4-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-lede-oc-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-lede-final-v4-
+            ${{ runner.os }}-lede-oc-
 
       - name: 5. 更新 Feeds
         run: |
@@ -61,54 +60,53 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 6. 修补上游 feeds 中缺失的 exfat-oot 依赖
+      - name: 6. 修补 feeds 中缺失的 exfat-oot 依赖
         run: |
           cd lede
           HIT=0
           while IFS= read -r f; do
             HIT=1
-            echo "🔧 修补: $f"
-            sed -i -E 's/(^|[[:space:]])\+kmod-fs-exfat-oot([[:space:]]|$)/\1/g' "$f"
+            sed -i -E 's/[A-Za-z0-9_:!+-]*kmod-fs-exfat-oot//g' "$f"
           done < <(grep -rl 'kmod-fs-exfat-oot' feeds/ 2>/dev/null || true)
-          if [ "$HIT" -eq 0 ]; then
-            echo "✅ 未发现 exfat-oot 依赖，跳过"
-          else
-            echo "✅ 依赖修补完成"
-          fi
+          if [ "$HIT" -eq 0 ]; then echo "✅ 无残留"; else echo "✅ 修补完成"; fi
 
-      - name: 7. 加载配置并强制校验关键依赖
+      - name: 7. 加载配置、深度净化并校验
         run: |
           if [ ! -f "$CONFIG_FILE" ]; then echo "❌ 未找到 $CONFIG_FILE"; exit 1; fi
           mv "$CONFIG_FILE" lede/.config
           cd lede
+          
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
-
-          # 强制重新生成一次配置，防止缓存污染
           make defconfig
 
+          # 🧹 终极净化：强制抹杀所有处于 =m 状态的包，防止 SSR/KMS 等夹带
+          echo "🧹 净化 .config: 清除所有 =m 状态，防止生成额外 .ipk..."
+          sed -i 's/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
+          make defconfig
+
+          echo "🔍 深度校验核心依赖..."
+          MISSING=0
           REQUIRED_PKGS=(
-            "CONFIG_PACKAGE_luci-app-passwall"
-            "CONFIG_PACKAGE_luci-app-passwall_Iptables_Transparent_Proxy"
-            "CONFIG_PACKAGE_iptables-mod-socket"
-            "CONFIG_PACKAGE_kmod-ipt-socket"
+            "CONFIG_PACKAGE_luci-app-openclash"
+            "CONFIG_PACKAGE_dnsmasq-full"
             "CONFIG_PACKAGE_iptables-mod-tproxy"
-            "CONFIG_PACKAGE_kmod-ipt-nat"
-            "CONFIG_PACKAGE_ipset"
+            "CONFIG_PACKAGE_iptables-mod-extra"
+            "CONFIG_PACKAGE_kmod-tun"
+            "CONFIG_PACKAGE_ruby"
             "CONFIG_PACKAGE_luci-app-upnp"
             "CONFIG_PACKAGE_zram-swap"
-            "CONFIG_PACKAGE_kmod-usb-storage"
-            "CONFIG_PACKAGE_kmod-usb-storage-extras"
             "CONFIG_PACKAGE_block-mount"
-            "CONFIG_PACKAGE_kmod-fs-exfat"
             "CONFIG_PACKAGE_ntfs-3g"
+            "CONFIG_PACKAGE_luci-app-samba4"
+            "CONFIG_PACKAGE_luci-app-aria2"
+            "CONFIG_PACKAGE_luci-app-zerotier"
           )
 
-          MISSING=0
           for pkg in "${REQUIRED_PKGS[@]}"; do
             if grep -q "^${pkg}=y" .config; then
-              echo "✅ ${pkg} 已保留"
+              echo "✅ ${pkg} 已成功保留"
             else
-              echo "⚠️ ${pkg} 被 defconfig 丢弃，强制补全..."
+              echo "⚠️ ${pkg} 被丢弃，强制补全..."
               echo "${pkg}=y" >> .config
               MISSING=1
             fi
@@ -117,20 +115,23 @@ jobs:
           if [ "$MISSING" -eq 1 ]; then
             make defconfig
             for pkg in "${REQUIRED_PKGS[@]}"; do
-              grep -q "^${pkg}=y" .config || { echo "❌ 致命错误: ${pkg} 依赖冲突！"; exit 1; }
+              grep -q "^${pkg}=y" .config || { echo "❌ 致命错误: ${pkg} 依赖冲突"; exit 1; }
             done
           fi
 
+          echo "🔍 补齐 UPnP 后端..."
           if ! grep -q '^CONFIG_PACKAGE_miniupnpd=y' .config; then
             echo 'CONFIG_PACKAGE_miniupnpd-iptables=y' >> .config
             echo 'CONFIG_PACKAGE_miniupnpd=y' >> .config
-            make defconfig
           fi
 
       - name: 8. 修改默认 IP 为 192.168.2.1
         run: |
           cd lede
-          sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate
+          OLD_PATH="package/base-files/files/bin/config_generate"
+          if [ -f "$OLD_PATH" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$OLD_PATH"
+          fi
 
       - name: 9. 配置 CCache 与下载源码
         run: |
@@ -138,65 +139,58 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           export CCACHE_DIR="$CCACHE_DIR"
           ccache -M 5G
-          make download -j8 || make download -j1 V=s
+          make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 开始编译固件
+      - name: 10. 嵌入 Mihomo (Clash Meta) 专属内核
+        run: |
+          cd lede
+          echo "📥 下载 Mihomo 内核 (mipsle-softfloat)..."
+          mkdir -p files/etc/openclash/core
+          
+          # 获取最新版本，MT7621 固定使用 mipsle-softfloat
+          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-mipsle-softfloat.gz"
+          
+          if wget -q -O /tmp/mihomo.gz "$MIHOMO_URL"; then
+            gzip -dc /tmp/mihomo.gz > files/etc/openclash/core/clash_meta
+            chmod 0755 files/etc/openclash/core/clash_meta
+            echo "✅ Mihomo 内核已成功嵌入: $(ls -lh files/etc/openclash/core/clash_meta | awk '{print $5}')"
+          else
+            echo "❌ 内核下载失败，请检查网络或源地址"
+            exit 1
+          fi
+
+      - name: 11. 开始编译固件
         id: compile
         run: |
           cd lede
           export CCACHE_DIR="$CCACHE_DIR"
-          # 移除 ulimit -v 限制，让系统利用 Github Runner 的 16GB 内存，防止被 OOM 误杀
-          echo "🚀 使用 -j$(nproc) 并行编译..."
-          # 使用 tee 让日志既保存到文件，又能在控制台看到
-          make -j$(nproc) V=s 2>&1 | tee build.log
-          # 由于使用了 pipe，make 的返回值需要通过 PIPESTATUS 获取
-          exit ${PIPESTATUS[0]}
+          if (ulimit -v 3000000; make -j4 V=s > build.log 2>&1); then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            tail -n 200 build.log
+            exit 1
+          fi
 
-      - name: 11. 提取并上传详细错误报告 (仅在失败时执行)
-        if: failure() && steps.compile.outcome == 'failure'
-        run: |
-          cd lede
-          echo "🔍 正在从海量日志中提取核心报错信息..."
-          
-          # 生成精简的错误报告
-          echo "================ 编译失败摘要 ================" > error_report.txt
-          # 抓取包含 Error, Failed, Killed 等关键字及其前后 3 行
-          grep -n -B 3 -A 3 -E "Error [0-9]|ERROR:|failed|No such file|undefined reference|Killed" build.log | tail -n 150 >> error_report.txt
-          
-          echo -e "\n================ 崩溃前最后 50 行日志 ================" >> error_report.txt
-          tail -n 50 build.log >> error_report.txt
-          
-          # 将报告输出到 GitHub Actions 的网页 Summary 中
-          cat error_report.txt >> $GITHUB_STEP_SUMMARY
-
-      - name: 12. 上传精简错误报告及压缩日志
-        if: failure() && steps.compile.outcome == 'failure'
+      - name: 12. 失败时上传日志
+        if: failure() && steps.compile.outputs.status != 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: error_report
-          path: |
-            lede/error_report.txt
-            lede/build.log
+          name: build_error_logs
+          path: lede/build.log
 
-      # ... (步骤13-15的检查大小与发布Release保持不变) ...
       - name: 13. 严格检查固件体积
         id: check_size
-        if: steps.compile.outcome == 'success' && !cancelled()
+        if: steps.compile.outputs.status == 'success'
         run: |
           cd lede/bin/targets/ramips/mt7621
-          FIRMWARE=$(ls *sysupgrade.bin 2>/dev/null | head -n 1)
-          [ -z "$FIRMWARE" ] && { echo "❌ 未找到 sysupgrade.bin"; exit 1; }
+          FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
           SIZE=$(stat -c%s "$FIRMWARE")
           SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
-          MAX_MB=$(echo "scale=2; $MAX_FIRMWARE_SIZE / 1024 / 1024" | bc)
-          REMAINING=$(echo "scale=2; ($MAX_FIRMWARE_SIZE - $SIZE) / 1024 / 1024" | bc)
-
-          echo "📦 $FIRMWARE"
-          echo "📊 ${SIZE_MB} MB / 上限 ${MAX_MB} MB / 剩余 ${REMAINING} MB"
-
+          
+          echo "📦 固件大小: ${SIZE_MB} MB"
           if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then
-            echo "❌ 超限，刷入会变砖！"
+            echo "❌ 超限，当前: $SIZE bytes"
             exit 1
           fi
           echo "✅ 大小合规"
@@ -205,26 +199,24 @@ jobs:
 
       - name: 14. 上传 Artifacts
         uses: actions/upload-artifact@v4
-        if: steps.check_size.outcome == 'success' && !cancelled()
+        if: steps.check_size.outcome == 'success'
         with:
-          name: LEDE_NewifiD2_PassWall
+          name: LEDE_NewifiD2_OpenClash
           path: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
-          if-no-files-found: error
 
       - name: 15. 发布 Release
         uses: softprops/action-gh-release@v2
-        if: steps.check_size.outcome == 'success' && !cancelled()
+        if: steps.check_size.outcome == 'success'
         with:
-          tag_name: LEDE-Newifi-D2-PassWall-${{ env.TAG_DATE }}
-          name: LEDE Newifi-D2 PassWall 稳定版 [${{ env.TAG_DATE }}]
+          tag_name: LEDE-Newifi-D2-OC-${{ env.TAG_DATE }}
+          name: LEDE Newifi-D2 OpenClash 纯净版 [${{ env.TAG_DATE }}]
           body: |
             ### 固件特性
-            * **源码**: coolsnowwolf/lede (`master`)
-            * **代理**: PassWall + Xray（Iptables 透明代理）
-            * **存储**: block-mount 原生挂载点（exFAT / NTFS / FAT32 / ext4）
-            * **USB**: USB 2.0 + USB 3.0
-            * **网络**: WWAN 无线中继 / USB 手机共享
-            * **优化**: ZRAM 防 OOM / 默认 IP 192.168.2.1
+            * **代理**: OpenClash (已内置 Mihomo/Meta 专属内核)
+            * **存储**: USB 自动挂载 / Samba4 共享 / Aria2 下载
+            * **网络**: ZeroTier 组网 / frpc 穿透 / USB 共享 / 无线中继
+            * **工具**: 流量监控 / 硬盘休眠 / 释放内存 / 自定义命令
+            * **说明**: 强制纯净编译，无任何多余夹带插件。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
