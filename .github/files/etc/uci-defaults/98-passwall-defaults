@@ -1,0 +1,24 @@
+#!/bin/sh
+# 开启 PassWall 主开关
+uci set passwall.@global[0].enabled='1'
+# 默认开启 TCP/UDP 透明代理，使用 gfwlist 模式
+uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
+uci set passwall.@global[0].udp_proxy_mode='gfwlist'
+# 开启 DNS 防污染，配置国内外分流 DNS
+uci set passwall.@global[0].dns_mode='xray'
+uci set passwall.@global[0].dns_direct='223.5.5.5'
+uci set passwall.@global[0].dns_remote='1.1.1.1'
+# 启用 TCP Fast Open
+uci set passwall.@global[0].tcp_fastopen='1'
+uci commit passwall
+
+# 应用底层网络优化参数
+sysctl -p /etc/sysctl.conf
+
+# 硬件外设服务自启
+/etc/init.d/ksmbd enable
+/etc/init.d/ksmbd start 2>/dev/null
+/etc/init.d/p910nd enable
+/etc/init.d/p910nd start 2>/dev/null
+
+exit 0
