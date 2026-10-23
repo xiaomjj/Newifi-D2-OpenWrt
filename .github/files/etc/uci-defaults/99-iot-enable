@@ -1,7 +1,0 @@
-#!/bin/sh
-sysctl -p /etc/sysctl.conf
-/etc/init.d/ksmbd enable
-/etc/init.d/ksmbd start 2>/dev/null
-/etc/init.d/p910nd enable
-/etc/init.d/p910nd start 2>/dev/null
-exit 0
