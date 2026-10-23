@@ -1,0 +1,18 @@
+#!/bin/sh
+# 启用 2.4G 和 5G 射频
+uci set wireless.radio0.disabled='0'
+uci set wireless.radio1.disabled='0'
+
+# 设置 2.4G WiFi 名称为 alon
+uci set wireless.default_radio0.ssid='alon'
+uci set wireless.default_radio0.encryption='none'
+uci set wireless.default_radio0.disabled='0'
+
+# 设置 5G WiFi 名称为 alon 5G
+uci set wireless.default_radio1.ssid='alon 5G'
+uci set wireless.default_radio1.encryption='none'
+uci set wireless.default_radio1.disabled='0'
+
+uci commit wireless
+wifi reload
+exit 0
