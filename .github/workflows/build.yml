@@ -44,10 +44,15 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none lede
           ln -sf /workdir/lede $GITHUB_WORKSPACE/lede
 
-      - name: 4. 把仓库 files/ 覆盖到 lede/files/
+      - name: 4. 覆盖 files/ 并强制转换换行符（修复脚本格式）
         run: |
           mkdir -p lede/files
           cp -a files/. lede/files/
+          # 将 files/ 下所有文件的 Windows 换行符 (CRLF) 转换为 Linux 换行符 (LF)
+          echo "🔧 转换文件格式 (DOS -> Unix)..."
+          find lede/files -type f -exec sed -i 's/\r$//' {} +
+          # 确保关键脚本有执行权限
+          chmod +x lede/files/etc/hotplug.d/net/20-usbwan lede/files/etc/uci-defaults/99-iot-enable || true
 
       - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
@@ -65,7 +70,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 7. 修补 feeds（只做必要修补，不加包）
+      - name: 7. 修补 feeds
         run: |
           cd lede
           find feeds/ -type f -name "*.mk" -exec sed -i '/kmod-fs-exfat-oot/d' {} + || true
@@ -80,11 +85,9 @@ jobs:
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-          # 只清理非 kmod 的 =m
           sed -i '/^CONFIG_PACKAGE_kmod-/!s/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
           make defconfig
 
-          # 强制检查已选择项，防止被 make defconfig 误删
           REQUIRED_PKGS=(
             "CONFIG_PACKAGE_luci-app-passwall"
             "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray"
@@ -119,7 +122,6 @@ jobs:
           done
           make defconfig
 
-          # 强制关闭冲突及未选择的包
           sed -i 's/^CONFIG_PACKAGE_autosamba=y/# CONFIG_PACKAGE_autosamba is not set/' .config
           sed -i 's/^CONFIG_PACKAGE_samba4-server=y/# CONFIG_PACKAGE_samba4-server is not set/' .config
           sed -i 's/^CONFIG_PACKAGE_luci-app-samba4=y/# CONFIG_PACKAGE_luci-app-samba4 is not set/' .config
@@ -149,52 +151,53 @@ jobs:
           make download -j8 || (echo "⚠️ 并发下载失败，单线程重试..." && make download -j1 V=s)
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 11. 预置 Xray 核心与 PassWall 规则（零下载目标）
+      - name: 11. 预置 Xray 核心与 PassWall 规则（文件格式严格校验）
         run: |
           cd lede
 
-          # ---- Xray mipsle 核心 (使用正确的 mips32le 命名) ----
+          # ---- 1. Xray 核心下载与格式校验 ----
           mkdir -p files/usr/bin
-          XRAY_VERSION="latest"
-          XRAY_FILE_SF="Xray-linux-mips32le-softfloat.zip"
-          XRAY_FILE_STD="Xray-linux-mips32le.zip"
+          echo "📥 获取 Xray 最新 mips32le 核心下载链接..."
           
-          echo "📥 下载 Xray mipsle 核心 ($XRAY_VERSION)..."
-          rm -f /tmp/xray.zip
-          
-          # 优先尝试 softfloat 版本，失败则尝试普通版本
-          curl -sL --retry 3 --connect-timeout 20 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE_SF}" \
-            -o /tmp/xray.zip || \
-          curl -sL --retry 3 --connect-timeout 20 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE_STD}" \
-            -o /tmp/xray.zip
+          XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
+            jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
 
-          if file /tmp/xray.zip | grep -q "Zip archive"; then
+          if [ -z "$XRAY_URL" ] || [ "$XRAY_URL" = "null" ]; then
+            echo "❌ 未找到匹配的 Xray zip 文件"; exit 1
+          fi
+          
+          echo "🔗 下载链接: $XRAY_URL"
+          curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
+
+          # 校验 ZIP 压缩包完整性（防止下到了 404 HTML 页面）
+          if unzip -t /tmp/xray.zip >/dev/null 2>&1; then
             unzip -o /tmp/xray.zip xray -d /tmp/xray-extract
             cp /tmp/xray-extract/xray files/usr/bin/xray
             chmod 0755 files/usr/bin/xray
             echo "✅ Xray 已嵌入: $(ls -lh files/usr/bin/xray | awk '{print $5}')"
           else
-            echo "❌ Xray 下载失败，请检查网络"; head -c 300 /tmp/xray.zip; exit 1
+            echo "❌ Xray 文件不是有效的 ZIP 格式，或下载失败"
+            file /tmp/xray.zip
+            head -c 300 /tmp/xray.zip
+            exit 1
           fi
 
-          # ---- PassWall 规则 ----
+          # ---- 2. PassWall 规则下载与格式校验 ----
           mkdir -p files/usr/share/passwall/rules
           RULES_DIR="files/usr/share/passwall/rules"
           
-          echo "📥 下载 gfwlist / chnlist / chnroute..."
-          # gfwlist
+          echo "📥 下载 PassWall 规则文件..."
+          # gfwlist: 纯文本格式 (PassWall 可直接读取)
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
-          # chnlist
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || \
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf" -o "$RULES_DIR/chnlist"
-          # chnroute (使用PassWall默认源)
+          # chnlist: 纯文本
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
+          # chnroute: 纯文本 CIDR
           curl -sL --retry 3 "https://ispip.clang.cn/all_cn.txt" -o "$RULES_DIR/chnroute"
 
           for f in gfwlist chnlist chnroute; do
-            if [ ! -s "$RULES_DIR/$f" ]; then
-              echo "❌ $f 为空，检查下载源"; exit 1
+            # 校验规则文件非空，且必须包含换行符（证明是文本文件）
+            if [ ! -s "$RULES_DIR/$f" ] || ! grep -q $'\n' "$RULES_DIR/$f"; then
+              echo "❌ $f 格式错误或为空"; exit 1
             fi
             echo "✅ $f: $(wc -l < "$RULES_DIR/$f") 行"
           done
@@ -204,14 +207,15 @@ jobs:
         run: |
           cd lede
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j2 V=s > build.log 2>&1 || (tail -n 200 build.log && exit 1)
+          make -j2 V=s 2>&1 | tee build.log || (tail -n 200 build.log && exit 1)
 
       - name: 13. 失败时上传日志
-        if: failure() && steps.compile.outcome != 'success'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
           path: lede/build.log
+          if-no-files-found: warn
 
       - name: 14. 检查固件体积
         id: check_size
