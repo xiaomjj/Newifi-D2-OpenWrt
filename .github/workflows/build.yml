@@ -153,11 +153,11 @@ jobs:
         run: |
           cd lede
 
-          # ---- Xray mipsle 核心 ----
+          # ---- Xray mipsle 核心 (使用正确的 mips32le 命名) ----
           mkdir -p files/usr/bin
           XRAY_VERSION="latest"
-          XRAY_FILE_SF="Xray-linux-mipsle-softfloat.zip"
-          XRAY_FILE="Xray-linux-mipsle.zip"
+          XRAY_FILE_SF="Xray-linux-mips32le-softfloat.zip"
+          XRAY_FILE_STD="Xray-linux-mips32le.zip"
           
           echo "📥 下载 Xray mipsle 核心 ($XRAY_VERSION)..."
           rm -f /tmp/xray.zip
@@ -167,7 +167,7 @@ jobs:
             "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE_SF}" \
             -o /tmp/xray.zip || \
           curl -sL --retry 3 --connect-timeout 20 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE}" \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_FILE_STD}" \
             -o /tmp/xray.zip
 
           if file /tmp/xray.zip | grep -q "Zip archive"; then
@@ -176,7 +176,7 @@ jobs:
             chmod 0755 files/usr/bin/xray
             echo "✅ Xray 已嵌入: $(ls -lh files/usr/bin/xray | awk '{print $5}')"
           else
-            echo "❌ Xray 下载失败，请检查网络或确认最新版是否包含 mipsle"; head -c 300 /tmp/xray.zip; exit 1
+            echo "❌ Xray 下载失败，请检查网络"; head -c 300 /tmp/xray.zip; exit 1
           fi
 
           # ---- PassWall 规则 ----
@@ -184,10 +184,12 @@ jobs:
           RULES_DIR="files/usr/share/passwall/rules"
           
           echo "📥 下载 gfwlist / chnlist / chnroute..."
-          # gfwlist 和 chnlist 使用 jsdelivr CDN
+          # gfwlist
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
-          # chnroute 使用 ispip 专属源
+          # chnlist
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || \
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf" -o "$RULES_DIR/chnlist"
+          # chnroute (使用PassWall默认源)
           curl -sL --retry 3 "https://ispip.clang.cn/all_cn.txt" -o "$RULES_DIR/chnroute"
 
           for f in gfwlist chnlist chnroute; do
