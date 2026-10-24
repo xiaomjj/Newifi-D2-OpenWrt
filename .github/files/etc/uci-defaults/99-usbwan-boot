@@ -9,7 +9,7 @@ for IFACE in usb0 usb1 eth1 eth2; do
       uci set network.usbwan.metric='10'
       uci commit network
       WAN_ZONE=$(uci show firewall 2>/dev/null | grep -E "zone\[[0-9]+\]\.name='wan'" | head -1 | sed -n "s/.*zone\[\([0-9]*\)\].*/\1/p")
-      [ -n "$WAN_ZONE" ] && uci add_list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
+      [ -n "$WAN_ZONE" ] && uci add-list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
       uci commit firewall
       /etc/init.d/network reload
       /etc/init.d/firewall reload
