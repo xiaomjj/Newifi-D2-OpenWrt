@@ -15,7 +15,7 @@ env:
   REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
-  MAX_FIRMWARE_SIZE: 33554432  # 上限提升至 32MB，匹配扩容后的物理极限
+  MAX_FIRMWARE_SIZE: 33554432  # 上限设为物理 32MB
   CCACHE_DIR: /workdir/immortalwrt/.ccache
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
       - name: 1. 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 2. 初始化编译环境 (Ubuntu)
+      - name: 2. 初始化编译环境
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -49,11 +49,11 @@ jobs:
         run: |
           mkdir -p immortalwrt/files
           cp -a files/. immortalwrt/files/ 2>/dev/null || true
-          echo "🔧 修复 Windows 换行符 (CRLF -> LF)..."
+          echo "🔧 修复 Windows 换行符..."
           find immortalwrt/files -type f -exec sed -i 's/\r$//' {} + 2>/dev/null || true
           chmod +x immortalwrt/files/etc/hotplug.d/net/20-usbwan immortalwrt/files/etc/uci-defaults/* 2>/dev/null || true
 
-      - name: 5. 缓存 CCache 与 dl 加速后续编译
+      - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
         with:
           path: |
@@ -106,6 +106,8 @@ jobs:
             "CONFIG_PACKAGE_luci-app-p910nd"
             "CONFIG_PACKAGE_kmod-fs-ksmbd"
             "CONFIG_PACKAGE_ksmbd-server"
+            "CONFIG_PACKAGE_kmod-fs-exfat"
+            "CONFIG_PACKAGE_kmod-fs-ntfs3"
             "CONFIG_PACKAGE_luci-i18n-base-zh-cn"
             "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn"
             "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn"
@@ -127,27 +129,22 @@ jobs:
             fi
           done
 
-      - name: 8. 修改 IP、扩容闪存分区至 32MB
+      - name: 8. 修改 IP、扩容 32MB
         run: |
           cd immortalwrt
-          # 修改默认 IP
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
           
-          # 物理扩容：强制覆盖默认的 16MB 限制，修改 Image 编译大小至 32768k (32MB)
+          # 突破 16MB 限制，强制 32MB
           DEVICE_CONFIG="target/linux/ramips/image/mt7621.mk"
           if [ -f "$DEVICE_CONFIG" ]; then
             sed -i '/d-team_newifi-d2/,/DEVICE_PACKAGES/ s/IMAGE_SIZE := [0-9]*k/IMAGE_SIZE := 32768k/' "$DEVICE_CONFIG" || true
-            echo "✅ 已修改 mt7621.mk：firmware 大小限制提升至 32MB"
           fi
-          
-          # 双保险：修改 DTS 中的 reg 大小（如有必要）
           DTS_FILE="target/linux/ramips/dts/mt7621_d-team_newifi-d2.dts"
           if [ -f "$DTS_FILE" ]; then
             sed -i 's/reg = <0x50000 0xfb0000>;/reg = <0x50000 0x1fb0000>;/' "$DTS_FILE"
-            echo "✅ 已修改 DTS：firmware 分区扩展至 0x1fb0000"
           fi
 
-      - name: 9. 下载源码包 (并发下载 + 单线程重试兜底)
+      - name: 9. 下载源码包
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
@@ -155,11 +152,11 @@ jobs:
           make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 预置 Xray 核心与 PassWall 分流规则库
+      - name: 10. 预置 Xray 核心与分流规则
         run: |
           cd immortalwrt
           mkdir -p files/usr/bin
-          echo "📥 获取 Xray 最新 mips32le 核心..."
+          echo "📥 获取 Xray 核心..."
           XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
             jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
           curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
@@ -169,12 +166,11 @@ jobs:
           
           mkdir -p files/usr/share/passwall/rules
           RULES_DIR="files/usr/share/passwall/rules"
-          echo "📥 下载 PassWall 分流规则..."
+          echo "📥 下载精简分流规则..."
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
-          curl -sL --retry 3 "https://ispip.clang.cn/all_cn.txt" -o "$RULES_DIR/chnroute"
 
-      - name: 11. 开始编译固件
+      - name: 11. 开始编译
         id: compile
         run: |
           cd immortalwrt
@@ -189,28 +185,24 @@ jobs:
           path: immortalwrt/build.log
           if-no-files-found: warn
 
-      - name: 13. 优雅降级：检查固件体积并准备发布
+      - name: 13. 检查体积与准备发布
         id: check_size
         if: steps.compile.outcome == 'success'
         run: |
           cd immortalwrt/bin/targets/ramips/mt7621
-          
-          # 明确判断 sysupgrade.bin 是否生成
           if ls *sysupgrade.bin 1> /dev/null 2>&1; then
             FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
             SIZE=$(stat -c%s "$FIRMWARE")
             SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
             echo "📦 固件体积: ${SIZE_MB} MB"
             if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then 
-              echo "❌ 体积超限 (${SIZE_MB}MB > 32MB)！请检查配置或裁剪软件包。"
-              exit 1
+              echo "❌ 体积超限！"; exit 1
             fi
             echo "✅ 体积合规"
             echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
             echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
           else
-            echo "❌ 编译虽然成功，但未生成 sysupgrade.bin 文件。"
-            echo "💡 常见原因：固件体积依然超过了 DTS 或 Makefile 中的硬性限制。"
+            echo "❌ 未生成 sysupgrade.bin，可能体积超限。"
             exit 1
           fi
 
@@ -219,29 +211,28 @@ jobs:
         if: steps.check_size.outcome == 'success'
         with:
           tag_name: ImmortalWrt-D2-PW-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 PassWall 纯净版 [${{ env.TAG_DATE }}]
+          name: ImmortalWrt Newifi-D2 纯净满血版 [${{ env.TAG_DATE }}]
           body: |
             ## 🚀 固件特色与产品介绍
 
-            本固件基于 **ImmortalWrt 24.10** 稳定版源码为 **Newifi-D2 (MT7621)** 深度定制，剔除了一切多余的臃肿插件，只为“极致纯净、稳定养老”而生。
+            本固件基于 **ImmortalWrt 24.10** 源码为 **Newifi-D2 (MT7621)** 深度定制，突破原厂 16MB 限制，全面释放 32MB 物理闪存，剔除所有臃肿插件，只为“极致纯净、稳定养老”而生。
 
             ### ✨ 核心功能特性
-            * **代理解析**：采用 **PassWall + Xray (Nftables 透明代理)**。已预置最新版 Xray 核心与全套分流规则库（gfwlist/chnlist/chnroute），刷机即用，无需漫长下载。
-            * **性能优化**：预置底层网络调优（UDP Buffer 扩容、TCP BBR 拥塞控制），彻底解决 MT7621 跑 Hysteria2/TUIC 等新协议的断流问题。
-            * **ZRAM 防溢出**：已启用 ZRAM 虚拟内存，缓解 512MB 物理内存压力，确保系统长期运行不 OOM 崩溃。
-            * **绝对纯净**：强硬阉割 OpenClash、SSR+、TurboACC 等源码自带私货，LuCI 界面干干净净。
+            * **代理解析**：采用 **PassWall + Xray (Nftables 透明代理)**。已预置最新版 Xray 核心与分流规则库，刷机填入节点即用。
+            * **性能优化**：预置底层网络调优（UDP Buffer 扩容、TCP BBR），彻底解决 MT7621 跑 Hysteria2 等新协议的断流问题。
+            * **ZRAM 防溢出**：启用 ZRAM 虚拟内存，确保系统长期运行不 OOM。
+            * **绝对纯净**：强硬阉割 OpenClash、SSR+、TurboACC 等源码自带私货。
 
-            ### 🔌 硬件即插即用（开箱即用配置）
+            ### 🔌 硬件即插即用（开箱即用）
             * **WiFi 预设**：默认广播免密 WiFi（2.4G: `alon` / 5G: `alon 5G`），手机直连即可进入 `192.168.2.1` 后台。
-            * **文件共享**：内置 **ksmbd** 核心（支持 NTFS / exFAT / ext4 / FAT32），U 盘插入自动挂载至 `\\192.168.2.1\usb`。
-            * **USB 打印**：内置 **p910nd**，USB 打印机插上即可通过 `9100` 端口打印。
-            * **USB 网络共享**：支持安卓/苹果手机及随身 WiFi。插上手机自动建接口，拔下自动删配置，绝无残留。
-            * **无线中继**：已内置 `relayd`，支持无线桥接扩展。
+            * **文件共享**：内置 **ksmbd**（支持 NTFS / exFAT / ext4 / FAT32），U 盘插入自动挂载。
+            * **USB 打印**：内置 **p910nd**，USB 打印机通过 `9100` 端口打印。
+            * **USB 网络共享**：支持安卓手机、苹果 iPhone、随身 WiFi。插拔自动建删，无残留。
 
             ### ⚠️ 刷机后必做操作
-            1. **重置配置**：如果在 Breed 或 LuCI 刷机，请**务必取消勾选**“保留配置”，以免旧固件的残留导致菜单错乱。
-            2. **配置节点**：进入 `服务 -> PassWall`，在节点列表中填入你的代理节点信息，保存应用即可科学上网。
-            3. **修改 WiFi 密码**：为了安全，进入后台后请前往 `网络 -> 无线` 为 `alon` 设置强密码。
+            1. **重置配置**：刷机请**务必取消勾选**“保留配置”，以免旧固件导致菜单错乱。
+            2. **配置节点**：进入 `服务 -> PassWall`，填入代理节点信息，启用即可。
+            3. **修改密码**：进入后台为 `alon` 设置强密码。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
