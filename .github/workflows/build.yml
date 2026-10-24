@@ -15,7 +15,7 @@ env:
   REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
-  MAX_FIRMWARE_SIZE: 33554432  # 上限设为物理 32MB
+  MAX_FIRMWARE_SIZE: 33554432  # 32MB
   CCACHE_DIR: /workdir/immortalwrt/.ccache
 
 jobs:
@@ -49,11 +49,11 @@ jobs:
         run: |
           mkdir -p immortalwrt/files
           cp -a files/. immortalwrt/files/ 2>/dev/null || true
-          echo "🔧 修复 Windows 换行符 (CRLF -> LF)..."
+          echo "🔧 修复 Windows 换行符..."
           find immortalwrt/files -type f -exec sed -i 's/\r$//' {} + 2>/dev/null || true
           chmod +x immortalwrt/files/etc/hotplug.d/net/20-usbwan immortalwrt/files/etc/uci-defaults/* 2>/dev/null || true
 
-      - name: 5. 缓存 CCache 与 dl 加速编译
+      - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
         with:
           path: |
@@ -68,26 +68,20 @@ jobs:
           cd immortalwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          
-          echo "🔪 物理阉割源码中默认捆绑的无关插件..."
+          echo "🔪 物理阉割无关插件..."
           for pkg in ssr-plus openclash turboacc ddns upnp nlbwmon wol ttyd sqm watchcat; do
             sed -i "/luci-app-$pkg/d" feeds/luci/collections/luci/Makefile 2>/dev/null || true
           done
-          echo "✅ 源码级净化完成"
 
       - name: 7. 加载配置与终极依赖校验
         run: |
           mv "$CONFIG_FILE" immortalwrt/.config
           cd immortalwrt
-          
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
-          
-          # 清除非内核模块的 =m 标记，强制加入固件
           sed -i '/^CONFIG_PACKAGE_kmod-/!s/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
           make defconfig
 
-          # 死锁强制添加指定项，防止被系统遗漏
           REQUIRED_PKGS=(
             "CONFIG_PACKAGE_luci-app-passwall"
             "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray"
@@ -128,43 +122,36 @@ jobs:
           done
           make defconfig
 
-          # 终极大检查：发现垃圾立即中止编译
-          echo "🛡️ 终极校验：发现垃圾立即中止！..."
+          # 终极校验
           for pkg in "luci-app-ssr-plus" "luci-app-openclash" "luci-app-turboacc" "luci-app-ddns" "luci-app-upnp" "luci-app-wol" "luci-app-nlbwmon" "luci-app-ttyd" "luci-app-samba4" "v2ray-core"; do
             if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "❌ 致命错误：发现未授权的插件 ${pkg}！"
+              echo "❌ 发现未授权的插件 ${pkg}！"
               exit 1
             fi
           done
 
-      - name: 8. 修改 IP、强制扩容闪存至 32MB
+      - name: 8. 暴力突破 16MB 限制
         run: |
           cd immortalwrt
-          # 修改默认 IP
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
           
           echo "🔧 正在暴力修改底层编译限制..."
           
-          # 1. 暴力替换 mt7621.mk 中的默认大小
+          # 1. 直接修改 mt7621.mk 中所有设备的 IMAGE_SIZE 为 32448k (因为只编译 D2，无需担心误伤其他设备)
           DEVICE_MK="target/linux/ramips/image/mt7621.mk"
           if [ -f "$DEVICE_MK" ]; then
-            # 精确命中 newifi-d2 所在区块，将其中的 IMAGE_SIZE 强制覆盖为 32448k (留一点余量防止溢出)
-            sed -i -E '/define Device\/d-team_newifi-d2/,/endef/ s/IMAGE_SIZE := [0-9]+k/IMAGE_SIZE := 32448k/' "$DEVICE_MK"
-            echo "✅ 已修改 mt7621.mk：Image Size -> 32448k"
+            sed -i -E 's/IMAGE_SIZE := [0-9]+k/IMAGE_SIZE := 32448k/g' "$DEVICE_MK"
+            echo "✅ 已修改 mt7621.mk：所有 Image Size 强制拉满 32448k"
           fi
           
-          # 2. 暴力修改 DTS 分区表：将 0xfb0000 (15.7MB) 改为 0x1fb0000 (31.7MB)
+          # 2. 强制修改 DTS 分区表，将 0xfb0000 (15.7MB) 替换为 0x1fb0000 (31.7MB)
           DTS_FILE="target/linux/ramips/dts/mt7621_d-team_newifi-d2.dts"
           if [ -f "$DTS_FILE" ]; then
-            # 匹配任何十六进制大小并强行替换
-            sed -i -E 's/reg = <0x50000 0x[0-9a-fA-F]+>;/reg = <0x50000 0x1fb0000>;/' "$DTS_FILE"
-            echo "✅ 已修改 DTS：分区强制扩展到 0x1fb0000"
+            sed -i -E 's/reg = <0x50000 0x[0-9a-fA-F]+>;/reg = <0x50000 0x1fb0000>;/g' "$DTS_FILE"
+            echo "✅ 已修改 DTS：firmware 分区扩展至 0x1fb0000"
           fi
-          
-          # 3. 保险措施：全局搜索并干掉可能残留的 16MB 限制配置
-          sed -i 's/16000k/32448k/g' "$DEVICE_MK" 2>/dev/null || true
 
-      - name: 9. 下载源码包 (并发下载 + 单线程重试兜底)
+      - name: 9. 下载源码包
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
@@ -172,11 +159,10 @@ jobs:
           make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 预置 Xray 核心与 PassWall 分流规则库
+      - name: 10. 预置 Xray 核心与 PassWall 规则
         run: |
           cd immortalwrt
           mkdir -p files/usr/bin
-          echo "📥 获取 Xray 最新 mips32le 核心..."
           XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
             jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
           curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
@@ -186,7 +172,6 @@ jobs:
           
           mkdir -p files/usr/share/passwall/rules
           RULES_DIR="files/usr/share/passwall/rules"
-          echo "📥 下载精简分流规则..."
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
 
@@ -205,7 +190,7 @@ jobs:
           path: immortalwrt/build.log
           if-no-files-found: warn
 
-      - name: 13. 检查固件体积并准备发布
+      - name: 13. 检查体积并准备发布
         id: check_size
         if: steps.compile.outcome == 'success'
         run: |
@@ -216,15 +201,13 @@ jobs:
             SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
             echo "📦 固件体积: ${SIZE_MB} MB"
             if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then 
-              echo "❌ 体积超限 (${SIZE_MB}MB > 32MB)！"
-              exit 1
+              echo "❌ 体积超限！"; exit 1
             fi
             echo "✅ 体积合规"
             echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
             echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
           else
-            echo "❌ 编译虽然成功，但未生成 sysupgrade.bin 文件。"
-            echo "💡 常见原因：固件体积依然超过了限制。"
+            echo "❌ 未生成 sysupgrade.bin 文件。请检查编译日志。"
             exit 1
           fi
 
