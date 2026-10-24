@@ -1,0 +1,17 @@
+#!/bin/sh
+uci set passwall.@global[0].enabled='1'
+uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
+uci set passwall.@global[0].udp_proxy_mode='gfwlist'
+uci set passwall.@global[0].dns_mode='xray'
+uci set passwall.@global[0].dns_direct='223.5.5.5'
+uci set passwall.@global[0].dns_remote='1.1.1.1'
+uci set passwall.@global[0].tcp_fastopen='1'
+uci commit passwall
+
+sysctl -p /etc/sysctl.conf
+
+/etc/init.d/ksmbd enable
+/etc/init.d/ksmbd start 2>/dev/null
+/etc/init.d/p910nd enable
+/etc/init.d/p910nd start 2>/dev/null
+exit 0
