@@ -1,0 +1,20 @@
+#!/bin/sh
+for IFACE in usb0 usb1 eth1 eth2; do
+  [ -e "/sys/class/net/$IFACE" ] || continue
+  if readlink -f "/sys/class/net/$IFACE/device" | grep -q usb; then
+    if ! uci get network.usbwan >/dev/null 2>&1; then
+      uci set network.usbwan=interface
+      uci set network.usbwan.proto='dhcp'
+      uci set network.usbwan.device="$IFACE"
+      uci set network.usbwan.metric='10'
+      uci commit network
+      WAN_ZONE=$(uci show firewall 2>/dev/null | grep -E "zone\[[0-9]+\]\.name='wan'" | head -1 | sed -n "s/.*zone\[\([0-9]*\)\].*/\1/p")
+      [ -n "$WAN_ZONE" ] && uci add_list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
+      uci commit firewall
+      /etc/init.d/network reload
+      /etc/init.d/firewall reload
+    fi
+    break
+  fi
+done
+exit 0
