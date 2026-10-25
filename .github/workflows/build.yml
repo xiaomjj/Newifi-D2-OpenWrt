@@ -135,20 +135,28 @@ jobs:
           cd immortalwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
           
-          echo "🔧 正在暴力修改底层编译限制..."
+          echo "🔧 搜索并修改底层编译限制..."
           
-          # 1. 直接修改 mt7621.mk 中所有设备的 IMAGE_SIZE 为 32448k (因为只编译 D2，无需担心误伤其他设备)
-          DEVICE_MK="target/linux/ramips/image/mt7621.mk"
-          if [ -f "$DEVICE_MK" ]; then
+          # 1. 动态搜索 mt7621.mk
+          DEVICE_MK=$(find target/linux/ramips -name "mt7621.mk" | head -n 1)
+          if [ -n "$DEVICE_MK" ] && [ -f "$DEVICE_MK" ]; then
+            echo "🎯 找到 $DEVICE_MK"
             sed -i -E 's/IMAGE_SIZE := [0-9]+k/IMAGE_SIZE := 32448k/g' "$DEVICE_MK"
-            echo "✅ 已修改 mt7621.mk：所有 Image Size 强制拉满 32448k"
+            echo "✅ 修改后的 IMAGE_SIZE:"
+            grep "IMAGE_SIZE" "$DEVICE_MK" | head -n 5
+          else
+            echo "❌ 找不到 mt7621.mk"
           fi
           
-          # 2. 强制修改 DTS 分区表，将 0xfb0000 (15.7MB) 替换为 0x1fb0000 (31.7MB)
-          DTS_FILE="target/linux/ramips/dts/mt7621_d-team_newifi-d2.dts"
-          if [ -f "$DTS_FILE" ]; then
+          # 2. 动态搜索 DTS 文件
+          DTS_FILE=$(find target/linux/ramips -name "mt7621_d-team_newifi-d2.dts" | head -n 1)
+          if [ -n "$DTS_FILE" ] && [ -f "$DTS_FILE" ]; then
+            echo "🎯 找到 $DTS_FILE"
             sed -i -E 's/reg = <0x50000 0x[0-9a-fA-F]+>;/reg = <0x50000 0x1fb0000>;/g' "$DTS_FILE"
-            echo "✅ 已修改 DTS：firmware 分区扩展至 0x1fb0000"
+            echo "✅ 修改后的 DTS 分区:"
+            grep "reg = <0x50000" "$DTS_FILE" | head -n 2
+          else
+            echo "❌ 找不到 DTS 文件"
           fi
 
       - name: 9. 下载源码包
@@ -180,7 +188,9 @@ jobs:
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j2 V=s 2>&1 | tee build.log || (tail -n 200 build.log && exit 1)
+          # 增加 set -o pipefail，捕获真实的 make 错误退出码
+          set -o pipefail
+          make -j2 V=s 2>&1 | tee build.log
 
       - name: 12. 编译失败时上传日志
         if: always()
