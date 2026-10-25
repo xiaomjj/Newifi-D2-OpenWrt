@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2
+name: Build ImmortalWrt Newifi-D2 Auto-Pro
 
 on:
   workflow_dispatch:
@@ -45,22 +45,180 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 注入预置文件并 HACK 底层校验
+      - name: 4. 自动化注入全功能优化方案与汉化配置 (files/)
         run: |
-          mkdir -p immortalwrt/files
-          cp -a files/. immortalwrt/files/ 2>/dev/null || true
-          echo "🔧 修复 Windows 换行符..."
-          find immortalwrt/files -type f -exec sed -i 's/\r$//' {} + 2>/dev/null || true
-          chmod +x immortalwrt/files/etc/hotplug.d/net/20-usbwan immortalwrt/files/etc/uci-defaults/* 2>/dev/null || true
-          
-          echo "🔨 强行覆盖底层体积校验脚本..."
-          cd immortalwrt
-          cat > scripts/check-size.sh << 'EOF'
-          #!/bin/bash
-          echo "Hack: check-size bypassed."
+          mkdir -p immortalwrt/files/etc/uci-defaults
+          mkdir -p immortalwrt/files/etc/hotplug.d/net
+          mkdir -p immortalwrt/files/etc/config
+          mkdir -p immortalwrt/files/usr/share/passwall/rules
+
+          # --------------------------------------------------------
+          # A. 无线默认开启与中文命名 (alon / alon 5G)
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/97-wifi-defaults
+          #!/bin/sh
+          uci set wireless.radio0.disabled='0'
+          uci set wireless.radio1.disabled='0'
+          uci set wireless.default_radio0.ssid='alon'
+          uci set wireless.default_radio0.encryption='none'
+          uci set wireless.default_radio0.disabled='0'
+          uci set wireless.default_radio1.ssid='alon 5G'
+          uci set wireless.default_radio1.encryption='none'
+          uci set wireless.default_radio1.disabled='0'
+          uci commit wireless
           exit 0
           EOF
-          chmod +x scripts/check-size.sh
+
+          # --------------------------------------------------------
+          # B. Turbo ACC 加速、Passwall 防崩及服务自启
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/98-optimize-defaults
+          #!/bin/sh
+          if uci get turboacc.@global[0] >/dev/null 2>&1; then
+              uci set turboacc.@global[0].sw_flow='1'
+              uci set turboacc.@global[0].hw_flow='1'
+              uci set turboacc.@global[0].fullcone_nat='1'
+              uci commit turboacc
+          fi
+
+          if uci get passwall.@global[0] >/dev/null 2>&1; then
+              uci set passwall.@global[0].enabled='1'
+              uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].udp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].dns_mode='xray'
+              uci set passwall.@global[0].dns_direct='223.5.5.5'
+              uci set passwall.@global[0].dns_remote='1.1.1.1'
+              uci set passwall.@global[0].tcp_fastopen='1'
+              uci commit passwall
+          fi
+
+          /etc/init.d/ksmbd enable
+          /etc/init.d/ksmbd start 2>/dev/null
+          /etc/init.d/p910nd enable
+          /etc/init.d/p910nd start 2>/dev/null
+          exit 0
+          EOF
+
+          # --------------------------------------------------------
+          # C. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/99-usbwan-boot
+          #!/bin/sh
+          for IFACE in usb0 usb1 eth1 eth2; do
+            [ -e "/sys/class/net/$IFACE" ] || continue
+            if readlink -f "/sys/class/net/$IFACE/device" | grep -q usb; then
+              if ! uci get network.usbwan >/dev/null 2>&1; then
+                uci set network.usbwan=interface
+                uci set network.usbwan.proto='dhcp'
+                uci set network.usbwan.device="$IFACE"
+                uci set network.usbwan.metric='10'
+                uci commit network
+                WAN_ZONE=$(uci show firewall 2>/dev/null | grep -E "zone\[[0-9]+\]\.name='wan'" | head -1 | sed -n "s/.*zone\[\([0-9]*\)\].*/\1/p")
+                [ -n "$WAN_ZONE" ] && uci add_list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
+                uci commit firewall
+                /etc/init.d/network reload
+                /etc/init.d/firewall reload
+              fi
+              break
+            fi
+          done
+          exit 0
+          EOF
+
+          # --------------------------------------------------------
+          # D. USB 网卡热插拔动态即插即用脚本
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/hotplug.d/net/20-usbwan
+          #!/bin/sh
+          [ -n "$INTERFACE" ] || exit 0
+          case "$INTERFACE" in usb*|eth1|eth2) ;; *) exit 0 ;; esac
+          is_usb_dev() {
+            if [ -e "/sys/class/net/$INTERFACE/device/uevent" ]; then
+              grep -q "DEVTYPE=usb_interface" "/sys/class/net/$INTERFACE/device/uevent" 2>/dev/null && return 0
+              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q usb && return 0
+            else
+              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q usb && return 0
+            fi
+            return 1
+          }
+          find_wan_zone() {
+            uci show firewall 2>/dev/null | grep -E "zone\[[0-9]+\]\.name='wan'" | head -1 | sed -n "s/.*zone\[\([0-9]*\)\].*/\1/p"
+          }
+          case "$ACTION" in
+            add)
+              is_usb_dev || exit 0
+              uci get network.usbwan >/dev/null 2>&1 && exit 0
+              uci set network.usbwan=interface
+              uci set network.usbwan.proto='dhcp'
+              uci set network.usbwan.device="$INTERFACE"
+              uci set network.usbwan.metric='10'
+              uci commit network
+              WAN_ZONE=$(find_wan_zone)
+              if [ -n "$WAN_ZONE" ]; then
+                uci add_list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
+                uci commit firewall
+              fi
+              /etc/init.d/network reload
+              /etc/init.d/firewall reload
+              ;;
+            remove)
+              CUR_DEV=$(uci get network.usbwan.device 2>/dev/null)
+              [ "$CUR_DEV" = "$INTERFACE" ] || exit 0
+              uci delete network.usbwan 2>/dev/null
+              uci commit network
+              WAN_ZONE=$(find_wan_zone)
+              if [ -n "$WAN_ZONE" ]; then
+                uci del_list firewall.@zone[$WAN_ZONE].network='usbwan' 2>/dev/null
+                uci commit firewall
+              fi
+              /etc/init.d/network reload
+              /etc/init.d/firewall reload
+              ;;
+          esac
+          EOF
+
+          # --------------------------------------------------------
+          # E. 共享与打印配置文件模板
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/config/ksmbd
+          config globals
+              option workgroup 'WORKGROUP'
+              option description 'Newifi-D2'
+          config share
+              option name 'usb'
+              option path '/mnt'
+              option read_only 'no'
+              option guest_ok 'yes'
+              option create_mask '0666'
+              option dir_mask '0777'
+          EOF
+
+          cat << 'EOF' > immortalwrt/files/etc/config/p910nd
+          config p910nd
+              option enabled '1'
+              option device '/dev/usb/lp0'
+              option port '0'
+              option bidirectional '0'
+          EOF
+
+          # --------------------------------------------------------
+          # F. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
+          # --------------------------------------------------------
+          cat << 'EOF' > immortalwrt/files/etc/sysctl.conf
+          fs.file-max = 655350
+          net.core.somaxconn = 1024
+          net.ipv4.tcp_max_syn_backlog = 8192
+          net.ipv4.tcp_rmem = 4096 87380 8388608
+          net.ipv4.tcp_wmem = 4096 65536 8388608
+          net.ipv4.tcp_congestion_control = bbr
+          vm.min_free_kbytes = 16384
+          EOF
+
+          mkdir -p immortalwrt/files/etc/crontabs
+          echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > immortalwrt/files/etc/crontabs/root
+
+          chmod +x immortalwrt/files/etc/hotplug.d/net/20-usbwan immortalwrt/files/etc/uci-defaults/* 2>/dev/null || true
+          echo "🔧 自动化配置与汉化注入完成。"
 
       - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
@@ -68,87 +226,27 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-imm-d2-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-imm-d2-autopro-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-imm-d2-
+            ${{ runner.os }}-imm-d2-autopro-
 
-      - name: 6. 更新 Feeds 与源码净化
+      - name: 6. 更新 Feeds
         run: |
           cd immortalwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          echo "🔪 物理阉割无关插件..."
-          for pkg in ssr-plus openclash turboacc ddns upnp nlbwmon wol ttyd sqm watchcat; do
-            sed -i "/luci-app-$pkg/d" feeds/luci/collections/luci/Makefile 2>/dev/null || true
-          done
 
-      - name: 7. 加载配置与终极依赖校验
+      - name: 7. 加载配置与依赖校验
         run: |
           mv "$CONFIG_FILE" immortalwrt/.config
           cd immortalwrt
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
-          sed -i '/^CONFIG_PACKAGE_kmod-/!s/^CONFIG_PACKAGE_\(.*\)=m/# CONFIG_PACKAGE_\1 is not set/g' .config
-          make defconfig
 
-          REQUIRED_PKGS=(
-            "CONFIG_PACKAGE_luci-app-passwall"
-            "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray"
-            "CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy"
-            "CONFIG_PACKAGE_xray-core"
-            "CONFIG_PACKAGE_kmod-nft-tproxy"
-            "CONFIG_PACKAGE_kmod-nft-socket"
-            "CONFIG_PACKAGE_kmod-tun"
-            "CONFIG_PACKAGE_kmod-inet-diag"
-            "CONFIG_PACKAGE_dnsmasq-full"
-            "CONFIG_PACKAGE_zram-swap"
-            "CONFIG_PACKAGE_block-mount"
-            "CONFIG_PACKAGE_relayd"
-            "CONFIG_PACKAGE_luci-proto-relay"
-            "CONFIG_PACKAGE_kmod-usb-net"
-            "CONFIG_PACKAGE_kmod-usb-net-rndis"
-            "CONFIG_PACKAGE_kmod-usb-net-cdc-ether"
-            "CONFIG_PACKAGE_kmod-usb-net-ipheth"
-            "CONFIG_PACKAGE_usbmuxd"
-            "CONFIG_PACKAGE_kmod-usb-printer"
-            "CONFIG_PACKAGE_p910nd"
-            "CONFIG_PACKAGE_luci-app-p910nd"
-            "CONFIG_PACKAGE_kmod-fs-ksmbd"
-            "CONFIG_PACKAGE_ksmbd-server"
-            "CONFIG_PACKAGE_kmod-fs-exfat"
-            "CONFIG_PACKAGE_kmod-fs-ntfs3"
-            "CONFIG_PACKAGE_luci-i18n-base-zh-cn"
-            "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn"
-            "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn"
-            "CONFIG_PACKAGE_luci-i18n-p910nd-zh-cn"
-          )
-          for pkg in "${REQUIRED_PKGS[@]}"; do
-            if grep -q "^${pkg}=y" .config; then
-              echo "✅ ${pkg}"
-            else
-              echo "${pkg}=y" >> .config
-            fi
-          done
-          make defconfig
-
-          for pkg in "luci-app-ssr-plus" "luci-app-openclash" "luci-app-turboacc" "luci-app-ddns" "luci-app-upnp" "luci-app-wol" "luci-app-nlbwmon" "luci-app-ttyd" "luci-app-samba4" "v2ray-core"; do
-            if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "❌ 发现未授权的插件 ${pkg}！"
-              exit 1
-            fi
-          done
-
-      - name: 8. 修改 IP 与 DTS 分区表
+      - name: 8. 修改 LAN IP 为 192.168.2.1
         run: |
           cd immortalwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
-          
-          echo "🔧 搜索并强改 DTS 分区..."
-          DTS_FILE=$(find target/linux/ramips -name "mt7621_d-team_newifi-d2.dts" | head -n 1)
-          if [ -n "$DTS_FILE" ] && [ -f "$DTS_FILE" ]; then
-            sed -i -E 's/reg = <0x50000 0x[0-9a-fA-F]+>;/reg = <0x50000 0x1fb0000>;/g' "$DTS_FILE"
-            echo "✅ 已修改 DTS：$DTS_FILE"
-          fi
 
       - name: 9. 下载源码包
         run: |
@@ -158,18 +256,9 @@ jobs:
           make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 预置 Xray 核心与 PassWall 规则
+      - name: 10. 预置 PassWall 规则
         run: |
           cd immortalwrt
-          mkdir -p files/usr/bin
-          XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
-            jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
-          curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
-          unzip -o /tmp/xray.zip xray -d /tmp/xray-extract
-          cp /tmp/xray-extract/xray files/usr/bin/xray
-          chmod 0755 files/usr/bin/xray
-          
-          mkdir -p files/usr/share/passwall/rules
           RULES_DIR="files/usr/share/passwall/rules"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
@@ -179,7 +268,7 @@ jobs:
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j2 V=s 2>&1 | tee build.log
+          make -j1 V=s 2>&1 | tee build.log
 
       - name: 12. 编译失败时上传日志
         if: always()
@@ -214,22 +303,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-D2-PW-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 纯净满血版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-D2-AutoPro-${{ env.TAG_DATE }}
+          name: ImmortalWrt Newifi-D2 全功能自动化汉化版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 固件特色与产品介绍
+            ## 🚀 固件亮点与自动化特性
 
-            本固件基于 **ImmortalWrt 24.10** 源码为 **Newifi-D2 (MT7621)** 深度定制，突破原厂 16MB 限制，全面释放 32MB 物理闪存。
+            本固件基于 **ImmortalWrt 24.10** 为 **Newifi-D2 (MT7621)** 量身定制，系统界面及所有插件均已实现**完美中文汉化**。
 
-            ### 🔌 核心功能与硬件即插即用
-            * PassWall + Xray 智能代理（已预置核心与分流）。
-            * 支持全格式 U 盘共享（NTFS / exFAT / ext4 / FAT32）。
-            * 支持 USB 打印，支持安卓/苹果/随身 WiFi 网络共享。
-            * 默认广播 `alon` 免密 WiFi，连上即可进后台。
-
-            ### ⚠️ 刷机必看
-            1. 刷机请**务必取消勾选**“保留配置”。
-            2. 进后台为 `alon` 设置强密码，并在 PassWall 填入节点。
+            ### ⚡ 核心自动化优化：
+            1. **全中文开箱即用**：Web 后台及 PassWall、打印服务等所有菜单均自带中文。
+            2. **Turbo ACC 硬件加速**：压榨 MT7621 极限，千兆转发不吃 CPU。
+            3. **默认免密 Wi-Fi**：开机自动广播 `alon` 和 `alon 5G`。
+            4. **USB 智能随身 Wi-Fi 拨号**：支持热插拔自动识别并桥接上网。
+            5. **开箱即用的共享与打印**：自动挂载 U 盘（`/mnt`），自动启用 Ksmbd 局域网共享和网络打印。
+            6. **长期稳定抗压**：集成 BBR 拥塞控制、ZRAM 内存保护，并内置 Cron 计划任务**每日凌晨 4 点自动清理系统内存碎片**。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
