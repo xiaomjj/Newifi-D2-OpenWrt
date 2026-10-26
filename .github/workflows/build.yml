@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2 Auto-Pro
+name: Build ImmortalWrt Newifi-D2 Production
 
 on:
   workflow_dispatch:
@@ -45,17 +45,32 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 自动化注入全功能优化方案与汉化配置 (files/)
+      - name: 4. 动态拉取最新稳定版 Xray 核心并注入自动化配置 (files/)
         run: |
-          mkdir -p immortalwrt/files/etc/uci-defaults
-          mkdir -p immortalwrt/files/etc/hotplug.d/net
-          mkdir -p immortalwrt/files/etc/config
-          mkdir -p immortalwrt/files/usr/share/passwall/rules
+          cd immortalwrt
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/etc/hotplug.d/net
+          mkdir -p files/etc/config
+          mkdir -p files/usr/share/passwall/rules
+          mkdir -p files/usr/bin
+
+          echo "🔍 正在获取官方最新稳定版 Xray-core (mips32le)..."
+          XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
+            jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
+          if [ -n "$XRAY_URL" ] && [ "$XRAY_URL" != "null" ]; then
+            curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
+            unzip -o /tmp/xray.zip xray -d /tmp/xray-extract
+            cp /tmp/xray-extract/xray files/usr/bin/xray
+            chmod 0755 files/usr/bin/xray
+            echo "✅ 最新 Xray 核心预置成功！"
+          else
+            echo "⚠️ 获取 Xray 失败，将使用源码默认版本。"
+          fi
 
           # --------------------------------------------------------
           # A. 无线默认开启与中文命名 (alon / alon 5G)
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/97-wifi-defaults
+          cat << 'EOF' > files/etc/uci-defaults/97-wifi-defaults
           #!/bin/sh
           uci set wireless.radio0.disabled='0'
           uci set wireless.radio1.disabled='0'
@@ -70,10 +85,11 @@ jobs:
           EOF
 
           # --------------------------------------------------------
-          # B. Turbo ACC 加速、Passwall 防崩及服务自启
+          # B. Turbo ACC 加速、Passwall 防崩、AGH 零配置初始化与服务自启
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/98-optimize-defaults
+          cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
+          # 1. 开启 Turbo ACC 硬件加速及 FullCone NAT
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
               uci set turboacc.@global[0].sw_flow='1'
               uci set turboacc.@global[0].hw_flow='1'
@@ -81,6 +97,7 @@ jobs:
               uci commit turboacc
           fi
 
+          # 2. Passwall 基础参数防崩初始化
           if uci get passwall.@global[0] >/dev/null 2>&1; then
               uci set passwall.@global[0].enabled='1'
               uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
@@ -92,6 +109,14 @@ jobs:
               uci commit passwall
           fi
 
+          # 3. AdGuard Home 自动化匹配 (零配置开箱即用)
+          if uci get adguardhome.@global[0] >/dev/null 2>&1; then
+              uci set adguardhome.@global[0].enabled='1'
+              uci set adguardhome.@global[0].port='3000'
+              uci commit adguardhome
+          fi
+
+          # 4. 启动共享与打印服务
           /etc/init.d/ksmbd enable
           /etc/init.d/ksmbd start 2>/dev/null
           /etc/init.d/p910nd enable
@@ -102,7 +127,7 @@ jobs:
           # --------------------------------------------------------
           # C. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/uci-defaults/99-usbwan-boot
+          cat << 'EOF' > files/etc/uci-defaults/99-usbwan-boot
           #!/bin/sh
           for IFACE in usb0 usb1 eth1 eth2; do
             [ -e "/sys/class/net/$IFACE" ] || continue
@@ -128,7 +153,7 @@ jobs:
           # --------------------------------------------------------
           # D. USB 网卡热插拔动态即插即用脚本
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/hotplug.d/net/20-usbwan
+          cat << 'EOF' > files/etc/hotplug.d/net/20-usbwan
           #!/bin/sh
           [ -n "$INTERFACE" ] || exit 0
           case "$INTERFACE" in usb*|eth1|eth2) ;; *) exit 0 ;; esac
@@ -180,7 +205,7 @@ jobs:
           # --------------------------------------------------------
           # E. 共享与打印配置文件模板
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/config/ksmbd
+          cat << 'EOF' > files/etc/config/ksmbd
           config globals
               option workgroup 'WORKGROUP'
               option description 'Newifi-D2'
@@ -193,7 +218,7 @@ jobs:
               option dir_mask '0777'
           EOF
 
-          cat << 'EOF' > immortalwrt/files/etc/config/p910nd
+          cat << 'EOF' > files/etc/config/p910nd
           config p910nd
               option enabled '1'
               option device '/dev/usb/lp0'
@@ -204,7 +229,7 @@ jobs:
           # --------------------------------------------------------
           # F. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
           # --------------------------------------------------------
-          cat << 'EOF' > immortalwrt/files/etc/sysctl.conf
+          cat << 'EOF' > files/etc/sysctl.conf
           fs.file-max = 655350
           net.core.somaxconn = 1024
           net.ipv4.tcp_max_syn_backlog = 8192
@@ -214,11 +239,11 @@ jobs:
           vm.min_free_kbytes = 16384
           EOF
 
-          mkdir -p immortalwrt/files/etc/crontabs
-          echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > immortalwrt/files/etc/crontabs/root
+          mkdir -p files/etc/crontabs
+          echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
-          chmod +x immortalwrt/files/etc/hotplug.d/net/20-usbwan immortalwrt/files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 自动化配置与汉化注入完成。"
+          chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
+          echo "🔧 生产环境自动化脚本与最新 Xray 核心注入完成。"
 
       - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
@@ -226,9 +251,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-imm-d2-autopro-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-imm-d2-prod-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-imm-d2-autopro-
+            ${{ runner.os }}-imm-d2-prod-
 
       - name: 6. 更新 Feeds
         run: |
@@ -303,20 +328,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-D2-AutoPro-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 全功能自动化汉化版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-D2-Prod-${{ env.TAG_DATE }}
+          name: ImmortalWrt Newifi-D2 生产环境 AGH+Passwall 版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 固件亮点与自动化特性
+            ## 🚀 生产环境固件亮点
 
-            本固件基于 **ImmortalWrt 24.10** 为 **Newifi-D2 (MT7621)** 量身定制，系统界面及所有插件均已实现**完美中文汉化**。
+            本固件基于 **ImmortalWrt 24.10** 为 **Newifi-D2 (MT7621)** 打造，后台及所有功能均已**完美汉化**。
 
-            ### ⚡ 核心自动化优化：
-            1. **全中文开箱即用**：Web 后台及 PassWall、打印服务等所有菜单均自带中文。
-            2. **Turbo ACC 硬件加速**：压榨 MT7621 极限，千兆转发不吃 CPU。
-            3. **默认免密 Wi-Fi**：开机自动广播 `alon` 和 `alon 5G`。
-            4. **USB 智能随身 Wi-Fi 拨号**：支持热插拔自动识别并桥接上网。
-            5. **开箱即用的共享与打印**：自动挂载 U 盘（`/mnt`），自动启用 Ksmbd 局域网共享和网络打印。
-            6. **长期稳定抗压**：集成 BBR 拥塞控制、ZRAM 内存保护，并内置 Cron 计划任务**每日凌晨 4 点自动清理系统内存碎片**。
+            ### ⚡ 生产级配置与核心亮点：
+            1. **最新稳定版 Xray 核心**：编译时自动从 GitHub 官方抓取最新 `mips32le` 核心预置，杜绝源里陈旧版本带来的兼容问题。
+            2. **AdGuard Home (AGH)**：精简版去广告 DNS，已配置开机自启（端口 3000），提供高效的本地 DNS 解析与去广告。
+            3. **Turbo ACC 硬件加速**：压榨 MT7621 极限，千兆转发不吃 CPU。
+            4. **默认免密 Wi-Fi**：开机自动广播 `alon` 和 `alon 5G`。
+            5. **USB 智能随身 Wi-Fi 拨号**：支持热插拔自动识别并桥接上网。
+            6. **抗压养老机制**：集成 BBR 拥塞控制、ZRAM 内存保护，并内置 Cron 计划任务**每日凌晨 4 点自动清理系统内存碎片**。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
