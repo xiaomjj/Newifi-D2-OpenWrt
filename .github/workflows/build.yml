@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2 Production
+name: Build ImmortalWrt Newifi-D2 Production Full v6
 
 on:
   workflow_dispatch:
@@ -45,31 +45,31 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 动态拉取最新稳定版 Xray 核心并注入自动化配置 (files/)
+      - name: 4. 强力抓取与 Newifi-D2 (mips32le) 完美匹配的最新 Xray 核心并注入 (files/)
         run: |
           cd immortalwrt
+          mkdir -p files/usr/bin
           mkdir -p files/etc/uci-defaults
           mkdir -p files/etc/hotplug.d/net
           mkdir -p files/etc/config
           mkdir -p files/usr/share/passwall/rules
-          mkdir -p files/usr/bin
 
-          echo "🔍 正在获取官方最新稳定版 Xray-core (mips32le)..."
+          echo "🔍 正在从 GitHub 官方抓取最新稳定版 Xray-core (mips32le)..."
           XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
             jq -r '.assets[] | select(.name | test("linux-mips32le.*zip")) | .browser_download_url' | head -n 1)
+          
           if [ -n "$XRAY_URL" ] && [ "$XRAY_URL" != "null" ]; then
-            curl -sL --retry 3 "$XRAY_URL" -o /tmp/xray.zip
+            curl -sL --retry 5 "$XRAY_URL" -o /tmp/xray.zip
             unzip -o /tmp/xray.zip xray -d /tmp/xray-extract
             cp /tmp/xray-extract/xray files/usr/bin/xray
-            chmod 0755 files/usr/bin/xray
-            echo "✅ 最新 Xray 核心预置成功！"
+            chmod +x files/usr/bin/xray
+            echo "✅ 成功拉取最新 Xray 核心并精准绑定到 files/usr/bin/xray！"
           else
-            echo "⚠️ 获取 Xray 失败，将使用源码默认版本。"
+            echo "❌ 致命错误：未能获取到精准匹配的 Xray 官方下载链接！"
+            exit 1
           fi
 
-          # --------------------------------------------------------
           # A. 无线默认开启与中文命名 (alon / alon 5G)
-          # --------------------------------------------------------
           cat << 'EOF' > files/etc/uci-defaults/97-wifi-defaults
           #!/bin/sh
           uci set wireless.radio0.disabled='0'
@@ -84,12 +84,9 @@ jobs:
           exit 0
           EOF
 
-          # --------------------------------------------------------
-          # B. Turbo ACC 加速、Passwall 防崩、AGH 零配置初始化与服务自启
-          # --------------------------------------------------------
+          # B. Turbo ACC、Passwall、AGH、USB打印 零配置初始化
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
-          # 1. 开启 Turbo ACC 硬件加速及 FullCone NAT
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
               uci set turboacc.@global[0].sw_flow='1'
               uci set turboacc.@global[0].hw_flow='1'
@@ -97,7 +94,6 @@ jobs:
               uci commit turboacc
           fi
 
-          # 2. Passwall 基础参数防崩初始化
           if uci get passwall.@global[0] >/dev/null 2>&1; then
               uci set passwall.@global[0].enabled='1'
               uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
@@ -109,14 +105,13 @@ jobs:
               uci commit passwall
           fi
 
-          # 3. AdGuard Home 自动化匹配 (零配置开箱即用)
           if uci get adguardhome.@global[0] >/dev/null 2>&1; then
               uci set adguardhome.@global[0].enabled='1'
               uci set adguardhome.@global[0].port='3000'
               uci commit adguardhome
           fi
 
-          # 4. 启动共享与打印服务
+          # 强制自启并激活 Ksmbd 共享与 USB 打印服务 (p910nd)
           /etc/init.d/ksmbd enable
           /etc/init.d/ksmbd start 2>/dev/null
           /etc/init.d/p910nd enable
@@ -124,9 +119,7 @@ jobs:
           exit 0
           EOF
 
-          # --------------------------------------------------------
           # C. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
-          # --------------------------------------------------------
           cat << 'EOF' > files/etc/uci-defaults/99-usbwan-boot
           #!/bin/sh
           for IFACE in usb0 usb1 eth1 eth2; do
@@ -150,9 +143,7 @@ jobs:
           exit 0
           EOF
 
-          # --------------------------------------------------------
           # D. USB 网卡热插拔动态即插即用脚本
-          # --------------------------------------------------------
           cat << 'EOF' > files/etc/hotplug.d/net/20-usbwan
           #!/bin/sh
           [ -n "$INTERFACE" ] || exit 0
@@ -202,9 +193,7 @@ jobs:
           esac
           EOF
 
-          # --------------------------------------------------------
-          # E. 共享与打印配置文件模板
-          # --------------------------------------------------------
+          # E. 局域网共享 (Ksmbd) 与 USB 打印服务 (p910nd) 预置配置文件
           cat << 'EOF' > files/etc/config/ksmbd
           config globals
               option workgroup 'WORKGROUP'
@@ -226,9 +215,7 @@ jobs:
               option bidirectional '0'
           EOF
 
-          # --------------------------------------------------------
           # F. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
-          # --------------------------------------------------------
           cat << 'EOF' > files/etc/sysctl.conf
           fs.file-max = 655350
           net.core.somaxconn = 1024
@@ -243,19 +230,19 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 生产环境自动化脚本与最新 Xray 核心注入完成。"
+          echo "🔧 自动化配置、最新 Xray 锁定及 USB 打印服务预置完成。"
 
-      - name: 5. 缓存 CCache 与 dl
+      - name: 5. 缓存 CCache 与 dl (升级至 v6 强制清理旧缓存)
         uses: actions/cache@v4
         with:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-imm-d2-prod-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-imm-d2-prod-v6-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-imm-d2-prod-
+            ${{ runner.os }}-imm-d2-prod-v6-
 
-      - name: 6. 更新 Feeds
+      - name: 6. 更新并安装 Feeds
         run: |
           cd immortalwrt
           ./scripts/feeds update -a
@@ -281,21 +268,21 @@ jobs:
           make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 10. 预置 PassWall 规则
+      - name: 10. 预置 PassWall 最新分流规则
         run: |
           cd immortalwrt
           RULES_DIR="files/usr/share/passwall/rules"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist"
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-host-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
 
-      - name: 11. 开始编译固件
+      - name: 11. 开始编译固件（多线程编译，带单线程错误降级）
         id: compile
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j1 V=s 2>&1 | tee build.log
+          make -j$(nproc) || make -j1 V=s 2>&1 | tee build.log
 
-      - name: 12. 编译失败时上传日志
+      - name: 12. 编译失败时上传错误日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -328,20 +315,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-D2-Prod-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 生产环境 AGH+Passwall 版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-D2-Printer-${{ env.TAG_DATE }}
+          name: ImmortalWrt Newifi-D2 打印机与全量集成版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 生产环境固件亮点
+            ## 🚀 终极打印服务与全量集成说明
 
-            本固件基于 **ImmortalWrt 24.10** 为 **Newifi-D2 (MT7621)** 打造，后台及所有功能均已**完美汉化**。
+            本固件基于 **ImmortalWrt 24.10** 为 **Newifi-D2 (MT7621)** 全量集成编译。
 
-            ### ⚡ 生产级配置与核心亮点：
-            1. **最新稳定版 Xray 核心**：编译时自动从 GitHub 官方抓取最新 `mips32le` 核心预置，杜绝源里陈旧版本带来的兼容问题。
-            2. **AdGuard Home (AGH)**：精简版去广告 DNS，已配置开机自启（端口 3000），提供高效的本地 DNS 解析与去广告。
-            3. **Turbo ACC 硬件加速**：压榨 MT7621 极限，千兆转发不吃 CPU。
-            4. **默认免密 Wi-Fi**：开机自动广播 `alon` 和 `alon 5G`。
-            5. **USB 智能随身 Wi-Fi 拨号**：支持热插拔自动识别并桥接上网。
-            6. **抗压养老机制**：集成 BBR 拥塞控制、ZRAM 内存保护，并内置 Cron 计划任务**每日凌晨 4 点自动清理系统内存碎片**。
+            ### 🖨️ USB 打印服务器特性：
+            1. **开箱即用**：内置 `kmod-usb-printer` 驱动与 `p910nd` 打印守护进程，固件刷入后插入 USB 打印机即可自动接管。
+            2. **自动配置**：通过内置配置文件默认绑定 `/dev/usb/lp0` 端口 9100，局域网电脑添加网络打印机时直接选择 `AppSocket/PJL` 协议连接 `192.168.2.1:9100` 即可直接打印。
+            3. **其他集成**：完美集成 nftables 版 PassWall + Xray 最新核心、AdGuard Home、Turbo ACC 硬件加速及随身 Wi-Fi 动态热插拔。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
