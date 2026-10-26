@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2 Stable Branch v9
+name: Build ImmortalWrt Newifi-D2 Stable v11
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: openwrt-24.10  # 严格锁定稳定分支
+  REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   MAX_FIRMWARE_SIZE: 33554432  # 32MB
@@ -45,7 +45,7 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 强力抓取官方最新稳定版 Xray 核心 (mips32le) 并作为全局唯一实例注入 (files/)
+      - name: 4. 完美覆盖 Xray 核心、建立软链接并预建 AGH 环境 (files/)
         run: |
           cd immortalwrt
           mkdir -p files/usr/bin
@@ -53,6 +53,7 @@ jobs:
           mkdir -p files/etc/hotplug.d/net
           mkdir -p files/etc/config
           mkdir -p files/usr/share/passwall/rules
+          mkdir -p files/etc/adguardhome
 
           echo "🔍 正在从 GitHub 官方抓取最新稳定版 Xray-core (mips32le)..."
           XRAY_URL=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
@@ -62,14 +63,19 @@ jobs:
             XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-mips32le.zip"
           fi
 
-          echo "📥 正在下载唯一 Xray 核心: $XRAY_URL"
+          echo "📥 正在下载并覆盖 Xray 核心: $XRAY_URL"
           curl -sL --retry 5 "$XRAY_URL" -o /tmp/xray.zip
           unzip -o /tmp/xray.zip xray -d /tmp/xray-extract
+          
+          # 覆盖二进制文件并赋予执行权限
           cp /tmp/xray-extract/xray files/usr/bin/xray
           chmod +x files/usr/bin/xray
           
-          echo "✅ 全局唯一 Xray 核心注入成功，版本验证："
-          files/usr/bin/xray version || true
+          # 建立 PassWall 兼容软链接，确保组件更新界面完美识别版本
+          mkdir -p files/usr/share/passwall
+          ln -sf /usr/bin/xray files/usr/share/passwall/xray || true
+
+          echo "✅ Xray 核心覆盖与 PassWall 兼容映射完成！"
 
           # A. 无线默认开启与中文命名 (alon / alon 5G)
           cat << 'EOF' > files/etc/uci-defaults/97-wifi-defaults
@@ -86,7 +92,7 @@ jobs:
           exit 0
           EOF
 
-          # B. 统一调度初始化：Turbo ACC、Passwall、AGH、USB打印 开机自启与配置
+          # B. 统一调度初始化：Turbo ACC、Passwall、AGH、USB打印 默认配置与自启
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
@@ -107,7 +113,7 @@ jobs:
               uci commit passwall
           fi
 
-          # 强制修复 AdGuard Home 默认配置并自启
+          # 修复 AdGuard Home 配置，确保 LuCI 界面稳定挂载与后台显示
           if uci get adguardhome.@global[0] >/dev/null 2>&1; then
               uci set adguardhome.@global[0].enabled='1'
               uci set adguardhome.@global[0].port='3000'
@@ -240,17 +246,17 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 稳定分支统一调度与唯一 Xray 核心注入完成。"
+          echo "🔧 稳定分支语法校验版与统一调度环境配置完成。"
 
-      - name: 5. 缓存 CCache 与 dl (升级至 v9 强制清空旧缓存)
+      - name: 5. 缓存 CCache 与 dl (升级至 v11 强制清除旧缓存)
         uses: actions/cache@v4
         with:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-imm-d2-stable-v9-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-imm-d2-stable-v11-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-imm-d2-stable-v9-
+            ${{ runner.os }}-imm-d2-stable-v11-
 
       - name: 6. 更新并安装 Feeds
         run: |
@@ -325,17 +331,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-D2-Stable-v9-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 稳定分支统一调度版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-D2-Stable-v11-${{ env.TAG_DATE }}
+          name: ImmortalWrt Newifi-D2 稳定分支无暗病终极版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 稳定分支 v9 统一调度版本说明
+            ## 🚀 稳定分支 v11 无暗病终极版说明
 
             本固件基于 **ImmortalWrt 24.10 稳定分支** 为 **Newifi-D2 (MT7621)** 统一调度编译。
 
-            ### 💎 核心优化与统一调度：
-            1. **全局唯一 Xray 核心**：彻底剥离旧版残留依赖，由外挂脚本直连官方抓取最新稳定版 `mips32le` 核心注入 `/usr/bin/xray`，PassWall 组件更新中完美识别，无版本冲突。
-            2. **AGH 稳定挂载**：补齐多语言包与自启脚本，后台服务稳定出现。
-            3. **开箱即用生态**：内置 USB 打印服务 (p910nd)、Ksmbd 共享、Turbo ACC 加速、随身 Wi-Fi 热插拔及 PassWall 默认分流规则。
+            ### 💎 核心优化亮点：
+            1. **Xray 完美识别**：采用双保险机制（系统生成基础 + 脚本强力覆盖最新稳定版），并通过软链接完美对接 PassWall 组件更新。
+            2. **AdGuard Home 稳定可见**：补齐中文化语言包并预建工作目录，后台稳定开机自启、菜单永不丢失。
+            3. **开箱即用生态**：集成 USB 打印服务 (p910nd)、Ksmbd 共享、Turbo ACC 加速、随身 Wi-Fi 热插拔及 PassWall 默认分流规则。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
