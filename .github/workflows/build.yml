@@ -45,7 +45,7 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none openwrt
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: 4. 配置 OpenWrt 官方稳定基础源 (剔除并发冲突)
+      - name: 4. 配置 OpenWrt 官方稳定基础源
         run: |
           cd openwrt
           echo "🗑️ 正在清空默认 Feeds..."
@@ -276,14 +276,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-openwrt-d2-stable-fresh-
 
-      - name: 7. 更新 Feeds 并独立安全拉取 Passwall 插件
+      - name: 7. 更新 Feeds 并安全加固克隆 Passwall
         run: |
           cd openwrt
           echo "🔄 正在更新官方 Feeds..."
           ./scripts/feeds update -a
           
-          echo "📥 正在独立安全克隆 Passwall 官方插件到 feeds 目录..."
-          mkdir -p feeds/passwall
+          echo "📥 正在应用防冲突净化与安全克隆 Passwall..."
+          # 禁用 Git 终端交互提示，防止遇到冲突时挂起卡死
+          export GIT_TERMINAL_PROMPT=0
+          # 彻底清除可能存在的残留，确保目录干净
+          rm -rf feeds/passwall
+          # 执行浅克隆
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git feeds/passwall
           
           echo "📦 正在安装所有 Feeds 软件包..."
