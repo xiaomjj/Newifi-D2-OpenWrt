@@ -310,27 +310,33 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-mosdns-v5-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-mosdns-v7-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-mosdns-v5-
+            ${{ runner.os }}-immortalwrt-d2-mosdns-v7-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】开始更新并安装 Feeds..."
+          echo "🔍 【预编译阶段】开始更新 Feeds..."
           echo "=================================================="
-          
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】开始组件完整性与依赖健康审计..."
+          echo "🔍 【预编译阶段】全量解包并安装核心三方源与所有基础包..."
           echo "=================================================="
-          
+          ./scripts/feeds install -p passwall -a
+          ./scripts/feeds install -p passwall_packages -a
+          ./scripts/feeds install -p mosdns -a
+          ./scripts/feeds install -a || true
+
+          echo "=================================================="
+          echo "📋 应用本地配置并执行依赖健康校验 (defconfig)..."
+          echo "=================================================="
           cp $GITHUB_WORKSPACE/$CONFIG_FILE .config
           make defconfig
 
+          # 确保关键组件 100% 写入配置
           for PKG in "CONFIG_PACKAGE_luci-app-passwall" "CONFIG_PACKAGE_luci-app-mosdns" "CONFIG_PACKAGE_kmod-fs-ksmbd" "CONFIG_PACKAGE_p910nd"; do
             if grep -q "$PKG=y" .config; then
               echo "  [✅ 检测通过] $PKG 已就绪"
