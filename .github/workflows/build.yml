@@ -272,23 +272,22 @@ jobs:
           path: |
             /workdir/openwrt/.ccache
             /workdir/openwrt/dl
-          key: ${{ runner.os }}-openwrt-d2-stable-fresh-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-openwrt-d2-stable-tarball-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-openwrt-d2-stable-fresh-
+            ${{ runner.os }}-openwrt-d2-stable-tarball-
 
-      - name: 7. 更新 Feeds 并安全加固克隆 Passwall
+      - name: 7. 更新 Feeds 并通过免密压缩包解压获取 Passwall
         run: |
           cd openwrt
           echo "🔄 正在更新官方 Feeds..."
           ./scripts/feeds update -a
           
-          echo "📥 正在应用防冲突净化与安全克隆 Passwall..."
-          # 禁用 Git 终端交互提示，防止遇到冲突时挂起卡死
-          export GIT_TERMINAL_PROMPT=0
-          # 彻底清除可能存在的残留，确保目录干净
+          echo "📦 正在下载 Passwall 官方源码压缩包（完全避开 git 鉴权报错）..."
           rm -rf feeds/passwall
-          # 执行浅克隆
-          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git feeds/passwall
+          mkdir -p feeds/passwall
+          curl -sL https://github.com/xiaorouji/openwrt-passwall/archive/refs/heads/main.tar.gz -o passwall.tar.gz
+          tar -xzf passwall.tar.gz -C feeds/passwall --strip-components=1
+          rm -f passwall.tar.gz
           
           echo "📦 正在安装所有 Feeds 软件包..."
           ./scripts/feeds install -a
