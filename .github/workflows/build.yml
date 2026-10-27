@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.xx Newifi-D2
+name: Build ImmortalWrt 25.12 Newifi-D2
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: main
+  REPO_BRANCH: openwrt-25.12
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   MAX_FIRMWARE_SIZE: 33554432  # 32MB
@@ -26,20 +26,22 @@ jobs:
       - name: 1. 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 2. 初始化编译环境
+      - name: 2. 初始化编译环境 (25.xx 专属依赖)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/local/share/chromium
           df -h
           sudo apt-get update
-          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.eu.org/init_build_environment.sh)'
+          sudo apt-get install -y build-essential clang flex bison gasm2c rsync device-tree-compiler gettext \
+            git libncurses5-dev libssl-dev python3-distutils python3-pyelftools python3-setuptools \
+            libpython3-dev zlib1g-dev unzip subversion file ccache wget curl
           sudo ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
           echo "$TZ" | sudo tee /etc/timezone > /dev/null
           sudo mkdir -p /workdir
           sudo chown -R "$USER":"$USER" /workdir
 
-      - name: 3. 克隆 ImmortalWrt 最新 25.xx/main 分支源码
+      - name: 3. 克隆 ImmortalWrt 25.12 分支源码
         working-directory: /workdir
         run: |
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
@@ -237,7 +239,7 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 ImmortalWrt 25.xx 初始化脚本部署完成。"
+          echo "🔧 ImmortalWrt 25.12 初始化脚本部署完成。"
 
       - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
@@ -245,9 +247,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-v25-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-v2512-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-v25-
+            ${{ runner.os }}-immortalwrt-d2-v2512-
 
       - name: 6. 更新并安装 Feeds
         run: |
@@ -303,19 +305,19 @@ jobs:
             exit 1
           fi
 
-      - name: 12. 发布 Release 版本
+      - name: 14. 发布 Release 版本
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-v25-Newifi-D2-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.xx 稳定版 Newifi-D2 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-25.12-Newifi-D2-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 稳定版 Newifi-D2 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.xx 优化加固版固件
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 优化加固版固件
 
-            本固件基于 **ImmortalWrt 最新 25.xx 分支** 编译，专为 **Newifi-D2 (MT7621)** 打造，完美整合官方优秀生态与高兼容性驱动。
+            本固件基于 **ImmortalWrt 25.12 稳定分支** 编译，专为 **Newifi-D2 (MT7621)** 打造，完美整合官方优秀生态与高兼容性驱动。
 
             ### 💎 核心功能特性：
-            1. **ImmortalWrt 25.xx 现代内核**：更高的性能、更新的软件包生态与更强的网络吞吐。
+            1. **ImmortalWrt 25.12 现代内核**：更高性能与最新软件包生态。
             2. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动，即插即用、自动拨号。
             3. **系统与网络加固**：
                - 预置后台网段 `192.168.2.1`。
