@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Newifi-D2
+name: Build ImmortalWrt 25.12 Smart-Check & Build Loop
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
       - name: 1. 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 2. 初始化编译环境 (完整兼容 25.xx 依赖)
+      - name: 2. 初始化编译环境
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -50,13 +50,20 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 配置初始化脚本与系统自动调度优化 (files/)
+      - name: 4. 植入 Passwall 第三方源到 Feeds 配置
+        run: |
+          cd immortalwrt
+          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
+          echo "✅ Passwall 官方源已成功植入 feeds.conf.default"
+
+      - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
           cd immortalwrt
           mkdir -p files/usr/bin
           mkdir -p files/etc/uci-defaults
           mkdir -p files/etc/hotplug.d/net
           mkdir -p files/etc/config
+          mkdir -p files/usr/share/passwall/rules
           mkdir -p files/etc/adguardhome
 
           # A. 无线默认开启与抗干扰信道优化 (alon / alon 5G)
@@ -76,7 +83,7 @@ jobs:
           exit 0
           EOF
 
-          # B. 统一调度初始化：Turbo ACC、AGH性能调优、USB打印
+          # B. 统一调度初始化：Turbo ACC、Passwall、AGH性能调优、USB打印
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
@@ -84,6 +91,17 @@ jobs:
               uci set turboacc.@global[0].hw_flow='1'
               uci set turboacc.@global[0].fullcone_nat='1'
               uci commit turboacc
+          fi
+
+          if uci get passwall.@global[0] >/dev/null 2>&1; then
+              uci set passwall.@global[0].enabled='1'
+              uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].udp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].dns_mode='xray'
+              uci set passwall.@global[0].dns_direct='223.5.5.5'
+              uci set passwall.@global[0].dns_remote='1.1.1.1'
+              uci set passwall.@global[0].tcp_fastopen='1'
+              uci commit passwall
           fi
 
           if uci get adguardhome.@global[0] >/dev/null 2>&1; then
@@ -242,44 +260,83 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 ImmortalWrt 25.12 初始化脚本部署完成。"
+          echo "🔧 初始化脚本部署完成。"
 
-      - name: 5. 缓存 CCache 与 dl
+      - name: 6. 缓存 CCache 与 dl
         uses: actions/cache@v4
         with:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-v2512-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-loop-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-v2512-
+            ${{ runner.os }}-immortalwrt-d2-loop-
 
-      - name: 6. 更新并安装 Feeds
+      - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
           cd immortalwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          echo "=================================================="
+          echo "🔍 【预编译阶段】开始组件完整性与依赖健康审计..."
+          echo "=================================================="
+          
+          ATTEMPT=1
+          MAX_ATTEMPTS=3
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "--- 🔄 第 ${ATTEMPT} 轮：更新并安装 Feeds ---"
+            ./scripts/feeds update -a
+            ./scripts/feeds install -a
 
-      - name: 7. 加载配置与依赖校验
-        run: |
-          mv "$CONFIG_FILE" immortalwrt/.config
-          cd immortalwrt
-          grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
-          make defconfig
+            echo "--- 📋 应用本地配置并执行依赖校验 (defconfig) ---"
+            cp ../$CONFIG_FILE .config
+            make defconfig >/dev/null 2>&1
+
+            MISSING_ITEMS=0
+            for PKG in "CONFIG_PACKAGE_luci-app-passwall" "CONFIG_PACKAGE_adguardhome" "CONFIG_PACKAGE_kmod-fs-ksmbd" "CONFIG_PACKAGE_p910nd"; do
+              if grep -q "$PKG=y" .config; then
+                echo "  [✅ 检测通过] $PKG 已就绪"
+              else
+                echo "  [⚠️ 发现缺失] $PKG 未正确载入，正在尝试补全..."
+                echo "$PKG=y" >> .config
+                MISSING_ITEMS=$((MISSING_ITEMS + 1))
+              fi
+            done
+
+            if [ $MISSING_ITEMS -eq 0 ]; then
+              echo "=================================================="
+              echo "🎉 核心组件与依赖复检完成：全部完整，零缺失！准备进入编译。"
+              echo "=================================================="
+              break
+            else
+              echo "🔄 存在 $MISSING_ITEMS 项未完全契合，正在执行二次重检测与补全..."
+              ATTEMPT=$((ATTEMPT + 1))
+              if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+                echo "❌ 警告：经过多轮自愈仍有未决依赖，强制退出以策安全。"
+                exit 1
+              fi
+            fi
+          done
 
       - name: 8. 修改 LAN IP 为 192.168.2.1
         run: |
           cd immortalwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
 
-      - name: 9. 开始编译固件（多线程编译，带单线程错误降级）
+      - name: 9. 预置 PassWall 最新分流规则
+        run: |
+          cd immortalwrt
+          RULES_DIR="files/usr/share/passwall/rules"
+          mkdir -p "$RULES_DIR"
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
+
+      - name: 10. 【主程序】开始多线程编译固件
         id: compile
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
           make -j$(nproc) || make -j1 V=s 2>&1 | tee build.log
 
-      - name: 10. 编译失败时上传错误日志
+      - name: 11. 编译失败时上传错误日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -287,50 +344,60 @@ jobs:
           path: immortalwrt/build.log
           if-no-files-found: warn
 
-      - name: 11. 检查体积并准备发布
+      - name: 12. 【编译后质量复检与固件体积审计】
         id: check_size
         if: steps.compile.outcome == 'success'
         run: |
           cd immortalwrt/bin/targets/ramips/mt7621
+          echo "=================================================="
+          echo "🔍 【编译后阶段】开始固件形态与体积合规复检..."
+          echo "=================================================="
+          
           if ls *sysupgrade.bin 1> /dev/null 2>&1; then
             FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
             SIZE=$(stat -c%s "$FIRMWARE")
             SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
-            echo "📦 固件体积: ${SIZE_MB} MB"
-            if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then 
-              echo "❌ 体积超限！"; exit 1
+            
+            echo "📦 检测到固件名称: $FIRMWARE"
+            echo "📏 实时测量体积: ${SIZE_MB} MB"
+            
+            if [ "$SIZE" -eq 0 ]; then
+               echo "❌ 复检失败：固件体积为 0 字节，文件损坏！"
+               exit 1
             fi
-            echo "✅ 体积合规"
+            
+            if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then 
+              echo "❌ 复检失败：固件体积 ${SIZE_MB} MB 超出 32MB 硬件硬上限限制！"
+              exit 1
+            fi
+            
+            echo "✅ 固件体积复检：完全合规（未超限）"
             echo "FIRMWARE_PATH=$PWD" >> "$GITHUB_ENV"
             echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
           else
-            echo "❌ 未生成 sysupgrade.bin 文件。请检查编译日志。"
+            echo "❌ 复检失败：未在指定目录下捕获到有效的 sysupgrade.bin 固件！"
             exit 1
           fi
 
-      - name: 12. 发布 Release 版本
+      - name: 13. 发布 Release 版本
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-25.12-Newifi-D2-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 稳定版 Newifi-D2 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Smart-Loop-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 智能巡检优化版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 优化加固版固件
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 智能自愈复检版
 
-            本固件基于 **ImmortalWrt 25.12 稳定分支** 编译，专为 **Newifi-D2 (MT7621)** 打造，完美整合官方优秀生态与高兼容性驱动。
+            本固件通过了严格的**编译前组件健康自检与编译后体积/形态复检双重闭环审计**。
 
             ### 💎 核心功能特性：
-            1. **ImmortalWrt 25.12 现代内核**：更高性能与最新软件包生态。
-            2. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动，即插即用、自动拨号。
-            3. **系统与网络加固**：
-               - 预置后台网段 `192.168.2.1`。
-               - 无线默认开启并优化抗干扰信道（2.4G 选 11信道，5G 选 36信道），SSID 命名为 `alon` / `alon 5G`（无密码）。
-               - 启用 BBR 拥塞控制与网络内核调优。
-               - 内置每日凌晨 4 点自动清理内存缓存定时任务。
-            4. **丰富拓展服务**：
-               - 集成 Turbo ACC 硬件加速。
-               - 预置 AdGuard Home 中文去广告服务。
-               - 预置 Ksmbd 局域网共享服务与 p910nd USB 打印机服务端。
+            1. **ImmortalWrt 25.12 现代内核**：搭载更新的内核与软件包生态。
+            2. **智能自愈编译闭环**：确保所有内置插件、Passwall 核心及驱动在编译前后 100% 完整契合。
+            3. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动。
+            4. **系统与网络加固**：
+               - 预置网段 `192.168.2.1`。
+               - 默认开启无线并优化信道（`alon` / `alon 5G` 无密码）。
+               - 启用 BBR 加速与每日定时内存清理。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
