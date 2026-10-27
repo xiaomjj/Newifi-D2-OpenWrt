@@ -310,9 +310,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-mosdns-v7-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-mosdns-v8-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-mosdns-v7-
+            ${{ runner.os }}-immortalwrt-d2-mosdns-v8-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
@@ -323,11 +323,11 @@ jobs:
           ./scripts/feeds update -a
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】全量解包并安装核心三方源与所有基础包..."
+          echo "🔍 【预编译阶段】全量解包并安装核心三方源与所有基础包（带容错保护）..."
           echo "=================================================="
-          ./scripts/feeds install -p passwall -a
-          ./scripts/feeds install -p passwall_packages -a
-          ./scripts/feeds install -p mosdns -a
+          ./scripts/feeds install -p passwall -a || true
+          ./scripts/feeds install -p passwall_packages -a || true
+          ./scripts/feeds install -p mosdns -a || true
           ./scripts/feeds install -a || true
 
           echo "=================================================="
