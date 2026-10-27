@@ -1,4 +1,4 @@
-name: Build Pure OpenWrt Official Stable Newifi-D2
+name: Build ImmortalWrt 25.xx Newifi-D2
 
 on:
   workflow_dispatch:
@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REPO_URL: https://github.com/openwrt/openwrt
-  REPO_BRANCH: openwrt-25.12
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: main
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   MAX_FIRMWARE_SIZE: 33554432  # 32MB
-  CCACHE_DIR: /workdir/openwrt/.ccache
+  CCACHE_DIR: /workdir/immortalwrt/.ccache
 
 jobs:
   build:
@@ -39,35 +39,19 @@ jobs:
           sudo mkdir -p /workdir
           sudo chown -R "$USER":"$USER" /workdir
 
-      - name: 3. 克隆 OpenWrt 官方稳定分支源码
+      - name: 3. 克隆 ImmortalWrt 最新 25.xx/main 分支源码
         working-directory: /workdir
         run: |
-          git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none openwrt
-          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+          git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
+          ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 配置 OpenWrt 官方稳定基础源
+      - name: 4. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
-          cd openwrt
-          echo "🗑️ 正在清空默认 Feeds..."
-          rm -f feeds.conf.default
-          
-          echo "🔄 正在写入 OpenWrt 官方基础稳定源..."
-          cat << 'EOF' > feeds.conf.default
-          src-git packages https://github.com/openwrt/packages.git;openwrt-25.12
-          src-git luci https://github.com/openwrt/luci.git;openwrt-25.12
-          src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
-          src-git telephony https://github.com/openwrt/telephony.git;openwrt-25.12
-          EOF
-          echo "✅ 官方基础稳定源配置完成！"
-
-      - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
-        run: |
-          cd openwrt
+          cd immortalwrt
           mkdir -p files/usr/bin
           mkdir -p files/etc/uci-defaults
           mkdir -p files/etc/hotplug.d/net
           mkdir -p files/etc/config
-          mkdir -p files/usr/share/passwall/rules
           mkdir -p files/etc/adguardhome
 
           # A. 无线默认开启与抗干扰信道优化 (alon / alon 5G)
@@ -87,7 +71,7 @@ jobs:
           exit 0
           EOF
 
-          # B. 统一调度初始化：Turbo ACC、Passwall、AGH性能调优、USB打印
+          # B. 统一调度初始化：Turbo ACC、AGH性能调优、USB打印
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
@@ -95,17 +79,6 @@ jobs:
               uci set turboacc.@global[0].hw_flow='1'
               uci set turboacc.@global[0].fullcone_nat='1'
               uci commit turboacc
-          fi
-
-          if uci get passwall.@global[0] >/dev/null 2>&1; then
-              uci set passwall.@global[0].enabled='1'
-              uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
-              uci set passwall.@global[0].udp_proxy_mode='gfwlist'
-              uci set passwall.@global[0].dns_mode='xray'
-              uci set passwall.@global[0].dns_direct='223.5.5.5'
-              uci set passwall.@global[0].dns_remote='1.1.1.1'
-              uci set passwall.@global[0].tcp_fastopen='1'
-              uci commit passwall
           fi
 
           if uci get adguardhome.@global[0] >/dev/null 2>&1; then
@@ -264,73 +237,56 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 官方稳定版加固初始化脚本部署完成。"
+          echo "🔧 ImmortalWrt 25.xx 初始化脚本部署完成。"
 
-      - name: 6. 缓存 CCache 与 dl
+      - name: 5. 缓存 CCache 与 dl
         uses: actions/cache@v4
         with:
           path: |
-            /workdir/openwrt/.ccache
-            /workdir/openwrt/dl
-          key: ${{ runner.os }}-openwrt-d2-stable-tarball-${{ hashFiles('newifi-d2.config') }}
+            /workdir/immortalwrt/.ccache
+            /workdir/immortalwrt/dl
+          key: ${{ runner.os }}-immortalwrt-d2-v25-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-openwrt-d2-stable-tarball-
+            ${{ runner.os }}-immortalwrt-d2-v25-
 
-      - name: 7. 更新 Feeds 并通过免密压缩包解压获取 Passwall
+      - name: 6. 更新并安装 Feeds
         run: |
-          cd openwrt
-          echo "🔄 正在更新官方 Feeds..."
+          cd immortalwrt
           ./scripts/feeds update -a
-          
-          echo "📦 正在下载 Passwall 官方源码压缩包（完全避开 git 鉴权报错）..."
-          rm -rf feeds/passwall
-          mkdir -p feeds/passwall
-          curl -sL https://github.com/xiaorouji/openwrt-passwall/archive/refs/heads/main.tar.gz -o passwall.tar.gz
-          tar -xzf passwall.tar.gz -C feeds/passwall --strip-components=1
-          rm -f passwall.tar.gz
-          
-          echo "📦 正在安装所有 Feeds 软件包..."
           ./scripts/feeds install -a
 
-      - name: 8. 加载配置与依赖校验
+      - name: 7. 加载配置与依赖校验
         run: |
-          mv "$CONFIG_FILE" openwrt/.config
-          cd openwrt
+          mv "$CONFIG_FILE" immortalwrt/.config
+          cd immortalwrt
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-      - name: 9. 修改 LAN IP 为 192.168.2.1
+      - name: 8. 修改 LAN IP 为 192.168.2.1
         run: |
-          cd openwrt
+          cd immortalwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
 
-      - name: 10. 预置 PassWall 最新分流规则
-        run: |
-          cd openwrt
-          RULES_DIR="files/usr/share/passwall/rules"
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
-
-      - name: 11. 开始编译固件（多线程编译，带单线程错误降级）
+      - name: 9. 开始编译固件（多线程编译，带单线程错误降级）
         id: compile
         run: |
-          cd openwrt
+          cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
           make -j$(nproc) || make -j1 V=s 2>&1 | tee build.log
 
-      - name: 12. 编译失败时上传错误日志
+      - name: 10. 编译失败时上传错误日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
-          path: openwrt/build.log
+          path: immortalwrt/build.log
           if-no-files-found: warn
 
-      - name: 13. 检查体积并准备发布
+      - name: 11. 检查体积并准备发布
         id: check_size
         if: steps.compile.outcome == 'success'
         run: |
-          cd openwrt/bin/targets/ramips/mt7621
+          cd immortalwrt/bin/targets/ramips/mt7621
           if ls *sysupgrade.bin 1> /dev/null 2>&1; then
             FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
             SIZE=$(stat -c%s "$FIRMWARE")
@@ -347,29 +303,29 @@ jobs:
             exit 1
           fi
 
-      - name: 14. 发布 Release 版本
+      - name: 12. 发布 Release 版本
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: OpenWrt-Official-Stable-${{ env.TAG_DATE }}
-          name: OpenWrt 官方最新稳定版 Newifi-D2 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-v25-Newifi-D2-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.xx 稳定版 Newifi-D2 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 纯正官方生态防御加固版固件
+            ## 🚀 Newifi-D2 ImmortalWrt 25.xx 优化加固版固件
 
-            本固件底层源码及软件包源 100% 采用 **OpenWrt 官方正式稳定分支**，专为 **Newifi-D2 (MT7621)** 精心打造，提供纯净、稳定、无后门的官方级安全体验。
+            本固件基于 **ImmortalWrt 最新 25.xx 分支** 编译，专为 **Newifi-D2 (MT7621)** 打造，完美整合官方优秀生态与高兼容性驱动。
 
             ### 💎 核心功能特性：
-            1. **纯正官方生态**：系统核心、AdGuard Home 与 PassWall 均由官方稳定源编译，彻底根治菜单丢失及依赖错位。
-            2. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动，插上主流及冷门板子即插即用、自动拨号。
+            1. **ImmortalWrt 25.xx 现代内核**：更高的性能、更新的软件包生态与更强的网络吞吐。
+            2. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动，即插即用、自动拨号。
             3. **系统与网络加固**：
                - 预置后台网段 `192.168.2.1`。
                - 无线默认开启并优化抗干扰信道（2.4G 选 11信道，5G 选 36信道），SSID 命名为 `alon` / `alon 5G`（无密码）。
                - 启用 BBR 拥塞控制与网络内核调优。
-               - 内置每日凌晨 4 点自动清理内存缓存定时任务，防止 MT7621 满载溢出。
+               - 内置每日凌晨 4 点自动清理内存缓存定时任务。
             4. **丰富拓展服务**：
-               - 集成 Turbo ACC 网络硬件加速。
-               - 预置 Ksmbd 局域网共享服务。
-               - 预置 p910nd USB 打印机服务端。
+               - 集成 Turbo ACC 硬件加速。
+               - 预置 AdGuard Home 中文去广告服务。
+               - 预置 Ksmbd 局域网共享服务与 p910nd USB 打印机服务端。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
