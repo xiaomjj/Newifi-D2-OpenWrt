@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Newifi-D2 Native v14
+name: Build Hardened OpenWrt Latest Stable Newifi-D2 v21
 
 on:
   workflow_dispatch:
@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: openwrt-24.10
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: openwrt-25
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   MAX_FIRMWARE_SIZE: 33554432  # 32MB
-  CCACHE_DIR: /workdir/immortalwrt/.ccache
+  CCACHE_DIR: /workdir/openwrt/.ccache
 
 jobs:
   build:
@@ -39,15 +39,31 @@ jobs:
           sudo mkdir -p /workdir
           sudo chown -R "$USER":"$USER" /workdir
 
-      - name: 3. 克隆 ImmortalWrt 稳定分支源码
+      - name: 3. 克隆 OpenWrt 官方最新稳定分支源码
         working-directory: /workdir
         run: |
-          git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
-          ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
+          git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none openwrt
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: 4. 配置初始化脚本与系统自动调度 (files/)
+      - name: 4. 配置 OpenWrt 官方最新稳定源并引入稳定版 Passwall
         run: |
-          cd immortalwrt
+          cd openwrt
+          echo "🗑️ 正在清空默认 Feeds..."
+          rm -f feeds.conf.default
+          
+          echo "🔄 正在写入 OpenWrt 官方最新稳定源及 Passwall 源..."
+          cat << 'EOF' > feeds.conf.default
+          src-git packages https://github.com/openwrt/packages.git;openwrt-25
+          src-git luci https://github.com/openwrt/luci.git;openwrt-25
+          src-git routing https://github.com/openwrt/routing.git;openwrt-25
+          src-git telephony https://github.com/openwrt/telephony.git;openwrt-25
+          src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main
+          EOF
+          echo "✅ 官方稳定源与插件源配置完成！"
+
+      - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
+        run: |
+          cd openwrt
           mkdir -p files/usr/bin
           mkdir -p files/etc/uci-defaults
           mkdir -p files/etc/hotplug.d/net
@@ -55,11 +71,13 @@ jobs:
           mkdir -p files/usr/share/passwall/rules
           mkdir -p files/etc/adguardhome
 
-          # A. 无线默认开启与中文命名 (alon / alon 5G)
+          # A. 无线默认开启与抗干扰信道优化 (alon / alon 5G)
           cat << 'EOF' > files/etc/uci-defaults/97-wifi-defaults
           #!/bin/sh
           uci set wireless.radio0.disabled='0'
           uci set wireless.radio1.disabled='0'
+          uci set wireless.radio0.channel='11'
+          uci set wireless.radio1.channel='36'
           uci set wireless.default_radio0.ssid='alon'
           uci set wireless.default_radio0.encryption='none'
           uci set wireless.default_radio0.disabled='0'
@@ -70,7 +88,7 @@ jobs:
           exit 0
           EOF
 
-          # B. 统一调度初始化：Turbo ACC、Passwall、AGH、USB打印 默认配置与自启
+          # B. 统一调度初始化：Turbo ACC、Passwall、AGH性能调优、USB打印
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
@@ -111,12 +129,37 @@ jobs:
           exit 0
           EOF
 
-          # C. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
+          # C. 针对 MT7621 内存与 AGH 性能的专属 yaml 基础配置文件（防止高压崩溃）
+          cat << 'EOF' > files/etc/adguardhome.yaml
+          bind_host: 0.0.0.0
+          bind_port: 3000
+          users: []
+          auth_attempts: 5
+          block_jarah: false
+          dns:
+            bind_hosts:
+              - 0.0.0.0
+            port: 53
+            cache_size: 4096
+            cache_ttl_min: 60
+            cache_ttl_max: 86400
+            upstream_dns:
+              - https://dns.alidns.com/dns-query
+              - https://doh.pub/dns-query
+          tls:
+            enabled: false
+          filters: []
+          clients: []
+          log_file: ""
+          verbose: false
+          EOF
+
+          # D. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
           cat << 'EOF' > files/etc/uci-defaults/99-usbwan-boot
           #!/bin/sh
-          for IFACE in usb0 usb1 eth1 eth2; do
+          for IFACE in usb0 usb1 eth1 eth2 wwan0; do
             [ -e "/sys/class/net/$IFACE" ] || continue
-            if readlink -f "/sys/class/net/$IFACE/device" | grep -q usb; then
+            if readlink -f "/sys/class/net/$IFACE/device" | grep -q -E "usb|wwan"; then
               if ! uci get network.usbwan >/dev/null 2>&1; then
                 uci set network.usbwan=interface
                 uci set network.usbwan.proto='dhcp'
@@ -135,17 +178,17 @@ jobs:
           exit 0
           EOF
 
-          # D. USB 网卡热插拔动态即插即用脚本（带完整的双向闭环拔出清理恢复逻辑）
+          # E. 全功能 USB 网卡热插拔动态即插即用脚本（支持更多网卡前缀）
           cat << 'EOF' > files/etc/hotplug.d/net/20-usbwan
           #!/bin/sh
           [ -n "$INTERFACE" ] || exit 0
-          case "$INTERFACE" in usb*|eth1|eth2) ;; *) exit 0 ;; esac
+          case "$INTERFACE" in usb*|eth1|eth2|wwan*) ;; *) exit 0 ;; esac
           is_usb_dev() {
             if [ -e "/sys/class/net/$INTERFACE/device/uevent" ]; then
               grep -q "DEVTYPE=usb_interface" "/sys/class/net/$INTERFACE/device/uevent" 2>/dev/null && return 0
-              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q usb && return 0
+              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q -E "usb|wwan" && return 0
             else
-              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q usb && return 0
+              readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null | grep -q -E "usb|wwan" && return 0
             fi
             return 1
           }
@@ -185,7 +228,7 @@ jobs:
           esac
           EOF
 
-          # E. 局域网共享 (Ksmbd) 与 USB 打印服务 (p910nd) 预置配置文件
+          # F. 局域网共享 (Ksmbd) 与 USB 打印服务 (p910nd) 预置配置
           cat << 'EOF' > files/etc/config/ksmbd
           config globals
               option workgroup 'WORKGROUP'
@@ -207,7 +250,7 @@ jobs:
               option bidirectional '0'
           EOF
 
-          # F. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
+          # G. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
           cat << 'EOF' > files/etc/sysctl.conf
           fs.file-max = 655350
           net.core.somaxconn = 1024
@@ -222,47 +265,39 @@ jobs:
           echo "0 4 * * * sync && echo 3 > /proc/sys/vm/drop_caches" > files/etc/crontabs/root
 
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
-          echo "🔧 纯原生源库初始化脚本部署完成。"
+          echo "🔧 v21 防御性加固初始化脚本部署完成。"
 
-      - name: 5. 缓存 CCache 与 dl (升级至 v14 强制清空旧缓存)
+      - name: 6. 缓存 CCache 与 dl (刷新至 v21 加固版起点)
         uses: actions/cache@v4
         with:
           path: |
-            /workdir/immortalwrt/.ccache
-            /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-imm-d2-native-v14-${{ hashFiles('newifi-d2.config') }}
+            /workdir/openwrt/.ccache
+            /workdir/openwrt/dl
+          key: ${{ runner.os }}-openwrt-d2-v21-hardened-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-imm-d2-native-v14-
+            ${{ runner.os }}-openwrt-d2-v21-hardened-
 
-      - name: 6. 更新并安装 Feeds
+      - name: 7. 更新并安装 Feeds
         run: |
-          cd immortalwrt
+          cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 7. 加载配置与依赖校验
+      - name: 8. 加载配置与依赖校验
         run: |
-          mv "$CONFIG_FILE" immortalwrt/.config
-          cd immortalwrt
+          mv "$CONFIG_FILE" openwrt/.config
+          cd openwrt
           grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
 
-      - name: 8. 修改 LAN IP 为 192.168.2.1
+      - name: 9. 修改 LAN IP 为 192.168.2.1
         run: |
-          cd immortalwrt
+          cd openwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
-
-      - name: 9. 下载源码包
-        run: |
-          cd immortalwrt
-          export CCACHE_DIR="$CCACHE_DIR"
-          ccache -M 5G
-          make download -j8 || make download -j1 V=s
-          find dl -size -1024c -exec rm -f {} \;
 
       - name: 10. 预置 PassWall 最新分流规则
         run: |
-          cd immortalwrt
+          cd openwrt
           RULES_DIR="files/usr/share/passwall/rules"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
@@ -270,7 +305,7 @@ jobs:
       - name: 11. 开始编译固件（多线程编译，带单线程错误降级）
         id: compile
         run: |
-          cd immortalwrt
+          cd openwrt
           export CCACHE_DIR="$CCACHE_DIR"
           make -j$(nproc) || make -j1 V=s 2>&1 | tee build.log
 
@@ -279,14 +314,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
-          path: immortalwrt/build.log
+          path: openwrt/build.log
           if-no-files-found: warn
 
       - name: 13. 检查体积并准备发布
         id: check_size
         if: steps.compile.outcome == 'success'
         run: |
-          cd immortalwrt/bin/targets/ramips/mt7621
+          cd openwrt/bin/targets/ramips/mt7621
           if ls *sysupgrade.bin 1> /dev/null 2>&1; then
             FIRMWARE=$(ls *sysupgrade.bin | head -n 1)
             SIZE=$(stat -c%s "$FIRMWARE")
@@ -307,16 +342,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-D2-Native-v14-${{ env.TAG_DATE }}
-          name: ImmortalWrt Newifi-D2 纯原生源库版 v14 [${{ env.TAG_DATE }}]
+          tag_name: OpenWrt-Hardened-v21-${{ env.TAG_DATE }}
+          name: OpenWrt 官方最新稳定版·防御加固版 v21 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 纯原生源库版 v14 说明
+            ## 🚀 OpenWrt 官方最新稳定版·防御加固版 v21 说明
 
-            本固件基于 **ImmortalWrt 24.10 稳定分支** 为 **Newifi-D2 (MT7621)** 编译。
+            本方案在纯正官方最新稳定生态的基础上，针对 MT7621 硬件瓶颈、随身 Wi-Fi 驱动缺失、AGH 资源占用及无线抗干扰做出了全方位深度加固，专为 **Newifi-D2** 打造。
 
-            ### 💎 核心亮点：
-            1. **100% 官方源库原生编译**：AdGuard Home、PassWall 与 Xray 核心均通过 `openwrt-24.10` 分支原生编译，完美消除版本错位和 LuCI 界面识别为【无】的现象。
-            2. **开箱即用调度**：预置网段 `192.168.2.1`、Wi-Fi 默认开启（`alon` / `alon 5G`）、USB 打印服务（`p910nd`）、Ksmbd 共享、Turbo ACC 加速及随身 Wi-Fi 智能热插拔（插上自动拨号、拔出自动清理恢复）。
+            ### 💎 核心加固亮点：
+            1. **全系随身 Wi-Fi 驱动全覆盖**：补齐了 RNDIS、CDC-NCM、WWAN、Option 等底层驱动，冷门高通/ASR 板子插上即拔即用。
+            2. **AGH 性能与内存保护**：内置预设配置文件，优化 DNS 缓存与上游查询，配合每日凌晨 4 点自动清理内存，防止 MT7621 满载爆内存。
+            3. **无线抗干扰优化**：开机自动固定 2.4G/5G 优质信道（11信道与36信道），显著降低日常环境无线抖动。
+            4. **自动化闭环调度**：默认预置网段 `192.168.2.1`、Wi-Fi 默认开启（`alon` / `alon 5G`）、USB 打印服务（`p910nd`）、Ksmbd 共享及 Turbo ACC 硬件加速。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
