@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Smart-Check & Build Loop
+name: Build ImmortalWrt 25.12 Ultimate MosDNS Loop
 
 on:
   workflow_dispatch:
@@ -50,12 +50,12 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 植入 Passwall 官方源与依赖库到 Feeds 配置
+      - name: 4. 植入 Passwall 与 MosDNS 第三方源到 Feeds 配置
         run: |
           cd immortalwrt
           echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git" >> feeds.conf.default
           echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git" >> feeds.conf.default
-          echo "✅ Passwall 官方源及依赖库已成功植入 feeds.conf.default"
+          echo "✅ 第三方软件源已成功植入 feeds.conf.default"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
@@ -65,7 +65,7 @@ jobs:
           mkdir -p files/etc/hotplug.d/net
           mkdir -p files/etc/config
           mkdir -p files/usr/share/passwall/rules
-          mkdir -p files/etc/adguardhome
+          mkdir -p files/etc/mosdns
 
           # A. 无线默认开启与抗干扰信道优化 (alon / alon 5G)
           cat << 'EOF' > files/etc/uci-defaults/97-wifi-defaults
@@ -84,7 +84,7 @@ jobs:
           exit 0
           EOF
 
-          # B. 统一调度初始化：Turbo ACC、Passwall、AGH性能调优、USB打印
+          # B. 统一调度初始化：Turbo ACC、Passwall、MosDNS、USB打印
           cat << 'EOF' > files/etc/uci-defaults/98-optimize-defaults
           #!/bin/sh
           if uci get turboacc.@global[0] >/dev/null 2>&1; then
@@ -98,56 +98,93 @@ jobs:
               uci set passwall.@global[0].enabled='1'
               uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
               uci set passwall.@global[0].udp_proxy_mode='gfwlist'
-              uci set passwall.@global[0].dns_mode='xray'
-              uci set passwall.@global[0].dns_direct='223.5.5.5'
-              uci set passwall.@global[0].dns_remote='1.1.1.1'
+              uci set passwall.@global[0].dns_mode='dnsmasq'
               uci set passwall.@global[0].tcp_fastopen='1'
               uci commit passwall
           fi
 
-          if uci get adguardhome.@global[0] >/dev/null 2>&1; then
-              uci set adguardhome.@global[0].enabled='1'
-              uci set adguardhome.@global[0].port='3000'
-              uci commit adguardhome
+          if uci get mosdns.@global[0] >/dev/null 2>&1; then
+              uci set mosdns.@global[0].enabled='1'
+              uci set mosdns.@global[0].listen_port='5335'
+              uci commit mosdns
           else
-              uci set adguardhome.@global[0]='global'
-              uci set adguardhome.@global[0].enabled='1'
-              uci set adguardhome.@global[0].port='3000'
-              uci commit adguardhome
+              uci set mosdns.@global[0]='global'
+              uci set mosdns.@global[0].enabled='1'
+              uci set mosdns.@global[0].listen_port='5335'
+              uci commit mosdns
           fi
 
           /etc/init.d/ksmbd enable
           /etc/init.d/ksmbd start 2>/dev/null
           /etc/init.d/p910nd enable
           /etc/init.d/p910nd start 2>/dev/null
-          /etc/init.d/adguardhome enable
-          /etc/init.d/adguardhome start 2>/dev/null
+          /etc/init.d/mosdns enable
+          /etc/init.d/mosdns start 2>/dev/null
           exit 0
           EOF
 
-          # C. 针对 MT7621 内存与 AGH 性能的专属 yaml 基础配置文件
-          cat << 'EOF' > files/etc/adguardhome.yaml
-          bind_host: 0.0.0.0
-          bind_port: 3000
-          users: []
-          auth_attempts: 5
-          block_jarah: false
-          dns:
-            bind_hosts:
-              - 0.0.0.0
-            port: 53
-            cache_size: 4096
-            cache_ttl_min: 60
-            cache_ttl_max: 86400
-            upstream_dns:
-              - https://dns.alidns.com/dns-query
-              - https://doh.pub/dns-query
-          tls:
+          # C. MosDNS 核心配置文件 (开箱即用，内置本地/远程分流与缓存)
+          cat << 'EOF' > files/etc/mosdns/config.yaml
+          log:
+            level: info
+            file: ""
+
+          api:
             enabled: false
-          filters: []
-          clients: []
-          log_file: ""
-          verbose: false
+            addr: "127.0.0.1:8338"
+
+          plugins:
+            - tag: "main_sequence"
+              type: sequence
+              args:
+                exec:
+                  - query_summary
+                  - if: qname_is_local
+                    exec:
+                      - forward_local
+                      - accept
+                  - cache
+                  - mem_cache
+                  - primary_forward
+
+            - tag: "qname_is_local"
+              type: query_matcher
+              args:
+                domain:
+                  - "ext:geosite.dat:cn"
+
+            - tag: "forward_local"
+              type: forward
+              args:
+                upstream:
+                  - addr: "223.5.5.5"
+                  - addr: "119.29.29.29"
+
+            - tag: "primary_forward"
+              type: forward
+              args:
+                upstream:
+                  - addr: "https://dns.alidns.com/dns-query"
+                  - addr: "https://doh.pub/dns-query"
+
+            - tag: "cache"
+              type: cache
+              args:
+                size: 1024
+                lazy_cache_ttl: 86400
+
+            - tag: "mem_cache"
+              type: memory_cache
+              args:
+                capacity: 1024
+
+          servers:
+            - exec: "main_sequence"
+              listener:
+                - protocol: udp
+                  addr: "0.0.0.0:5335"
+                - protocol: tcp
+                  addr: "0.0.0.0:5335"
           EOF
 
           # D. 随身WiFi / USB网卡开机自动拨号绑定 (usbwan)
@@ -246,7 +283,7 @@ jobs:
               option bidirectional '0'
           EOF
 
-          # G. 内核网络调优、BBR 及每日凌晨 4 点自动释放内存缓存
+          # G. 内核网络调优、BBR、内存保护及每日凌晨 4 点自动释放内存缓存
           cat << 'EOF' > files/etc/sysctl.conf
           fs.file-max = 655350
           net.core.somaxconn = 1024
@@ -255,6 +292,7 @@ jobs:
           net.ipv4.tcp_wmem = 4096 65536 8388608
           net.ipv4.tcp_congestion_control = bbr
           vm.min_free_kbytes = 16384
+          vm.swappiness = 10
           EOF
 
           mkdir -p files/etc/crontabs
@@ -269,9 +307,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-loop-v3-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-mosdns-v2-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-loop-v3-
+            ${{ runner.os }}-immortalwrt-d2-mosdns-v2-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
@@ -292,7 +330,7 @@ jobs:
             make defconfig >/dev/null 2>&1
 
             MISSING_ITEMS=0
-            for PKG in "CONFIG_PACKAGE_luci-app-passwall" "CONFIG_PACKAGE_adguardhome" "CONFIG_PACKAGE_kmod-fs-ksmbd" "CONFIG_PACKAGE_p910nd"; do
+            for PKG in "CONFIG_PACKAGE_luci-app-passwall" "CONFIG_PACKAGE_luci-app-mosdns" "CONFIG_PACKAGE_kmod-fs-ksmbd" "CONFIG_PACKAGE_p910nd"; do
               if grep -q "$PKG=y" .config; then
                 echo "  [✅ 检测通过] $PKG 已就绪"
               else
@@ -322,23 +360,26 @@ jobs:
           cd immortalwrt
           sed -i 's/192\.168\.1\.1/192.168.2.1/g' package/base-files/files/bin/config_generate 2>/dev/null || true
 
-      - name: 9. 预置 PassWall 最新分流规则
+      - name: 9. 预置 PassWall 最新分流规则与 MosDNS geo 数据
         run: |
           cd immortalwrt
           RULES_DIR="files/usr/share/passwall/rules"
           mkdir -p "$RULES_DIR"
+          mkdir -p files/etc/mosdns
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist" || true
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat" -o "files/etc/mosdns/geosite.dat" || true
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat" -o "files/etc/mosdns/geoip.dat" || true
 
       - name: 10. 【主程序】开始多线程编译固件
         id: compile
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j$(nproc) || make -j1 V=s 2>&1 | tee build.log
+          make -j$(nproc) || make -j1 V=s
 
       - name: 11. 编译失败时上传错误日志
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build_error_logs
@@ -384,21 +425,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Smart-Loop-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 智能巡检优化版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-MosDNS-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 + MosDNS 智能量产版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 智能自愈复检版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 + MosDNS 完美适配版
 
             本固件通过了严格的**编译前组件健康自检与编译后体积/形态复检双重闭环审计**。
 
             ### 💎 核心功能特性：
-            1. **ImmortalWrt 25.12 现代内核**：搭载更新的内核与软件包生态。
-            2. **智能自愈编译闭环**：确保所有内置插件、Passwall 核心及驱动在编译前后 100% 完整契合。
+            1. **MosDNS 高性能 DNS 分流**：预置高效率分流配置与 geo 数据库，开箱即用、省心省力。
+            2. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
             3. **全系随身 Wi-Fi 兼容**：内置 RNDIS、CDC-NCM、WWAN 等全套 USB 网卡驱动。
             4. **系统与网络加固**：
                - 预置网段 `192.168.2.1`。
                - 默认开启无线并优化信道（`alon` / `alon 5G` 无密码）。
-               - 启用 BBR 加速与每日定时内存清理。
+               - 启用 BBR 加速、SWAP 内存保护及每日定时内存清理。
           files: ${{ env.FIRMWARE_PATH }}/*sysupgrade.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
