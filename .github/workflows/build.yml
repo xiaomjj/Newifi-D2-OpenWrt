@@ -12,7 +12,7 @@ concurrency:
 
 env:
   REPO_URL: https://github.com/openwrt/openwrt
-  REPO_BRANCH: openwrt-25
+  REPO_BRANCH: openwrt-25.12
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   MAX_FIRMWARE_SIZE: 33554432  # 32MB
