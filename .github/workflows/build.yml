@@ -53,7 +53,6 @@ jobs:
       - name: 4. 植入 Passwall 官方源与依赖库到 Feeds 配置
         run: |
           cd immortalwrt
-          # 使用更稳定兼容的 Passwall 官方源与依赖库源
           echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git" >> feeds.conf.default
           echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git" >> feeds.conf.default
           echo "✅ Passwall 官方源及依赖库已成功植入 feeds.conf.default"
@@ -270,9 +269,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-loop-v2-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-loop-v3-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-loop-v2-
+            ${{ runner.os }}-immortalwrt-d2-loop-v3-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
@@ -289,7 +288,7 @@ jobs:
             ./scripts/feeds install -a
 
             echo "--- 📋 应用本地配置并执行依赖校验 (defconfig) ---"
-            cp ../$CONFIG_FILE .config
+            cp $GITHUB_WORKSPACE/$CONFIG_FILE .config
             make defconfig >/dev/null 2>&1
 
             MISSING_ITEMS=0
