@@ -50,11 +50,13 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 植入 Passwall 第三方源到 Feeds 配置
+      - name: 4. 植入 Passwall 官方源与依赖库到 Feeds 配置
         run: |
           cd immortalwrt
-          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
-          echo "✅ Passwall 官方源已成功植入 feeds.conf.default"
+          # 使用更稳定兼容的 Passwall 官方源与依赖库源
+          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git" >> feeds.conf.default
+          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git" >> feeds.conf.default
+          echo "✅ Passwall 官方源及依赖库已成功植入 feeds.conf.default"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
@@ -268,9 +270,9 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-loop-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-loop-v2-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-loop-
+            ${{ runner.os }}-immortalwrt-d2-loop-v2-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
@@ -283,7 +285,7 @@ jobs:
           MAX_ATTEMPTS=3
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "--- 🔄 第 ${ATTEMPT} 轮：更新并安装 Feeds ---"
-            ./scripts/feeds update -a
+            ./scripts/feeds update -a || true
             ./scripts/feeds install -a
 
             echo "--- 📋 应用本地配置并执行依赖校验 (defconfig) ---"
@@ -326,7 +328,7 @@ jobs:
           cd immortalwrt
           RULES_DIR="files/usr/share/passwall/rules"
           mkdir -p "$RULES_DIR"
-          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist"
+          curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist" || true
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
 
       - name: 10. 【主程序】开始多线程编译固件
