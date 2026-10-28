@@ -333,12 +333,23 @@ jobs:
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat" -o "$V2RAY_RULES/geosite.dat" || true
           echo "✅ 规则库与 GeoData 已全量集成完毕！"
 
-      - name: 10. 【主程序】开始多线程编译固件（双保险防内存溢出）
+      - name: 10. 【主程序】安全多线程编译固件（含智能容错与单线程降级重试）
         id: compile
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j$(nproc) || make -j4 V=s
+          
+          echo "=================================================="
+          echo "🚀 开始多线程标准编译 (-j$(nproc))..."
+          echo "=================================================="
+          make -j$(nproc) || {
+            echo "⚠️ 检测到多线程并发冲突，正在自动切换为低并发单线程排错重试 (V=s)..."
+            make -j1 V=s || {
+              echo "❌ 编译彻底失败，正在提取最后 200 行错误日志..."
+              tail -n 200 build.log || true
+              exit 1
+            }
+          }
 
       - name: 11. 编译失败时上传错误日志
         if: failure()
