@@ -250,9 +250,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-immortalwrt-d2-clean-v11-
 
-      - name: 7. 【预编译检查与智能补全循环】更新官方 Feeds 与自愈
+      - name: 7. 【预编译检查与智能补全循环】绝对净化并更新 Feeds
         run: |
           cd immortalwrt
+          echo "=================================================="
+          echo "🔍 【预编译阶段】绝对净化：强行抹除所有 feeds 里的 passwall 痕迹..."
+          echo "=================================================="
+          
+          # 1. 直接修改 feeds.conf.default，把里面任何带 passwall 的行全部删掉
+          sed -i '/passwall/d' feeds.conf.default 2>/dev/null || true
+          sed -i '/mosdns/d' feeds.conf.default 2>/dev/null || true
+          
+          # 2. 如果根目录存在高优先级的 feeds.conf，直接暴力删掉！
+          rm -f ../feeds.conf
+          rm -f feeds.conf
+          
+          # 3. 清理掉旧的索引缓存
+          rm -f feeds/*.index
+          rm -rf feeds/passwall
+
           echo "=================================================="
           echo "🔍 【预编译阶段】执行纯净的官方 Feeds 更新..."
           echo "=================================================="
