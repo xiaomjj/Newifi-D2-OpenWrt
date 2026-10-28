@@ -239,17 +239,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-immortalwrt-d2-ultimate-v10-
 
-      - name: 7. 【预编译检查与智能补全循环】强制粉碎旧索引与自愈
+      - name: 7. 【预编译检查与智能补全循环】绝对净化 Feeds 并自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】暴力清除所有残留 feeds 索引缓存..."
+          echo "🔍 【预编译阶段】绝对净化：强制抹除 feeds 里的 passwall 痕迹..."
           echo "=================================================="
-          rm -rf feeds/*.index
+          # 核心双保险：直接在更新前再次净化 feeds.conf.default，并干掉所有旧索引
+          sed -i '/passwall/d' feeds.conf.default
+          sed -i '/mosdns/d' feeds.conf.default
+          rm -f feeds/*.index
           rm -rf feeds/passwall
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】更新官方基础 Feeds..."
+          echo "🔍 【预编译阶段】执行纯净的 feeds 更新与安装..."
           echo "=================================================="
           ./scripts/feeds update -a
           ./scripts/feeds install -d default || true
