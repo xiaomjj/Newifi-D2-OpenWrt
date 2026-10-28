@@ -50,17 +50,15 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 彻底物理粉碎 feeds.conf 干扰源并平级直插 Passwall
+      - name: 4. 终极净化：物理粉碎 feeds.conf 并平级直插 Passwall
         run: |
           cd immortalwrt
           
-          # 1. 极其暴力：直接删除高优先级的 feeds.conf，防止它偷偷加载 passwall 进料源
+          # 1. 极其暴力：不管有没有，直接把 feeds.conf 删得连渣都不剩
           rm -f feeds.conf
+          rm -f feeds.conf.default
           
-          # 2. 重新初始化 feeds 并强制写入纯净的官方 5 大基础源
-          rm -rf feeds/
-          ./scripts/feeds init
-          
+          # 2. 从头全新写入最纯净的官方 5 大基础源（绝不包含 passwall）
           cat << 'EOF' > feeds.conf.default
           src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
           src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
@@ -68,13 +66,13 @@ jobs:
           src-git telephony https://github.com/openwrt/telephony.git;openwrt-25.12
           src-git video https://github.com/openwrt/video.git;openwrt-25.12
           EOF
-          echo "✅ 成功清除 feeds.conf 并重写 feeds.conf.default"
+          echo "✅ 官方纯净 feeds.conf.default 已重新生成"
 
-          # 3. 平级直插真正的 Passwall 源码到 package 目录
+          # 3. 把真实的 Passwall 源码平级克隆到 package 目录
           rm -rf package/passwall package/passwall_packages
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git -b main package/passwall || true
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git -b main package/passwall_packages || true
-          echo "✅ Passwall 源码已平级直插 package 目录"
+          echo "✅ Passwall 源码已直插 package 目录"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
