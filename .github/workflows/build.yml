@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Monitored Loop
+name: Build ImmortalWrt 25.12 Optimized Loop
 
 on:
   workflow_dispatch:
@@ -230,18 +230,18 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-monitored-v5-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-optimized-v6-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-monitored-v5-
+            ${{ runner.os }}-immortalwrt-d2-optimized-v6-
 
-      - name: 7. 【预编译检查与智能补全循环】清理旧索引并安全更新
+      - name: 7. 【预编译检查与智能补全循环】手动占位与安全更新
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】清理历史 feeds 索引缓存..."
+          echo "🔍 【预编译阶段】排查并预先创建 feeds/passwall 占位目录..."
           echo "=================================================="
           rm -f feeds/*.index
-          rm -rf feeds/passwall
+          mkdir -p feeds/passwall
 
           echo "=================================================="
           echo "🔍 【预编译阶段】执行 feeds 原生更新与安装..."
@@ -301,12 +301,12 @@ jobs:
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" -o "$RULES_DIR/gfwlist" || true
           curl -sL --retry 3 "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" -o "$RULES_DIR/chnlist" || true
 
-      - name: 10. 【主程序】开始多线程编译固件
+      - name: 10. 【主程序】开始多线程编译固件（双保险防内存溢出）
         id: compile
         run: |
           cd immortalwrt
           export CCACHE_DIR="$CCACHE_DIR"
-          make -j$(nproc) || make -j1 V=s
+          make -j$(nproc) || make -j4 V=s
 
       - name: 11. 编译失败时上传错误日志
         if: failure()
@@ -355,12 +355,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Monitored-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 智能监查版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Optimized-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 极致优化版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 智能监查量产版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 极致优化量产版
 
-            本固件通过了严格的**编译前全套组件自动化监查、智能自愈与编译后体积审计双重闭环**。
+            本固件通过了严格的**编译前目录占位防错、全套组件自动化监查自愈与编译后体积审计双重闭环**。
 
             ### 💎 核心功能特性：
             1. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
