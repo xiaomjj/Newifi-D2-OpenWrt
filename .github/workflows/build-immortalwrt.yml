@@ -23,6 +23,10 @@ on:
           - "1.26"
           - "1.27"
         default: auto
+      with_turboacc:
+        description: "是否编入 TurboACC（若它编译失败，设为 false 重跑即可；加速不依赖它）"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -56,8 +60,17 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # 释放 runner 空间（immortalwrt 全量构建约需 15~20GB）
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/powershell /usr/local/share/chromium
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/share/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "---- 清理后磁盘 ----"
+          df -h /
+          AVAIL_GB=$(df -Pk / | awk 'NR==2{printf "%d", $4/1048576}')
+          echo "可用空间: ${AVAIL_GB} GB"
+          if [ "$AVAIL_GB" -lt 15 ]; then
+            echo "::warning::可用空间仅 ${AVAIL_GB}GB，可能不足；如失败请改用 larger runner"
+          fi
           sudo apt-get update
           sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint \
             binutils bison build-essential bzip2 ccache cmake cpio curl \
@@ -102,6 +115,22 @@ jobs:
           ./scripts/feeds update -a
           # 关键：必须是 -a。原脚本的 "-d default" 什么都没装
           ./scripts/feeds install -a
+
+          # --- PassWall 依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
+          echo "---- PassWall 依赖预检 ----"
+          DEP_MISS=0
+          for p in chinadns-ng dns2socks ipt2socks microsocks tcping lyaml \
+                   xray-core luci-compat luci-lib-jsonc; do
+            if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
+              printf '  ✅ %s\n' "$p"
+            else
+              printf '::warning::依赖缺失 %s\n' "$p"
+              DEP_MISS=$((DEP_MISS + 1))
+            fi
+          done
+          if [ "$DEP_MISS" -gt 0 ]; then
+            echo "::warning::有 $DEP_MISS 个依赖不在 feeds 中，第 7 步会再确认一次"
+          fi
 
           # --- 第三方源码 ---
           rm -rf package/luci-app-mosdns package/v2ray-geodata package/turboacc
@@ -251,6 +280,13 @@ jobs:
               # 想开：先确认 feeds 有该 kmod（.config 里 INCLUDE_NFT_FULLCONE 改 y），再把这里改 1
               uci set turboacc.@turboacc[0].fullcone_nat='0'
               uci commit turboacc
+          fi
+
+          # ---- 防火墙流量分载：不依赖 TurboACC，装了/没装都生效 ----
+          # TurboACC 只是 UI + 额外选项；核心加速走 firewall4 原生 offload。
+          if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+              uci set firewall.@defaults[0].flow_offloading='1'
+              uci commit firewall
           fi
 
           # ---- 只 enable，不在这里 start（此时网络还没起来）----
@@ -420,6 +456,16 @@ jobs:
           echo "mosdns 版本   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
 
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+
+          # ---------- 可选：关闭 TurboACC ----------
+          # 它是第三方 v1.4；万一与 25.12 的 LuCI 不兼容导致编译失败，
+          # 用 with_turboacc=false 重跑即可，加速能力不受影响
+          #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
+          if [ "${{ inputs.with_turboacc }}" != "true" ]; then
+            sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
+            echo "⏭  已按输入关闭 TurboACC"
+          fi
+
           make defconfig 2>&1 | tee defconfig.log
 
           if grep -qi 'warning' defconfig.log; then
@@ -445,7 +491,11 @@ jobs:
           check CONFIG_PACKAGE_mosdns
           check CONFIG_PACKAGE_v2ray-geoip
           check CONFIG_PACKAGE_v2ray-geosite
-          check CONFIG_PACKAGE_luci-app-turboacc
+          if [ "${{ inputs.with_turboacc }}" = "true" ]; then
+            check CONFIG_PACKAGE_luci-app-turboacc
+          else
+            echo "  ⏭  TurboACC 按要求跳过（不影响 offload / BBR）"
+          fi
           check CONFIG_PACKAGE_zram-swap
           check CONFIG_PACKAGE_luci-app-ksmbd
           check CONFIG_PACKAGE_ksmbd-server
