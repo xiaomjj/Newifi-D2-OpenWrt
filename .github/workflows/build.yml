@@ -266,12 +266,20 @@ jobs:
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】执行精简稳定的 Feeds 更新..."
+          echo "🔍 【预编译阶段】暴力清理所有旧 Feeds 缓存并更新..."
           echo "=================================================="
-          sed -i '/passwall/d' feeds.conf.default 2>/dev/null || true
-          sed -i '/mosdns/d' feeds.conf.default 2>/dev/null || true
-          rm -f feeds/*.index
           
+          # 暴力清理所有可能残留的旧 feed 目录和索引文件
+          rm -rf feeds/*
+          rm -f feeds.conf.default
+          
+          # 重新写入干净的 3 大核心源
+          cat << 'EOF' > feeds.conf.default
+          src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
+          src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
+          src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
+          EOF
+
           ./scripts/feeds update -a
           ./scripts/feeds install -d default || true
 
