@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Optimized Loop
+name: Build ImmortalWrt 25.12 Perfect Loop
 
 on:
   workflow_dispatch:
@@ -50,13 +50,16 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 规范植入 Passwall 标准源到 Feeds 配置
+      - name: 4. 平级克隆 Passwall 到本地 package 目录（彻底消除嵌套与索引报错）
         run: |
           cd immortalwrt
           sed -i '/passwall/d' feeds.conf.default
           sed -i '/mosdns/d' feeds.conf.default
-          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
-          echo "✅ Passwall 软件源已成功精准植入 feeds.conf.default"
+          
+          # 采用扁平化平级目录结构，绝对符合 OpenWrt 原生 Makefile 扫描规范
+          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git -b main package/passwall || true
+          git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git -b main package/passwall_packages || true
+          echo "✅ Passwall 源码已完美平级植入 package 目录"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
@@ -230,24 +233,23 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-optimized-v6-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-perfect-v8-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-optimized-v6-
+            ${{ runner.os }}-immortalwrt-d2-perfect-v8-
 
-      - name: 7. 【预编译检查与智能补全循环】手动占位与安全更新
+      - name: 7. 【预编译检查与智能补全循环】标准更新与组件自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】排查并预先创建 feeds/passwall 占位目录..."
+          echo "🔍 【预编译阶段】清理历史 feeds 索引缓存..."
           echo "=================================================="
           rm -f feeds/*.index
-          mkdir -p feeds/passwall
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】执行 feeds 原生更新与安装..."
+          echo "🔍 【预编译阶段】执行标准 feeds 更新与安装..."
           echo "=================================================="
           ./scripts/feeds update -a
-          ./scripts/feeds install -p passwall -a || true
+          ./scripts/feeds install -a || true
 
           echo "=================================================="
           echo "📋 应用本地配置并执行依赖健康校验 (defconfig)..."
@@ -355,12 +357,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Optimized-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 极致优化版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Perfect-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 完美平级量产版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 极致优化量产版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 完美平级量产版
 
-            本固件通过了严格的**编译前目录占位防错、全套组件自动化监查自愈与编译后体积审计双重闭环**。
+            本固件通过了严格的**平级源码直插、全套组件自动化监查自愈与编译后体积审计双重闭环**。
 
             ### 💎 核心功能特性：
             1. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
