@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Stable Loop
+name: Build ImmortalWrt 25.12 Monitored Loop
 
 on:
   workflow_dispatch:
@@ -231,24 +231,23 @@ jobs:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-stable-v1-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-monitored-v3-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-stable-v1-
+            ${{ runner.os }}-immortalwrt-d2-monitored-v3-
 
       - name: 7. 【预编译检查与智能补全循环】组件健康审计与自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】开始更新 Feeds..."
+          echo "🔍 【预编译阶段】更新所有 Feeds 索引..."
           echo "=================================================="
           ./scripts/feeds update -a
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】安装 Passwall 核心组件..."
+          echo "🔍 【预编译阶段】精准安装预定组件与三方源..."
           echo "=================================================="
-          ./scripts/feeds install -p passwall -a || true
-          ./scripts/feeds install -p passwall_packages -a || true
-          ./scripts/feeds install -a || true
+          ./scripts/feeds install -p passwall -a
+          ./scripts/feeds install -p passwall_packages -a
 
           echo "=================================================="
           echo "📋 应用本地配置并执行依赖健康校验 (defconfig)..."
@@ -256,17 +255,38 @@ jobs:
           cp $GITHUB_WORKSPACE/$CONFIG_FILE .config
           make defconfig
 
-          # 确保关键组件 100% 写入配置
-          for PKG in "CONFIG_PACKAGE_luci-app-passwall" "CONFIG_PACKAGE_kmod-fs-ksmbd" "CONFIG_PACKAGE_p910nd"; do
+          echo "=================================================="
+          echo "🛡️ 【自动化监查机制】开始全套核心组件状态核对与自愈..."
+          echo "=================================================="
+          
+          MISSING_ITEMS=0
+          TARGET_PKGS=(
+            "CONFIG_PACKAGE_luci-app-passwall"
+            "CONFIG_PACKAGE_xray-core"
+            "CONFIG_PACKAGE_luci-app-turboacc"
+            "CONFIG_PACKAGE_zram-swap"
+            "CONFIG_PACKAGE_kmod-fs-ksmbd"
+            "CONFIG_PACKAGE_p910nd"
+            "CONFIG_PACKAGE_kmod-usb-net-rndis"
+            "CONFIG_PACKAGE_kmod-usb-net-cdc-ncm"
+          )
+
+          for PKG in "${TARGET_PKGS[@]}"; do
             if grep -q "$PKG=y" .config; then
-              echo "  [✅ 检测通过] $PKG 已就绪"
+              echo "  [✅ 监查正常] $PKG 已就绪"
             else
-              echo "  [⚠️ 发现缺失] $PKG 未载入，正在强制补全..."
+              echo "  [⚠️ 监查告警] $PKG 未载入，正在触发自愈机制强制补全..."
               echo "$PKG=y" >> .config
+              MISSING_ITEMS=$((MISSING_ITEMS + 1))
             fi
           done
 
-          make defconfig
+          if [ $MISSING_ITEMS -gt 0 ]; then
+            echo "🔄 检测到有 $MISSING_ITEMS 项预定组件被补全，正在重新生成配置..."
+            make defconfig
+          else
+            echo "🎉 所有预定组件监查全部通过：零遗漏、完美契合！"
+          fi
 
       - name: 8. 修改 LAN IP 为 192.168.2.1
         run: |
@@ -320,6 +340,7 @@ jobs:
             
             if [ "$SIZE" -gt "$MAX_FIRMWARE_SIZE" ]; then 
               echo "❌ 复检失败：固件体积 ${SIZE_MB} MB 超出 32MB 硬件硬上限限制！"
+              exit 1
             fi
             
             echo "✅ 固件体积复检：完全合规（未超限）"
@@ -334,12 +355,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Stable-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 稳定量产版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Monitored-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 智能监查版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 稳定量产版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 智能监查量产版
 
-            本固件通过了严格的**编译前组件健康自检与编译后体积/形态复检双重闭环审计**。
+            本固件通过了严格的**编译前全套组件自动化监查、智能自愈与编译后体积审计双重闭环**。
 
             ### 💎 核心功能特性：
             1. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
