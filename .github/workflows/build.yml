@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Unified Loop
+name: Build ImmortalWrt 25.12 Ultimate Loop
 
 on:
   workflow_dispatch:
@@ -50,18 +50,18 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 彻底脱离 Feeds 索引：平级直插 Passwall 到本地 package 目录
+      - name: 4. 平级直插 Passwall 到本地 package 目录（彻底脱离 Feeds 索引）
         run: |
           cd immortalwrt
-          # 暴力清除 feeds 配置文件中的 passwall 干扰，防止触发索引报错
+          # 清理 feeds.conf.default 中的相关配置，防止触发 feeds 索引
           sed -i '/passwall/d' feeds.conf.default
           sed -i '/mosdns/d' feeds.conf.default
           
-          # 平级克隆到 package 目录下，享受原生编译系统的递归扫描
+          # 平级直插到 package 目录下，利用 OpenWrt 原生递归扫描
           rm -rf package/passwall package/passwall_packages
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git -b main package/passwall || true
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git -b main package/passwall_packages || true
-          echo "✅ Passwall 源码已平级直插 package 目录"
+          echo "✅ Passwall 源码已完美平级植入 package 目录"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
@@ -229,26 +229,27 @@ jobs:
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
           echo "🔧 初始化脚本部署完成。"
 
-      - name: 6. 缓存 CCache 与 dl
+      - name: 6. 缓存 CCache 与 dl（升级至 v10 彻底隔绝历史污染）
         uses: actions/cache@v4
         with:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-unified-v9-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-ultimate-v10-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-unified-v9-
+            ${{ runner.os }}-immortalwrt-d2-ultimate-v10-
 
-      - name: 7. 【预编译检查与智能补全循环】纯净更新其他 Feeds 与自愈
+      - name: 7. 【预编译检查与智能补全循环】强制粉碎旧索引与自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】清理历史 feeds 索引..."
+          echo "🔍 【预编译阶段】暴力清除所有残留 feeds 索引缓存..."
           echo "=================================================="
-          rm -f feeds/*.index
+          rm -rf feeds/*.index
+          rm -rf feeds/passwall
 
           echo "=================================================="
-          echo "🔍 【预编译阶段】更新基础官方 Feeds..."
+          echo "🔍 【预编译阶段】更新官方基础 Feeds..."
           echo "=================================================="
           ./scripts/feeds update -a
           ./scripts/feeds install -d default || true
@@ -359,12 +360,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Unified-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 统一量产版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Ultimate-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 旗舰量产版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 统一量产版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 旗舰量产版
 
-            本固件通过了严格的**前后一致、本地平级直插、全套组件自动化监查自愈与编译后体积审计双重闭环**。
+            本固件通过了严格的**前后完全统一、本地平级源码直插、全套组件自动化监查自愈与编译后体积审计闭环**。
 
             ### 💎 核心功能特性：
             1. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
