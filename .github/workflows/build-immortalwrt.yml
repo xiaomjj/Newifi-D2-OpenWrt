@@ -180,33 +180,42 @@ jobs:
                    files/etc/config files/etc/crontabs files/usr/bin
 
           # ---------- A. 系统 / LuCI 默认语言 / 主机名 / NTP ----------
+          # ⚠️ 铁律：首次启动脚本【只改已存在的配置段】，绝不新建
+          #    新建空的 network/system 段会让 config_generate 认为配置已存在而跳过，
+          #    结果是 LAN 没有 proto/device → br-lan 建不出来 → 全屋拿不到 IP。
           cat > files/etc/uci-defaults/90-luci << 'EOF'
           #!/bin/sh
-          [ -f /etc/config/luci ] || touch /etc/config/luci
-          uci -q get luci.main >/dev/null 2>&1 || uci set luci.main=core
-          uci set luci.main.lang='zh_cn'
-          uci commit luci
 
-          uci set system.@system[0].hostname='Newifi-D2'
-          uci set system.@system[0].timezone='CST-8'
-          uci set system.@system[0].zonename='Asia/Shanghai'
-          if uci -q get system.ntp >/dev/null 2>&1; then
-              uci -q delete system.ntp.server
-              uci add_list system.ntp.server='ntp.aliyun.com'
-              uci add_list system.ntp.server='cn.pool.ntp.org'
-              uci add_list system.ntp.server='time.cloudflare.com'
+          # 系统信息：段存在才改
+          if uci -q get system.@system[0] >/dev/null 2>&1; then
+              uci set system.@system[0].hostname='Newifi-D2'
+              uci set system.@system[0].timezone='CST-8'
+              uci set system.@system[0].zonename='Asia/Shanghai'
+              if uci -q get system.ntp >/dev/null 2>&1; then
+                  uci -q delete system.ntp.server
+                  uci add_list system.ntp.server='ntp.aliyun.com'
+                  uci add_list system.ntp.server='cn.pool.ntp.org'
+                  uci add_list system.ntp.server='time.cloudflare.com'
+              fi
+              uci commit system
           fi
-          uci commit system
 
-          uci set network.lan.ipaddr='192.168.2.1'
-          uci commit network
+          # 默认中文：段存在才改
+          if uci -q get luci.main >/dev/null 2>&1; then
+              uci set luci.main.lang='zh_cn'
+              uci commit luci
+          fi
+
+          # LAN 地址：这里【不写】。由构建时对 config_generate 的 sed 决定（与原配置同一做法），
+          # 避免在配置尚未生成时创建残段。万一仍然异常，由 /etc/rc.local 的自愈逻辑兜底修复。
           exit 0
           EOF
 
           # ---------- B. 无线：双频开启 + 中国区 + WPA2 ----------
+          # 同样遵守铁律：无线配置不存在就完全不碰，交给系统自己生成
           cat > files/etc/uci-defaults/91-wireless << 'EOF'
           #!/bin/sh
-          [ -f /etc/config/wireless ] || /sbin/wifi config >/dev/null 2>&1
+          [ -f /etc/config/wireless ] || exit 0
           uci -q get wireless.radio0 >/dev/null 2>&1 || exit 0
 
           uci set wireless.radio0.disabled='0'
@@ -440,6 +449,42 @@ jobs:
           for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
               [ -e "$g" ] && echo performance > "$g"
           done
+
+          # ---- 自愈看门狗（后台，20 秒后检查一次）----
+          # 1) LAN 段不完整 → 自动补齐并重载网络（这是"全家断网"的兜底）
+          # 2) dnsmasq 没跑 → 回滚 MosDNS 接管
+          (
+              sleep 20
+              _dirty=0
+              if ! uci -q get network.lan.proto >/dev/null 2>&1; then
+                  logger -t netguard "LAN 段缺少 proto，自动修复"
+                  uci set network.lan='interface'
+                  [ -n "$(uci -q get network.lan.device)" ] || uci set network.lan.device='br-lan'
+                  uci set network.lan.proto='static'
+                  uci set network.lan.ipaddr='192.168.2.1'
+                  uci set network.lan.netmask='255.255.255.0'
+                  _dirty=1
+              fi
+              if ! uci -q get network.lan.device >/dev/null 2>&1; then
+                  uci set network.lan.device='br-lan'
+                  _dirty=1
+              fi
+              if [ "$_dirty" = "1" ]; then
+                  uci commit network
+                  logger -t netguard "网络配置已修复，重载中"
+                  /etc/init.d/network reload
+                  sleep 5
+              fi
+
+              if ! pidof dnsmasq >/dev/null 2>&1; then
+                  logger -t netguard "dnsmasq 未运行，回滚 MosDNS 接管"
+                  uci -q set mosdns.@mosdns[0].enabled='0'
+                  uci -q set mosdns.@mosdns[0].redirect='0'
+                  uci -q commit mosdns
+                  /etc/init.d/mosdns stop 2>/dev/null
+                  /etc/init.d/dnsmasq restart
+              fi
+          ) &
 
           exit 0
           EOF
