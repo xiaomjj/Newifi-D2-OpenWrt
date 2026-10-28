@@ -399,18 +399,27 @@ jobs:
               option bidirectional '0'
           EOF
 
-          # ---------- F. 内核调优 ----------
+          # ---------- F. 内核调优（针对 MT7621 双核 / 128MB 内存）----------
           cat > files/etc/sysctl.conf << 'EOF'
-          fs.file-max = 655350
-          net.core.somaxconn = 1024
+          # ---- 缓冲与队列：BBR 需要 fq，rmem/wmem 上限要放开否则 tcp_rmem 白设 ----
           net.core.default_qdisc = fq
-          net.ipv4.tcp_max_syn_backlog = 8192
+          net.core.somaxconn = 1024
+          net.core.rmem_max = 8388608
+          net.core.wmem_max = 8388608
           net.ipv4.tcp_rmem = 4096 87380 8388608
           net.ipv4.tcp_wmem = 4096 65536 8388608
           net.ipv4.tcp_congestion_control = bbr
           net.ipv4.tcp_fastopen = 3
-          vm.min_free_kbytes = 16384
+          net.ipv4.tcp_max_syn_backlog = 8192
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.tcp_tw_reuse = 1
+          # ---- 内存：小内存机器不要把 16MB 锁死，8MB 足够 ----
+          vm.min_free_kbytes = 8192
           vm.swappiness = 10
+          # ---- 保留 VFS 缓存：ksmbd/USB 共享读写更稳 ----
+          vm.vfs_cache_pressure = 50
+          # ---- 内核 panic 后 10 秒自动重启，避免软路由挂着 ----
+          kernel.panic = 10
           EOF
 
           cat > files/etc/crontabs/root << 'EOF'
@@ -418,9 +427,124 @@ jobs:
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
           EOF
 
-          chmod +x files/usr/bin/dns-recover files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/*
+          # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
+          cat > files/etc/rc.local << 'EOF'
+          #!/bin/sh
+          # conntrack 上限：128MB 机器上 32K 是性价比最高的档位（默认 16K，P2P 会打满）
+          if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+              echo 32768 > /proc/sys/net/netfilter/nf_conntrack_max
+              echo 3600  > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established
+          fi
+
+          # CPU 调频：MT7621 有 cpufreq 就锁 performance，软路由不需要省电
+          for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+              [ -e "$g" ] && echo performance > "$g"
+          done
+
+          exit 0
+          EOF
+
+          # ---------- H. 固件自检脚本（刷机后 SSH 执行 fw-selftest）----------
+          mkdir -p files/usr/bin
+          cat > files/usr/bin/fw-selftest << 'EOF'
+          #!/bin/sh
+          # 固件自检：一条命令看全系统状态
+          P=0; F=0
+          ok() { printf '  \033[32m✅\033[0m %s\n' "$1"; P=$((P + 1)); }
+          ng() { printf '  \033[31m❌\033[0m %s\n' "$1"; F=$((F + 1)); }
+          t()  { d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else ng "$d"; fi; }
+
+          echo "===== Newifi-D2 固件自检 ====="
+          t "xray 可执行"        xray -version
+          t "mosdns 可执行"      mosdns -v
+          t "mosdns 运行中"      pidof mosdns
+          t "dnsmasq 运行中"     pidof dnsmasq
+          t "DNS 解析正常"       nslookup www.baidu.com 127.0.0.1
+          t "NAT 转发开启"       test -e /proc/sys/net/ipv4/ip_forward
+
+          [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ok "ip_forward=1" || ng "ip_forward≠1"
+          [ "$(uci -q get mosdns.@mosdns[0].adblock)" = "1" ] && ok "广告拦截已开" || ng "广告拦截未开"
+          [ "$(uci -q get passwall.@global[0].enabled)" = "1" ] && ok "PassWall 已启用" || ng "PassWall 未启用"
+          [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ] && ok "BBR 生效" || ng "BBR 未生效"
+          [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
+          [ -d /mnt/sda1 ] && ok "U 盘已挂载 /mnt/sda1" || ng "未检测到 U 盘（未插可忽略）"
+
+          echo
+          printf '通过 %d 项，失败 %d 项\n' "$P" "$F"
+          if [ "$F" -eq 0 ]; then echo "🎉 一切正常"; else echo "⚠️  有失败项，按上面 ❌ 对应功能排查"; fi
+          exit 0
+          EOF
+
+          # ---------- I. 内置使用说明页（http://192.168.2.1/guide.html）----------
+          mkdir -p files/www
+          cat > files/www/guide.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="zh-CN">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Newifi-D2 使用说明</title>
+          <style>
+          body{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.75;color:#222}
+          h1{font-size:1.4em;border-bottom:2px solid #4a90d9;padding-bottom:6px}
+          h2{font-size:1.05em;margin-top:26px;color:#1a5fb4}
+          code{background:#f2f4f7;padding:1px 5px;border-radius:3px;font-size:.92em}
+          table{border-collapse:collapse;width:100%}
+          td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:.95em}
+          .warn{background:#fff6e5;border-left:4px solid #f0a020;padding:8px 12px;margin:12px 0}
+          </style>
+          </head>
+          <body>
+          <h1>Newifi-D2 使用说明</h1>
+          <p>固件已预配置完毕，刷入后基本不需要再设置。</p>
+
+          <h2>1. 登录</h2>
+          <p>浏览器打开 <code>http://192.168.2.1</code>，首次登录会要求设置 root 密码。</p>
+
+          <h2>2. 无线</h2>
+          <table><tr><th>频段</th><th>名称</th><th>密码</th></tr>
+          <tr><td>2.4G</td><td>alon</td><td>alon12345678</td></tr>
+          <tr><td>5G</td><td>alon-5G</td><td>alon12345678</td></tr></table>
+          <div class="warn">建议改掉默认密码：网络 → 无线 → 修改。</div>
+
+          <h2>3. 科学上网（PassWall）</h2>
+          <p>固件<b>不含节点</b>：服务 → PassWall → 节点列表 → 导入订阅链接 → 保存并应用。</p>
+          <p>模式已设为 gfwlist：名单内走代理，其余直连。</p>
+
+          <h2>4. DNS 与去广告</h2>
+          <p>MosDNS 已接管 DNS（5335），广告拦截已开启，规则来自固件自带 geosite，不联网更新。</p>
+          <p>网站/App 突然打不开，多半是规则误杀：服务 → MosDNS → 关闭广告拦截。</p>
+
+          <h2>5. 文件共享 / 打印</h2>
+          <table>
+          <tr><td>共享</td><td>插上 U 盘后访问 <code>\\192.168.2.1\usb</code>（/mnt/sda1，匿名可写）</td></tr>
+          <tr><td>打印</td><td>USB 打印机接上，客户端添加网络打印机 <code>192.168.2.1:9100</code></td></tr>
+          </table>
+
+          <h2>6. 随身 WiFi / 4G 网卡</h2>
+          <p>直接插上即可，自动作为备份线路（主线路优先）。</p>
+
+          <h2>7. 出问题三招</h2>
+          <table><tr><th>现象</th><th>处理</th></tr>
+          <tr><td>能 ping 通 IP、网页打不开</td><td>SSH 执行 <code>dns-recover</code></td></tr>
+          <tr><td>某个 App 突然不通</td><td>关掉 MosDNS 广告拦截</td></tr>
+          <tr><td>科学上网时快时慢</td><td>TurboACC 关掉硬件分载</td></tr></table>
+          <p>看整体状态：SSH 执行 <code>fw-selftest</code>。</p>
+
+          <h2>8. 更新固件</h2>
+          <p>本固件是冻结版本，不会自动更新。要新版本请重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
+          </body>
+          </html>
+          EOF
+
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest \
+                   files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
           echo "🔧 files/ 预置完成："
           find files -type f | sort
+
+          # 打包覆盖层快照：第 12 步"缺失补齐"时可一键还原，不用重跑整个 step
+          tar -C . -czf /workdir/files-overlay.tgz files
+          echo "覆盖层快照: $(du -h /workdir/files-overlay.tgz | cut -f1)"
 
       # ---------------------------------------------------------------
       - name: 6. 缓存 ccache 与 dl
@@ -461,10 +585,14 @@ jobs:
           # 它是第三方 v1.4；万一与 25.12 的 LuCI 不兼容导致编译失败，
           # 用 with_turboacc=false 重跑即可，加速能力不受影响
           #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
+          EFF_TURBO="true"
           if [ "${{ inputs.with_turboacc }}" != "true" ]; then
             sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
+            EFF_TURBO="false"
             echo "⏭  已按输入关闭 TurboACC"
           fi
+          # 记录"实际生效状态"：第 11 步可能自动降级把它关掉，第 12 步审计要读这个文件
+          echo "$EFF_TURBO" > /workdir/state-turboacc
 
           make defconfig 2>&1 | tee defconfig.log
 
@@ -574,14 +702,69 @@ jobs:
           echo "    自动拉取 geoip-only-cn-private.dat(≈90KB) 与 geosite.dat(≈1.2MB) 并校验 sha256。"
 
       # ---------------------------------------------------------------
-      - name: 10. 预下载源码包
+      - name: 10. 下载源码包（失败重试；无进展立即中断并诊断）
         run: |
           cd immortalwrt
-          make download -j8 V=s || make download -j1 V=s
-          echo "---- 清理不完整下载 ----"
-          find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
-          find dl -size -1024c -delete 2>/dev/null || true
-          du -sh dl
+          # 只下载 .config 已选中的包所需源码：make download 按依赖图遍历，未选中的包不会下载
+          export GIT_HTTP_LOW_SPEED_LIMIT=1000
+          export GIT_HTTP_LOW_SPEED_TIME=60
+
+          diag_download() {
+            echo "::group::📋 下载失败诊断"
+            echo "--- 残缺/异常文件（<1KB）---"
+            find dl -type f -size -1024c -exec ls -l {} \; 2>/dev/null || echo "  （无）"
+            echo "--- 日志里的失败线索 ---"
+            grep -hE "Download failed|Hash mismatch|404 Not Found|404:|ERROR|Connection (timed out|refused|reset)|Temporary failure|Could not resolve|unable to|No space left" /tmp/dl-*.log 2>/dev/null | sort -u | head -n 25 || echo "  （未匹配到关键字）"
+            echo "--- 涉及的源码包 ---"
+            grep -hoE "dl/[A-Za-z0-9._+@-]+\.(tar\.gz|tar\.xz|tar\.bz2|zip|tgz|git)" /tmp/dl-*.log 2>/dev/null | sort -u | tail -n 30 || true
+            echo "--- 磁盘 ---"
+            df -h . | tail -n1
+            echo "::endgroup::"
+            echo "处理建议：① 直接重跑（dl 缓存复用，只补缺的）"
+            echo "          ② 勾选 clean_build 清空 dl 重下"
+            echo "          ③ 日志为 404/哈希不符 → 该包源地址或版本在 feeds 里已失效，需要改版本"
+            echo "          ④ 大量 403/404 且集中在 GitHub → 限流，隔几分钟重跑"
+          }
+
+          DL_OK=0
+          PREV_FILES=-1
+          PREV_BAD=-1
+          for i in 1 2 3 4 5; do
+            JOBS=8
+            if [ "$i" -gt 1 ]; then JOBS=4; fi
+            echo "================ 下载第 $i 轮（-j${JOBS}）================"
+
+            RC=0
+            make download -j"$JOBS" V=s 2>&1 | tee "/tmp/dl-$i.log" || RC=$?
+
+            FILES=$(find dl -type f 2>/dev/null | wc -l)
+            BAD=$(find dl -type f -size -1024c 2>/dev/null | wc -l)
+
+            if [ "$RC" -eq 0 ] && [ "$BAD" -eq 0 ]; then
+              echo "✅ 下载完整：${FILES} 个文件，共 $(du -sh dl | cut -f1)"
+              DL_OK=1
+              break
+            fi
+
+            echo "⚠️  第 $i 轮结果：退出码=${RC}，残缺=${BAD}，总文件=${FILES}"
+
+            if [ "$i" -gt 1 ] && [ "$FILES" -le "$PREV_FILES" ] && [ "$BAD" -ge "$PREV_BAD" ]; then
+              echo "::error::下载连续两轮零进展（文件数 ${PREV_FILES}→${FILES}，残缺 ${PREV_BAD}→${BAD}），提前中断，不再空跑"
+              diag_download
+              exit 1
+            fi
+            PREV_FILES=$FILES
+            PREV_BAD=$BAD
+
+            find dl -type f -size -1024c -print -delete 2>/dev/null || true
+            if [ "$i" -lt 5 ]; then sleep 10; fi
+          done
+
+          if [ "$DL_OK" -ne 1 ]; then
+            echo "::error::5 轮下载仍未完成，已中断构建（不进入编译，避免浪费 2 小时）"
+            diag_download
+            exit 1
+          fi
 
       # ---------------------------------------------------------------
       - name: 11. 编译固件
@@ -591,17 +774,269 @@ jobs:
           export CCACHE_DIR="$CCACHE_DIR"
           export CCACHE_MAXSIZE="$CCACHE_MAXSIZE"
           set -o pipefail
-          echo "🚀 开始编译 (-j$(nproc))，日志同时写入 build.log"
-          make -j"$(nproc)" 2>&1 | tee build.log
-          echo "✅ 编译完成"
-          ccache -s || true
+
+          : > build.log
+          build_once() {
+            RC=0
+            make -j"$(nproc)" 2>&1 | tee -a build.log || RC=$?
+            return "$RC"
+          }
+
+          echo "🚀 第 1 次编译 (-j$(nproc))"
+          if build_once; then
+            echo "✅ 编译完成"
+            ccache -s || true
+            exit 0
+          fi
+
+          # ================= 自动降级重试（最多 2 次）=================
+          for attempt in 1 2; do
+            echo "::warning::编译失败，进入第 ${attempt} 次自动修复"
+            FIXED=0
+
+            if grep -qE "requires go >= *[0-9]" build.log; then
+              NEED=$(grep -oE "requires go >= *[0-9]+\.[0-9]+" build.log | head -n1 | grep -oE "[0-9]+\.[0-9]+")
+              CUR=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
+              if [ -n "$NEED" ] && [ "$NEED" != "$CUR" ]; then
+                echo "  · Go 版本不足：当前 ${CUR} → 需要 ${NEED}，自动切换"
+                sed -i "s/^GO_DEFAULT_VERSION:=.*/GO_DEFAULT_VERSION:=$NEED/" \
+                  feeds/packages/lang/golang/golang-values.mk
+                rm -rf staging_dir/hostpkg/lib/go-* staging_dir/hostpkg/bin/go*
+                make defconfig >/dev/null 2>&1 || true
+                FIXED=1
+              fi
+            fi
+
+            if [ "$FIXED" -eq 0 ] && grep -qi "turboacc" build.log; then
+              if grep -q "^CONFIG_PACKAGE_luci-app-turboacc=y" .config; then
+                echo "  · TurboACC 编译失败，自动移出本次构建（加速由 firewall4 分载 + BBR 承担）"
+                sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
+                echo "false" > /workdir/state-turboacc
+                make defconfig >/dev/null 2>&1 || true
+                FIXED=1
+              fi
+            fi
+
+            if [ "$FIXED" -eq 0 ]; then
+              break
+            fi
+
+            echo "🔁 修复完成，重新编译 ..."
+            if build_once; then
+              echo "✅ 降级重试后编译完成（日志见 build.log）"
+              ccache -s || true
+              exit 0
+            fi
+          done
+
+          # ================= 仍失败：明确报错 =================
+          echo "::group::📋 编译失败诊断（最后 40 行）"
+          tail -n 40 build.log || true
+          echo "::endgroup::"
+          if grep -q "requires go >=" build.log; then
+            echo "::error::编译失败：Go 版本仍不满足（自动切换已尝试），请手动把 go_version 设为日志要求的版本"
+          elif grep -qi "luci-app-turboacc" build.log; then
+            echo "::error::编译失败：TurboACC 相关错误（自动移除已尝试），请用 with_turboacc=false 重跑"
+          elif grep -q "No space left on device" build.log; then
+            echo "::error::编译失败：磁盘不足，重跑（缓存复用）或改用 larger runner"
+          else
+            echo "::error::编译失败且无法自动修复，详见上方日志末 40 行"
+          fi
+          exit 1
 
       # ---------------------------------------------------------------
-      - name: 12. 固件体积与完整性审计
+      - name: 12. 固件内容审计（缺失自动补齐，最多 3 轮）
         id: audit
         if: steps.build.outcome == 'success'
         run: |
-          cd immortalwrt/bin/targets/ramips/mt7621
+          cd immortalwrt
+
+          # ================= 审计脚本（可重复调用）=================
+          # 退出码：0=通过  1=有缺失（可补齐）  2=致命（无产物）
+          cat > /workdir/fw-audit.sh << 'EOS'
+          #!/bin/sh
+          MISS_PKG=/workdir/missing-pkgs.txt
+          MISS_FILE=/workdir/missing-files.txt
+          : > "$MISS_PKG"
+          : > "$MISS_FILE"
+          LOST=0
+
+          cd bin/targets/ramips/mt7621 2>/dev/null || { echo "::error::产物目录不存在"; exit 2; }
+          MANIFEST=$(ls -1 *.manifest 2>/dev/null | head -n1)
+          [ -n "$MANIFEST" ] || { echo "::error::未找到 .manifest"; exit 2; }
+          echo "包清单: $MANIFEST（$(wc -l < "$MANIFEST") 个包）"
+
+          MUST="xray-core luci-app-passwall mosdns luci-app-mosdns v2ray-geoip v2ray-geosite dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
+          [ "$1" = "true" ] && MUST="$MUST luci-app-turboacc"
+
+          echo "---- 软件包 ----"
+          for p in $MUST; do
+            L=$(grep -m1 "^$p " "$MANIFEST")
+            if [ -n "$L" ]; then
+              printf '  ✅ %-22s %s\n' "$p" "$(echo "$L" | awk '{print $3}')"
+            else
+              printf '  ❌ %-22s 缺失\n' "$p"
+              echo "$p" >> "$MISS_PKG"
+              LOST=$((LOST + 1))
+            fi
+          done
+
+          ROOTFS=$(ls -d ../../../../build_dir/target-*/root-ramips 2>/dev/null | head -n1)
+          if [ -n "$ROOTFS" ]; then
+            echo "---- 关键文件 ----"
+            chk() {
+              _n="$1"; shift
+              for c in "$@"; do
+                if [ -e "$ROOTFS/$c" ]; then
+                  printf '  ✅ %-40s %s\n' "$c" "$(du -h "$ROOTFS/$c" 2>/dev/null | cut -f1)"
+                  return 0
+                fi
+              done
+              printf '  ❌ %-40s 缺失\n' "$_n"
+              echo "$_n" >> "$MISS_FILE"
+              LOST=$((LOST + 1))
+              return 0
+            }
+            chk xray        usr/bin/xray
+            chk mosdns      usr/bin/mosdns usr/sbin/mosdns
+            chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
+            chk ksmbd-init  etc/init.d/ksmbd
+            chk mosdns-init etc/init.d/mosdns
+            chk geoip       usr/share/v2ray/geoip.dat
+            chk geosite     usr/share/v2ray/geosite.dat
+            chk uci-90      etc/uci-defaults/90-luci
+            chk uci-91      etc/uci-defaults/91-wireless
+            chk uci-92      etc/uci-defaults/92-services
+            chk usbwan      etc/hotplug.d/net/20-usbwan
+            chk dns-recover usr/bin/dns-recover
+            chk fw-selftest usr/bin/fw-selftest
+            chk guide       www/guide.html
+            chk cfg-ksmbd   etc/config/ksmbd
+            chk cfg-p910nd  etc/config/p910nd
+            chk sysctl      etc/sysctl.conf
+          else
+            echo "::warning::未找到 root-ramips，跳过文件级检查"
+          fi
+
+          echo "缺失合计: $LOST（包 $(wc -l < "$MISS_PKG") / 文件 $(wc -l < "$MISS_FILE")）"
+          echo "$LOST" > /workdir/audit-count.txt
+          [ "$LOST" -eq 0 ] || exit 1
+          exit 0
+          EOS
+          chmod +x /workdir/fw-audit.sh
+
+          # ================= 审计 → 补齐 → 再审计（无进展立即中断）=================
+          diag_repair() {
+            echo "::group::📋 缺失原因诊断"
+            echo "--- 缺失包（config / feeds / ipk 三处状态）---"
+            if [ -s /workdir/missing-pkgs.txt ]; then
+              while read -r p; do
+                [ -n "$p" ] || continue
+                printf '  · %s\n' "$p"
+                if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+                  echo "      config: 已选中"
+                else
+                  echo "      config: 未被 defconfig 保留（依赖不满足，或包名不存在）"
+                fi
+                if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
+                  echo "      feeds : 存在"
+                else
+                  echo "      feeds : 不存在（包名拼错 / 未加入 feeds / 源码未克隆）"
+                fi
+                _ipk=$(find bin/packages -name "${p}_*.ipk" 2>/dev/null | head -n1)
+                if [ -n "$_ipk" ]; then
+                  echo "      ipk   : $_ipk"
+                else
+                  echo "      ipk   : 未生成（包没有编译成功）"
+                fi
+              done < /workdir/missing-pkgs.txt
+            else
+              echo "  （无）"
+            fi
+            echo "--- 缺失文件 ---"
+            if [ -s /workdir/missing-files.txt ]; then
+              sed 's/^/  · /' /workdir/missing-files.txt
+              echo "  → 说明 files/ 覆盖层没有生效，或对应包未安装"
+            else
+              echo "  （无）"
+            fi
+            echo "--- defconfig 告警（最后 15 条）---"
+            grep -i 'warning' defconfig.log 2>/dev/null | tail -n 15 || echo "  （无）"
+            echo "::endgroup::"
+            echo "处理建议：按上面三行状态定位——config 未选中＝依赖问题；feeds 不存在＝包名或源问题；ipk 未生成＝编译失败"
+          }
+
+          OK=0
+          PREV=999
+          # 读"实际生效"的 TurboACC 状态（第 11 步可能已自动降级关掉它）
+          EFF_TURBO=$(cat /workdir/state-turboacc 2>/dev/null || echo "true")
+          echo "TurboACC 实际生效状态: ${EFF_TURBO}"
+          for round in 1 2 3; do
+            echo "================ 审计第 $round 轮 ================"
+            RC=0
+            /workdir/fw-audit.sh "$EFF_TURBO" || RC=$?
+
+            if [ "$RC" -eq 0 ]; then
+              OK=1
+              break
+            fi
+
+            if [ "$RC" -eq 2 ]; then
+              echo "::error::产物缺失（没有 manifest 或输出目录），无法补齐，立即中断"
+              exit 1
+            fi
+
+            COUNT=$(cat /workdir/audit-count.txt 2>/dev/null || echo 999)
+
+            # 补齐后缺失数没有下降 → 补不动了，立即中断，不再空跑第 2/3 轮
+            if [ "$round" -gt 1 ] && [ "$COUNT" -ge "$PREV" ]; then
+              echo "::error::第 $round 轮缺失数未下降（${PREV} → ${COUNT}），继续补齐无效，立即中断"
+              diag_repair
+              exit 1
+            fi
+            PREV=$COUNT
+
+            if [ "$round" -eq 3 ]; then
+              echo "::error::已补齐 3 轮仍有 ${COUNT} 项缺失，中断构建"
+              diag_repair
+              exit 1
+            fi
+
+            echo "⚙️  发现缺失（${COUNT} 项），执行第 $round 轮补齐"
+
+            # (a) 重新部署 files/ 覆盖层（用第 5 步的快照还原）
+            if [ -f /workdir/files-overlay.tgz ]; then
+              rm -rf files
+              tar -C . -xzf /workdir/files-overlay.tgz
+              echo "  · files/ 覆盖层已重新部署"
+            fi
+
+            # (b) 缺失软件包写回 .config 并重建配置
+            if [ -s /workdir/missing-pkgs.txt ]; then
+              echo "  · 补装软件包: $(tr '\n' ' ' < /workdir/missing-pkgs.txt)"
+              while read -r p; do
+                [ -n "$p" ] || continue
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config || echo "CONFIG_PACKAGE_${p}=y" >> .config
+              done < /workdir/missing-pkgs.txt
+              make defconfig 2>&1 | tail -n 15
+            fi
+
+            # (c) 重建根文件系统与镜像（只重装+重打包，不重编已完成的包）
+            rm -rf build_dir/target-*/root-ramips build_dir/target-*/stamp
+            echo "  · 重建 rootfs + 镜像 ..."
+            RC2=0
+            make -j"$(nproc)" 2>&1 | tee -a build.log || RC2=$?
+            if [ "$RC2" -ne 0 ]; then
+              echo "::error::补齐重建失败（退出码 ${RC2}），最后 40 行："
+              tail -n 40 build.log || true
+              exit 1
+            fi
+          done
+
+          [ "$OK" -eq 1 ] || { echo "::error::审计未通过，拒绝输出固件"; exit 1; }
+
+          # ================= 体积 / 哈希 / 产物 =================
+          cd bin/targets/ramips/mt7621
           ls -lh
 
           FIRMWARE=$(ls -1 *sysupgrade.bin 2>/dev/null | head -n1)
@@ -610,18 +1045,39 @@ jobs:
           SIZE=$(stat -c%s "$FIRMWARE")
           SIZE_MB=$(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1048576}')
           LIMIT_MB=$(awk -v s="$MAX_FIRMWARE_SIZE" 'BEGIN{printf "%.2f", s/1048576}')
-
           echo "文件: $FIRMWARE"
           echo "体积: ${SIZE_MB} MiB (${SIZE} B) / 分区上限 ${LIMIT_MB} MiB (${MAX_FIRMWARE_SIZE} B)"
-
           [ "$SIZE" -gt 0 ] || { echo "::error::固件为 0 字节"; exit 1; }
           [ "$SIZE" -le "$MAX_FIRMWARE_SIZE" ] || { echo "::error::固件超出 firmware 分区，刷入会变砖"; exit 1; }
+
+          PKG_COUNT=$(wc -l < "$(ls -1 *.manifest | head -n1)")
+
+          # 余量告警：overlay（可写分区）太小时，LuCI 改配置容易写失败
+          SPARE=$((MAX_FIRMWARE_SIZE - SIZE))
+          if [ "$SPARE" -lt 2097152 ]; then
+            echo "::warning::固件余量只有 $(awk -v s="$SPARE" 'BEGIN{printf "%.2f", s/1048576}') MiB，overlay 会很紧张"
+          fi
+
+          # ================= 版本快照（本次构建到底用了哪些版本）=================
+          {
+            echo "# ImmortalWrt 25.12 for Newifi-D2 — 构建版本快照"
+            echo ""
+            echo "构建时间 : $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "源码分支 : openwrt-25.12 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
+            echo "固件体积 : ${SIZE_MB} MiB / ${LIMIT_MB} MiB"
+            echo "包总数   : ${PKG_COUNT}"
+            echo ""
+            echo "## 关键组件"
+            grep -E '^(luci-app-passwall|xray-core|mosdns|luci-app-mosdns|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap) ' \
+                 "$(ls -1 *.manifest | head -n1)" | sort
+          } > versions.txt
+          cat versions.txt
 
           sha256sum "$FIRMWARE" > sha256sums.txt
           cat sha256sums.txt
 
           {
-            echo "### ✅ 固件审计通过"
+            echo "### ✅ 固件审计通过（含内容核对）"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
@@ -629,6 +1085,20 @@ jobs:
             echo "| 体积 | **${SIZE_MB} MiB** |"
             echo "| 分区上限 | ${LIMIT_MB} MiB (0x1FB0000) |"
             echo "| 余量 | $(awk -v a="$MAX_FIRMWARE_SIZE" -v b="$SIZE" 'BEGIN{printf "%.2f", (a-b)/1048576}') MiB |"
+            echo "| 固件内包数 | ${PKG_COUNT} |"
+            echo "| 关键包/文件缺失 | 0 |"
+            echo "| 自动补齐轮次 | ${round} |"
+            echo "| TurboACC | ${EFF_TURBO} |"
+            echo ""
+            echo "<details><summary>本次构建的组件版本</summary>"
+            echo ""
+            echo '```'
+            echo "源码: openwrt-25.12 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
+            grep -E '^(luci-app-passwall|xray-core|mosdns|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full) ' \
+                 "$(ls -1 *.manifest | head -n1)" | sort
+            echo '```'
+            echo ""
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "FIRMWARE_DIR=$PWD" >> "$GITHUB_ENV"
@@ -644,6 +1114,7 @@ jobs:
           path: |
             ${{ env.FIRMWARE_DIR }}/*sysupgrade.bin
             ${{ env.FIRMWARE_DIR }}/sha256sums.txt
+            ${{ env.FIRMWARE_DIR }}/versions.txt
           if-no-files-found: error
           retention-days: 7
 
@@ -657,34 +1128,43 @@ jobs:
           body: |
             ## ImmortalWrt 25.12 · Newifi-D2
 
+            > **本固件是"冻结"版本**：内部所有软件都锁定在编译时的版本，路由器上**不做任何自动更新**
+            （MosDNS 的 geodata 自动更新已关闭）。需要新版本 = **重新跑一次构建**，
+            那时会自动取当时 `openwrt-25.12` 分支与 feeds 的最新稳定版。
+
             默认管理地址 **192.168.2.1** · 无 root 密码（首次登录请自行设置）
 
+            ### 本次使用的版本
+            见 Release 附件 **`versions.txt`**（含源码提交号与各组件版本号）。
+
             ### 内置组件
-            - **PassWall + Xray**（nftables 透明代理，仅编入 Xray，不再打包 SS-Rust / Simple-Obfs 以节省闪存）
-            - **MosDNS**（5335，DoT 上游 1.1.1.1 / 8.8.8.8，geoip 使用 `geoip-only-cn-private`）
-              · DNS 广告拦截已开启，规则源为固件内 geosite `category-ads-all`（随固件版本更新，不在路由器上自动下载）
-            - **TurboACC**（软件流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 是否可用）
-            - **Ksmbd**（`/mnt/sda1` 共享，匿名读写）· **p910nd**（`/dev/usb/lp0`）
-            - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂到 WAN
-            - ZRAM 交换 + BBR + `fq` 队列
+            - **PassWall + Xray**（nftables 透明代理；仅编入 Xray，省掉 SS-Rust / Simple-Obfs）
+            - **MosDNS**（5335，DoT 上游，geoip 用 `geoip-only-cn-private`）
+              · DNS 广告拦截已开启，规则源为固件内 geosite `category-ads-all`（随固件版本，不联网更新）
+            - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
+            - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
+            - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
+            - 性能调优：BBR + `fq` + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
 
             ### 无线
-            - 2.4G：`alon` @ ch11 HT20
-            - 5G：`alon-5G` @ ch36 VHT80
-            - WPA2，默认密码 `alon12345678`（**请立即修改**）
+            - 2.4G：`alon` @ ch11 HT20 · 5G：`alon-5G` @ ch36 VHT80 · WPA2 `alon12345678`（**请立即修改**）
 
             ### 出问题怎么办
+            路由器里已内置说明页：**http://192.168.2.1/guide.html**
+            自检命令：SSH 执行 **`fw-selftest`**（逐项 ✅/❌，一眼看出哪个功能没起来）
+
             | 现象 | 处理 |
             | --- | --- |
-            | 能 ping 通 IP、但网页打不开 | SSH 执行 **`dns-recover`**（关闭 MosDNS 接管并重启 dnsmasq） |
+            | 能 ping 通 IP、但网页打不开 | SSH 执行 **`dns-recover`** |
             | 某个 App / 网站突然不通 | LuCI → 服务 → MosDNS → 关闭「广告拦截」 |
             | 科学上网时快时慢 | TurboACC 里把硬件分载 `hw_flow` 关掉再试 |
 
             ### 校验
-            见 Release 附件 `sha256sums.txt`；固件体积已通过 32MB(0x1FB0000) 分区上限审计。
+            `sha256sums.txt`；体积已通过 32MB(0x1FB0000) 分区上限审计。
           files: |
             ${{ env.FIRMWARE_DIR }}/*sysupgrade.bin
             ${{ env.FIRMWARE_DIR }}/sha256sums.txt
+            ${{ env.FIRMWARE_DIR }}/versions.txt
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # ---------------------------------------------------------------
