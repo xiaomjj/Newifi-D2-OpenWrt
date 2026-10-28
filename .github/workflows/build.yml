@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Ultimate Loop
+name: Build ImmortalWrt 25.12 Cleanized Loop
 
 on:
   workflow_dispatch:
@@ -50,12 +50,15 @@ jobs:
           git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none immortalwrt
           ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
 
-      - name: 4. 绝对净化 Feeds 配置文件并平级直插 Passwall
+      - name: 4. 暴力重建 Feeds 环境并平级直插 Passwall
         run: |
           cd immortalwrt
           
-          # 1. 极其暴力且彻底：直接重写 feeds.conf.default，只保留官方最纯净的 5 个基础源
-          # 这样可以 100% 根除任何畸形源、网盘错误或残留污染！
+          # 1. 彻底清空并重置 feeds 目录，彻底杜绝历史残留污染
+          rm -rf feeds/
+          ./scripts/feeds init
+          
+          # 2. 重新写入最纯净的官方 5 大 feeds 源
           cat << 'EOF' > feeds.conf.default
           src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
           src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
@@ -63,13 +66,13 @@ jobs:
           src-git telephony https://github.com/openwrt/telephony.git;openwrt-25.12
           src-git video https://github.com/openwrt/video.git;openwrt-25.12
           EOF
-          echo "✅ feeds.conf.default 已被重写为绝对纯净的官方源"
+          echo "✅ feeds.conf.default 已强制重写为纯净官方源"
 
-          # 2. 清理旧缓存并平级直插 Passwall 到 package 目录
+          # 3. 平级直插真正的 Passwall 源码到 package 目录
           rm -rf package/passwall package/passwall_packages
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall.git -b main package/passwall || true
           git clone --depth=1 https://github.com/xiaorouji/openwrt-passwall-packages.git -b main package/passwall_packages || true
-          echo "✅ Passwall 源码已完美平级直插 package 目录"
+          echo "✅ Passwall 源码已平级直插 package 目录"
 
       - name: 5. 配置初始化脚本与系统自动调度优化 (files/)
         run: |
@@ -237,30 +240,21 @@ jobs:
           chmod +x files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* 2>/dev/null || true
           echo "🔧 初始化脚本部署完成。"
 
-      - name: 6. 缓存 CCache 与 dl（升级至 v10 彻底隔绝历史污染）
+      - name: 6. 缓存 CCache 与 dl（升级至 v11 彻底隔绝历史污染）
         uses: actions/cache@v4
         with:
           path: |
             /workdir/immortalwrt/.ccache
             /workdir/immortalwrt/dl
-          key: ${{ runner.os }}-immortalwrt-d2-ultimate-v10-${{ hashFiles('newifi-d2.config') }}
+          key: ${{ runner.os }}-immortalwrt-d2-clean-v11-${{ hashFiles('newifi-d2.config') }}
           restore-keys: |
-            ${{ runner.os }}-immortalwrt-d2-ultimate-v10-
+            ${{ runner.os }}-immortalwrt-d2-clean-v11-
 
-      - name: 7. 【预编译检查与智能补全循环】绝对净化 Feeds 并自愈
+      - name: 7. 【预编译检查与智能补全循环】更新官方 Feeds 与自愈
         run: |
           cd immortalwrt
           echo "=================================================="
-          echo "🔍 【预编译阶段】绝对净化：强制抹除 feeds 里的 passwall 痕迹..."
-          echo "=================================================="
-          # 核心双保险：直接在更新前再次净化 feeds.conf.default，并干掉所有旧索引
-          sed -i '/passwall/d' feeds.conf.default
-          sed -i '/mosdns/d' feeds.conf.default
-          rm -f feeds/*.index
-          rm -rf feeds/passwall
-
-          echo "=================================================="
-          echo "🔍 【预编译阶段】执行纯净的 feeds 更新与安装..."
+          echo "🔍 【预编译阶段】执行纯净的官方 Feeds 更新..."
           echo "=================================================="
           ./scripts/feeds update -a
           ./scripts/feeds install -d default || true
@@ -371,12 +365,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: steps.check_size.outcome == 'success'
         with:
-          tag_name: ImmortalWrt-Ultimate-${{ env.TAG_DATE }}
-          name: ImmortalWrt 25.12 旗舰量产版 [${{ env.TAG_DATE }}]
+          tag_name: ImmortalWrt-Clean-${{ env.TAG_DATE }}
+          name: ImmortalWrt 25.12 纯净量产版 [${{ env.TAG_DATE }}]
           body: |
-            ## 🚀 Newifi-D2 ImmortalWrt 25.12 旗舰量产版
+            ## 🚀 Newifi-D2 ImmortalWrt 25.12 纯净量产版
 
-            本固件通过了严格的**前后完全统一、本地平级源码直插、全套组件自动化监查自愈与编译后体积审计闭环**。
+            本固件通过了严格的**feeds环境物理重建、本地平级源码直插、全套组件自动化监查自愈与编译后体积审计闭环**。
 
             ### 💎 核心功能特性：
             1. **Passwall + Xray**：内置成熟科学代理与透明代理环境。
