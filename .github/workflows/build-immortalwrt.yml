@@ -145,6 +145,38 @@ jobs:
           # TurboACC：25.12 的 luci feed 已经没有 luci-app-turboacc
           git clone --depth=1 https://github.com/chenmozhijin/turboacc.git package/turboacc
 
+          # --- xray-core 版本对齐（必须）---
+          # feeds 的 xray-core 是 26.3.27，而 luci-app-passwall 是 26.10.x，
+          # 新版 PassWall 生成的配置要求 xray >= 26.7.11，否则报
+          #   "this config must be run on version 26.7.11 or higher" 并启动失败。
+          # 因此只从 PassWall 官方包仓库取同期的 xray-core 替换，其余依赖仍用 feeds。
+          rm -rf /tmp/pp
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git /tmp/pp
+          rm -rf package/xray-core package/feeds/packages/xray-core
+          cp -r /tmp/pp/xray-core package/xray-core
+          rm -rf /tmp/pp
+
+          # 该仓库的 Makefile 用相对路径 include golang，挪到 package/ 下会找不到 → 改绝对路径
+          sed -i -E 's#include[[:space:]]+\.\./\.\./lang/golang/#include $(TOPDIR)/feeds/packages/lang/golang/#' \
+            package/xray-core/Makefile || true
+
+          XV=$(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)
+          PV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)
+          echo "  · luci-app-passwall : $PV"
+          echo "  · xray-core         : $XV   （PassWall 要求 ≥ 26.7.11）"
+
+          # 硬断言：版本不够就直接失败，绝不产出"能刷但不能用"的固件
+          if [ -z "$XV" ]; then
+            echo "::error::读不到 xray-core 版本，passwall-packages 结构与预期不符"
+            exit 1
+          fi
+          LOWEST=$(printf '%s\n%s\n' "26.7.11" "$XV" | sort -V | head -n1)
+          if [ "$LOWEST" != "26.7.11" ]; then
+            echo "::error::xray-core $XV 低于 PassWall $PV 要求的 26.7.11，构建中止（先别刷）"
+            exit 1
+          fi
+          echo "  ✅ 版本对齐通过"
+
           # --- 同名包去重：一律以本地源码为准 ---
           rm -rf package/feeds/luci/luci-app-mosdns \
                  package/feeds/luci/luci-app-turboacc \
@@ -161,7 +193,7 @@ jobs:
                    package/v2ray-geodata \
                    package/turboacc/luci-app-turboacc \
                    package/feeds/luci/luci-app-passwall \
-                   package/feeds/packages/xray-core; do
+                   package/xray-core; do
             if [ -f "$m/Makefile" ]; then
               echo "  ✅ $m"
             else
@@ -621,7 +653,8 @@ jobs:
           echo "---- 当前 Go 工具链 ----"
           grep -n '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk
           ls -d feeds/packages/lang/golang/golang[0-9]* 2>/dev/null | sed 's/^/  可用版本: /'
-          echo "xray-core 版本: $(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/xray-core/Makefile)"
+          echo "xray-core 版本: $(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)"
+          echo "passwall 版本 : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)"
           echo "mosdns 版本   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
 
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
@@ -862,6 +895,17 @@ jobs:
               fi
             fi
 
+            # 阶段 3：Go 主版本已对上但仍报 requires go（说明要的是补丁版本，
+            # 例如 1.27.3 而 feeds 只提供 1.27.1）→ 允许 Go 在构建时自动取工具链
+            if [ "$FIXED" -eq 0 ] && grep -q "requires go >=" build.log; then
+              if grep -q "GOTOOLCHAIN=local" feeds/packages/lang/golang/golang-package.mk; then
+                echo "  · 需要更高的 Go 补丁版本，切换为 GOTOOLCHAIN=auto（构建时自动下载对应工具链）"
+                sed -i 's/GOTOOLCHAIN=local/GOTOOLCHAIN=auto/' \
+                  feeds/packages/lang/golang/golang-package.mk
+                FIXED=1
+              fi
+            fi
+
             if [ "$FIXED" -eq 0 ]; then
               break
             fi
@@ -961,6 +1005,19 @@ jobs:
             chk sysctl      etc/sysctl.conf
           else
             echo "::warning::未找到 root-ramips，跳过文件级检查"
+          fi
+
+          # ---- 版本对齐复查：Xray 必须 ≥ PassWall 要求的 26.7.11 ----
+          XRAY_MV=$(grep -m1 '^xray-core ' "$MANIFEST" | awk '{print $3}' | cut -d- -f1)
+          if [ -n "$XRAY_MV" ]; then
+            _low=$(printf '%s\n%s\n' "26.7.11" "$XRAY_MV" | sort -V | head -n1)
+            if [ "$_low" != "26.7.11" ]; then
+              printf '  ❌ %-22s %s（低于 26.7.11，PassWall 无法启动）\n' "xray-core" "$XRAY_MV"
+              echo "xray-core" >> "$MISS_PKG"
+              LOST=$((LOST + 1))
+            else
+              printf '  ✅ %-22s %s（版本对齐）\n' "xray-core" "$XRAY_MV"
+            fi
           fi
 
           echo "缺失合计: $LOST（包 $(wc -l < "$MISS_PKG") / 文件 $(wc -l < "$MISS_FILE")）"
