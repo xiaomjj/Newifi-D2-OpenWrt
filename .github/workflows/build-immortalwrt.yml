@@ -116,12 +116,19 @@ jobs:
           # 关键：必须是 -a。原脚本的 "-d default" 什么都没装
           ./scripts/feeds install -a
 
+          # 规避 Kconfig 递归依赖（25.12 里 weechat 三件套互相 select，defconfig 会报
+          # recursive dependency detected）。这两个包我们永远不用，直接摘掉。
+          rm -rf package/feeds/packages/weechat package/feeds/luci/luci-app-weechat
+          # 同理，gst1-plugins-base 的 3 个可选依赖在 25.12 里不存在，只是噪声
+          echo "已摘要无关包：weechat / luci-app-weechat"
+
           # --- PassWall 依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
           echo "---- PassWall 依赖预检 ----"
           DEP_MISS=0
           for p in chinadns-ng dns2socks ipt2socks microsocks tcping lyaml \
                    xray-core luci-compat luci-lib-jsonc; do
-            if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
+            if [ -d "package/feeds/packages/$p" ] || [ -d "package/feeds/luci/$p" ] \
+               || [ -d "package/$p" ]; then
               printf '  ✅ %s\n' "$p"
             else
               printf '::warning::依赖缺失 %s\n' "$p"
@@ -674,6 +681,12 @@ jobs:
 
           make defconfig 2>&1 | tee defconfig.log
 
+          if grep -q 'recursive dependency detected' defconfig.log; then
+            echo "::error::Kconfig 检测到递归依赖（未知新增的冲突包），可能已丢包"
+            grep -A4 'recursive dependency' defconfig.log | head -n 20
+            exit 1
+          fi
+
           if grep -qi 'warning' defconfig.log; then
             echo "::warning::defconfig 存在告警，以下符号可能被丢弃："
             grep -i 'warning' defconfig.log | head -n 50
@@ -854,6 +867,65 @@ jobs:
           set -o pipefail
 
           : > build.log
+          {
+            echo "==== 构建环境 ===="
+            echo "Go: $(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)"
+            echo "xray-core: $(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)"
+            echo "passwall : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)"
+            echo "mosdns   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
+            echo "===================="
+          } >> build.log
+
+          # ---- 先单独预编 3 个 Go 组件（-j1 V=s）----
+          # 1) 失败能 10 分钟内暴露真实错误（整机 -j 编译时错误会被 make 吞掉）
+          # 2) 顺序执行，彻底消除"Go 工具链还没就绪就开始编"的竞态
+          # 3) mosdns 若与新 Go 不兼容，自动退回 Go 1.26 重试
+          GOVER=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
+          echo "🔧 预编译 Go 组件（Go ${GOVER} + mosdns + xray）..."
+
+          try_build() {
+            make -j1 V=s "$1" 2>&1 | tee -a build.log
+          }
+
+          die_with_log() {
+            echo "::error::$1 预编译失败（真实错误见下）"
+            echo "::group::📋 失败详情"
+            tail -n 80 build.log
+            echo "::endgroup::"
+            exit 1
+          }
+
+          # ① host Go 工具链
+          GT="package/feeds/packages/golang${GOVER}/host/compile"
+          if [ -d "$(dirname "${GT%/compile}")" ]; then
+            echo "================ 预编 $GT ================"
+            try_build "$GT" || die_with_log "Go ${GOVER} 工具链"
+          else
+            echo "::warning::找不到 golang${GOVER} 目录，跳过工具链预编"
+          fi
+
+          # ② mosdns（失败 → 自动退回 Go 1.26 重试）
+          echo "================ 预编 mosdns ================"
+          if ! try_build "package/luci-app-mosdns/mosdns/compile"; then
+            if [ -d feeds/packages/lang/golang/golang1.26 ]; then
+              echo "::warning::mosdns 在 Go ${GOVER} 下编译失败，自动改用 Go 1.26 重试"
+              sed -i -E 's#^PKG_BUILD_DEPENDS:=.*#PKG_BUILD_DEPENDS:=golang1.26/host#' \
+                package/luci-app-mosdns/mosdns/Makefile
+              make package/luci-app-mosdns/mosdns/clean >/dev/null 2>&1 || true
+              try_build "package/luci-app-mosdns/mosdns/compile" \
+                || die_with_log "mosdns（Go 1.26 退回后仍失败）"
+              echo "  ✅ mosdns 已用 Go 1.26 编过"
+            else
+              die_with_log "mosdns（且没有 golang1.26 可退回）"
+            fi
+          fi
+
+          # ③ xray（必须 ≥26.7.11，只能跟随主 Go 版本）
+          echo "================ 预编 xray-core ================"
+          try_build "package/xray-core/compile" || die_with_log "xray-core"
+
+          echo "✅ Go 组件预编译全部通过"
+
           build_once() {
             RC=0
             make -j"$(nproc)" 2>&1 | tee -a build.log || RC=$?
@@ -885,7 +957,7 @@ jobs:
               fi
             fi
 
-            if [ "$FIXED" -eq 0 ] && grep -qi "turboacc" build.log; then
+            if [ "$FIXED" -eq 0 ] && grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
               if grep -q "^CONFIG_PACKAGE_luci-app-turboacc=y" .config; then
                 echo "  · TurboACC 编译失败，自动移出本次构建（加速由 firewall4 分载 + BBR 承担）"
                 sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
@@ -919,13 +991,15 @@ jobs:
           done
 
           # ================= 仍失败：明确报错 =================
+          echo "---- 失败包清单 ----"
+          grep -oE "package/[A-Za-z0-9_./-]+ failed to build" build.log | sed 's/ failed to build//' | sort -u || true
           echo "::group::📋 编译失败诊断（最后 40 行）"
           tail -n 40 build.log || true
           echo "::endgroup::"
           if grep -q "requires go >=" build.log; then
             echo "::error::编译失败：Go 版本仍不满足（自动切换已尝试），请手动把 go_version 设为日志要求的版本"
-          elif grep -qi "luci-app-turboacc" build.log; then
-            echo "::error::编译失败：TurboACC 相关错误（自动移除已尝试），请用 with_turboacc=false 重跑"
+          elif grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
+            echo "::error::编译失败：TurboACC 编译错误（自动移除已尝试），请用 with_turboacc=false 重跑"
           elif grep -q "No space left on device" build.log; then
             echo "::error::编译失败：磁盘不足，重跑（缓存复用）或改用 larger runner"
           else
