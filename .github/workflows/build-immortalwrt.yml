@@ -28,6 +28,12 @@ on:
         type: boolean
         default: true
 
+  # ---- 每周自动构建：每周六 02:17（北京）= 每周五 18:17 UTC ----
+  # 只在默认分支生效；公开仓库 60 天无提交会被 GitHub 自动暂停（偶尔手动 Run 一次即可续上）。
+  # 避开整点：GitHub 的 cron 在 :00 排队最挤，延迟可能 20~40 分钟。
+  schedule:
+    - cron: '17 18 * * 5'
+
 permissions:
   contents: write
 
@@ -288,8 +294,11 @@ jobs:
               uci set mosdns.@mosdns[0].listen_port='5335'
               uci set mosdns.@mosdns[0].redirect='1'
               uci set mosdns.@mosdns[0].geoip_type='geoip-only-cn-private'
-              # 关闭运行时自动更新：它会往 /usr/share/v2ray 写 1.3MB（overlay 就是 32MB 闪存），
-              # 且下载失败会报错。规则新鲜度交给"每次固件构建时拉取最新 geodata"来保证。
+              # 关闭 MosDNS 自带的 geodata 自动更新：它会往 /usr/share/v2ray 写 1.3MB，
+              # 32MB 闪存的 overlay 经不起反复覆盖，且弱网下下载失败会报错。
+              # 规则新鲜度分两路保证：
+              #   ① geoip/geosite 二进制库 —— 每次固件构建时拉最新（本周构建 = 本周数据）
+              #   ② gfwlist/chnlist 文本规则 —— 路由器上每周六 04:30 由 rule-refresh 自更新
               uci set mosdns.@mosdns[0].geo_auto_update='0'
               # ---- 广告拦截 ----
               # 只吃固件自带的 geosite 分类 category-ads-all：
@@ -473,6 +482,8 @@ jobs:
           cat > files/etc/crontabs/root << 'EOF'
           # 每日 04:00 释放页缓存，缓解 128MB 内存压力
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
+          # 每周六 04:30 刷新 PassWall 文本规则（gfwlist / chnlist），失败自动回滚
+          30 4 * * 6 /usr/bin/rule-refresh
           EOF
 
           # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
@@ -528,7 +539,68 @@ jobs:
           exit 0
           EOF
 
-          # ---------- H. 固件自检脚本（刷机后 SSH 执行 fw-selftest）----------
+          # ---------- H. 规则自更新（每周六 04:30，见 crontabs）----------
+          # 只刷文本规则 gfwlist/chnlist（合计约 1.4MB）：
+          #   geoip.dat / geosite.dat 是 ROM 里的 6MB 二进制库，在 32MB 闪存上原地覆盖
+          #   会把 overlay 撑爆，所以那两份只随"每周重编固件"更新。
+          # 下载 → 校验 → 备份 → 替换 → 重启 PassWall → 确认 xray 还活着，否则回滚。
+          cat > files/usr/bin/rule-refresh << 'EOF'
+          #!/bin/sh
+          LOG=/var/log/rule-refresh.log
+          RULES=/usr/share/passwall/rules
+          TMP=/tmp/rules.$$
+          log() { echo "$(date '+%F %T') $*" >> "$LOG"; logger -t rule-refresh "$*"; }
+
+          [ -d "$RULES" ] || { log "跳过：$RULES 不存在（未装 PassWall）"; exit 0; }
+          mkdir -p "$TMP" || exit 1
+
+          # 空间预检：两份规则约 1.4MB，留 3MB 余量，不够就安静跳过
+          FREE=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print int($4/1024)}')
+          if [ -n "$FREE" ] && [ "$FREE" -lt 3 ]; then
+              log "跳过：overlay 仅剩 ${FREE}MB"
+              rm -rf "$TMP"; exit 0
+          fi
+
+          fetch() {
+              _url="$1"; _out="$2"
+              curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -m 300 \
+                   "$_url" -o "$TMP/$_out" || { log "失败：$_out 下载出错"; return 1; }
+              _n=$(wc -l < "$TMP/$_out" | tr -d ' ')
+              [ "$_n" -ge 1000 ] || { log "失败：$_out 行数异常($_n)"; return 1; }
+              if grep -qE '^(domain|full|regexp|keyword|include):' "$TMP/$_out"; then
+                  log "失败：$_out 是 v2ray 格式，不能直接当 gfwlist"; return 1
+              fi
+              log "完成：$_out 下载($_n 行)"
+          }
+
+          fetch "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" gfwlist \
+              || { rm -rf "$TMP"; exit 0; }
+          fetch "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" chnlist \
+              || { rm -rf "$TMP"; exit 0; }
+
+          cp -f "$RULES/gfwlist" "$TMP/gfwlist.bak" 2>/dev/null
+          cp -f "$RULES/chnlist" "$TMP/chnlist.bak" 2>/dev/null
+          mv -f "$TMP/gfwlist" "$RULES/gfwlist"
+          mv -f "$TMP/chnlist" "$RULES/chnlist"
+
+          if [ -x /etc/init.d/passwall ]; then
+              /etc/init.d/passwall restart >/dev/null 2>&1
+              sleep 20
+              if ! pidof xray >/dev/null 2>&1; then
+                  log "回滚：重启后 xray 未运行"
+                  [ -f "$TMP/gfwlist.bak" ] && cp -f "$TMP/gfwlist.bak" "$RULES/gfwlist"
+                  [ -f "$TMP/chnlist.bak" ] && cp -f "$TMP/chnlist.bak" "$RULES/chnlist"
+                  /etc/init.d/passwall restart >/dev/null 2>&1
+              else
+                  log "生效：规则已替换，xray 运行中"
+              fi
+          fi
+
+          rm -rf "$TMP"
+          exit 0
+          EOF
+
+          # ---------- I. 固件自检脚本（刷机后 SSH 执行 fw-selftest）----------
           mkdir -p files/usr/bin
           cat > files/usr/bin/fw-selftest << 'EOF'
           #!/bin/sh
@@ -616,12 +688,15 @@ jobs:
           <p>看整体状态：SSH 执行 <code>fw-selftest</code>。</p>
 
           <h2>8. 更新固件</h2>
-          <p>本固件是冻结版本，不会自动更新。要新版本请重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
+          <p>固件本体不自动升级：要新版本请重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
+          <p>但 <b>PassWall 规则会自己更新</b>：每周六 04:30 跑一次 <code>rule-refresh</code>
+             （gfwlist / chnlist，约 1.4MB）。想看日志：<code>cat /var/log/rule-refresh.log</code>；
+             想立即刷一次：<code>rule-refresh</code>。失败会自动回滚，不会断网。</p>
           </body>
           </html>
           EOF
 
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest \
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
           echo "🔧 files/ 预置完成："
           find files -type f | sort
@@ -684,7 +759,11 @@ jobs:
           # 用 with_turboacc=false 重跑即可，加速能力不受影响
           #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
           EFF_TURBO="true"
-          if [ "${{ inputs.with_turboacc }}" != "true" ]; then
+          # 定时触发（schedule）时 inputs.* 全是空串，这里统一回落到默认值 true，
+          # 否则每周自动构建会误把 TurboACC 当成"用户要求关闭"而悄悄漏掉。
+          TURBO="${{ inputs.with_turboacc }}"
+          [ -z "$TURBO" ] && TURBO="true"
+          if [ "$TURBO" != "true" ]; then
             sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
             EFF_TURBO="false"
             echo "⏭  已按输入关闭 TurboACC"
@@ -723,7 +802,7 @@ jobs:
           check CONFIG_PACKAGE_mosdns
           check CONFIG_PACKAGE_v2ray-geoip
           check CONFIG_PACKAGE_v2ray-geosite
-          if [ "${{ inputs.with_turboacc }}" = "true" ]; then
+          if [ "$TURBO" = "true" ]; then
             check CONFIG_PACKAGE_luci-app-turboacc
           else
             echo "  ⏭  TurboACC 按要求跳过（不影响 offload / BBR）"
@@ -1118,6 +1197,7 @@ jobs:
             chk usbwan      etc/hotplug.d/net/20-usbwan
             chk dns-recover usr/bin/dns-recover
             chk fw-selftest usr/bin/fw-selftest
+            chk rule-refresh usr/bin/rule-refresh
             chk guide       www/guide.html
             chk cfg-ksmbd   etc/config/ksmbd
             chk cfg-p910nd  etc/config/p910nd
@@ -1340,7 +1420,25 @@ jobs:
           retention-days: 7
 
       # ---------------------------------------------------------------
-      - name: 14. 发布 Release
+      - name: 14. 记录回退点（上一个可用版本）
+        if: steps.audit.outcome == 'success'
+        run: |
+          # 本步骤只读，不删任何东西：历史 Release 全部保留，随时可回退
+          PREV=$(git ls-remote --tags --refs origin 2>/dev/null \
+                 | awk -F'refs/tags/' '{print $2}' | grep -E '^D2-' | sort -V | tail -n1)
+          echo "PREV_TAG=${PREV:-（这是首个版本）}" >> "$GITHUB_ENV"
+          echo "本次源码提交: ${{ github.sha }}"
+          echo "上一个可用版本: ${PREV:-无}"
+          {
+            echo ""
+            echo "### 回退点"
+            echo "- 本次源码提交: \`${{ github.sha }}\`"
+            echo "- 上一个可用版本: \`${PREV:-无}\`"
+            echo "- 触发方式: \`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      - name: 15. 发布 Release
         if: steps.audit.outcome == 'success'
         uses: softprops/action-gh-release@v2
         with:
@@ -1349,14 +1447,24 @@ jobs:
           body: |
             ## ImmortalWrt 25.12 · Newifi-D2
 
-            > **本固件是"冻结"版本**：内部所有软件都锁定在编译时的版本，路由器上**不做任何自动更新**
-            （MosDNS 的 geodata 自动更新已关闭）。需要新版本 = **重新跑一次构建**，
-            那时会自动取当时 `openwrt-25.12` 分支与 feeds 的最新稳定版。
+            > **固件本体是"冻结"版本**：软件版本锁定在编译时，**不自升级**；要新版本就刷入新构建。
+            > **规则会自更新**：PassWall 的 gfwlist / chnlist 每周六 04:30 由 `rule-refresh` 刷新
+            > （失败自动回滚，不会把路由器停在半坏状态）。geoip/geosite 二进制库仍随固件版本。
+            >
+            > 本仓库已开启**每周六 02:17（北京）定时构建**，源码每次取
+            > `openwrt-25.12` / feeds / 第三方 `main` 的最新提交，所以每周都会有新 Release。
 
             默认管理地址 **192.168.2.1** · 无 root 密码（首次登录请自行设置）
 
             ### 本次使用的版本
             见 Release 附件 **`versions.txt`**（含源码提交号与各组件版本号）。
+
+            ### ↩️ 回退（出问题时）
+            - 本次源码提交：`${{ github.sha }}`
+            - 上一个可用版本：**`${{ env.PREV_TAG }}`**
+            - 方法：在下方 Releases 列表里找到上一个版本，下载它的 `sysupgrade.bin`，
+              在 LuCI「系统 → 备份/升级」中**保留配置**刷入即可（3 分钟内完成）。
+            - 历史 Release 一律不删，都是可回退点。
 
             ### 内置组件
             - **PassWall + Xray**（nftables 透明代理；仅编入 Xray，省掉 SS-Rust / Simple-Obfs）
@@ -1390,7 +1498,7 @@ jobs:
 
       # ---------------------------------------------------------------
       # 放在最后：编译 / 审计 / 发布任一阶段失败都能捞到日志
-      - name: 15. 失败时上传日志
+      - name: 16. 失败时上传日志
         if: failure()
         uses: actions/upload-artifact@v4
         with:
