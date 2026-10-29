@@ -1,0 +1,1601 @@
+# ============================================================
+#  ImmortalWrt 25.12 (openwrt-25.12) — newifi-d2 自动构建
+#  设计原则：
+#   1. 依赖一律走官方 feeds，不再手工克隆 PassWall（避免同名包重复定义）
+#   2. 只保留 3 个第三方源码：MosDNS / GeoData / TurboACC
+#   3. defconfig 之后做"硬校验"，缺包直接失败，拒绝产出残缺固件
+#   4. 全流程日志落盘 build.log，失败必留日志
+# ============================================================
+name: Build ImmortalWrt 25.12 for Newifi-D2
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "丢弃 ccache / dl 缓存（改依赖后建议勾选）"
+        type: boolean
+        default: false
+      go_version:
+        description: "Go 工具链版本（auto = 跟随 feeds 默认；报 go.mod requires go >= 1.XX 时改成对应版本）"
+        type: choice
+        options:
+          - auto
+          - "1.26"
+          - "1.27"
+        default: auto
+      with_turboacc:
+        description: "是否编入 TurboACC（若它编译失败，设为 false 重跑即可；加速不依赖它）"
+        type: boolean
+        default: true
+
+  # ---- 每周自动构建：每周六 02:17（北京）= 每周五 18:17 UTC ----
+  # 只在默认分支生效；公开仓库 60 天无提交会被 GitHub 自动暂停（偶尔手动 Run 一次即可续上）。
+  # 避开整点：GitHub 的 cron 在 :00 排队最挤，延迟可能 20~40 分钟。
+  schedule:
+    - cron: '17 18 * * 5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  CONFIG_FILE: newifi-d2.config
+  TZ: Asia/Shanghai
+  # d-team_newifi-d2 的 firmware 分区 = 0x1FB0000 = 33226752 字节
+  MAX_FIRMWARE_SIZE: 33226752
+  CCACHE_DIR: /workdir/immortalwrt/.ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+
+    steps:
+      # ---------------------------------------------------------------
+      - name: 1. 检出本仓库
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      - name: 2. 准备编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 释放 runner 空间（immortalwrt 全量构建约需 15~20GB）
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/share/swift /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "---- 清理后磁盘 ----"
+          df -h /
+          AVAIL_GB=$(df -Pk / | awk 'NR==2{printf "%d", $4/1048576}')
+          echo "可用空间: ${AVAIL_GB} GB"
+          if [ "$AVAIL_GB" -lt 15 ]; then
+            echo "::warning::可用空间仅 ${AVAIL_GB}GB，可能不足；如失败请改用 larger runner"
+          fi
+          sudo apt-get update
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache cmake cpio curl \
+            device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool libelf-dev libglib2.0-dev libgmp3-dev \
+            liblzo2-dev libncurses5-dev libssl-dev libtool lrzsz mkisofs nano \
+            ninja-build p7zip-full patch pkg-config python3 python3-dev python3-pip \
+            python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip wget xmlto xxd zlib1g-dev
+
+          sudo ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
+          echo "$TZ" | sudo tee /etc/timezone > /dev/null
+          sudo timedatectl set-ntp true || true
+
+          sudo mkdir -p /workdir
+          sudo chown -R "$USER":"$USER" /workdir
+
+          ccache --version | head -n1
+          df -h / /workdir
+
+      # ---------------------------------------------------------------
+      - name: 3. 克隆 ImmortalWrt 25.12
+        working-directory: /workdir
+        run: |
+          git clone --depth=1 -b "$REPO_BRANCH" "$REPO_URL" immortalwrt
+          ln -sfn /workdir/immortalwrt "$GITHUB_WORKSPACE/immortalwrt"
+          cd immortalwrt
+          git log -1 --format='分支 %D | %h %s'
+
+      # ---------------------------------------------------------------
+      - name: 4. 安装官方 feeds 并植入 3 个第三方源码
+        run: |
+          cd immortalwrt
+
+          # --- 官方 feeds（PassWall / Xray / chinadns-ng 等全部由 feeds 提供）---
+          cat > feeds.conf.default << 'EOF'
+          src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
+          src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
+          src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
+          EOF
+
+          ./scripts/feeds update -a
+          # 关键：必须是 -a。原脚本的 "-d default" 什么都没装
+          ./scripts/feeds install -a
+
+          # 规避 Kconfig 递归依赖（25.12 里 weechat 三件套互相 select，defconfig 会报
+          # recursive dependency detected）。这两个包我们永远不用，直接摘掉。
+          rm -rf package/feeds/packages/weechat package/feeds/luci/luci-app-weechat
+          # 同理，gst1-plugins-base 的 3 个可选依赖在 25.12 里不存在，只是噪声
+          echo "已摘要无关包：weechat / luci-app-weechat"
+
+          # --- PassWall 依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
+          echo "---- PassWall 依赖预检 ----"
+          DEP_MISS=0
+          for p in chinadns-ng dns2socks ipt2socks microsocks tcping lyaml \
+                   xray-core luci-compat luci-lib-jsonc; do
+            if [ -d "package/feeds/packages/$p" ] || [ -d "package/feeds/luci/$p" ] \
+               || [ -d "package/$p" ]; then
+              printf '  ✅ %s\n' "$p"
+            else
+              printf '::warning::依赖缺失 %s\n' "$p"
+              DEP_MISS=$((DEP_MISS + 1))
+            fi
+          done
+          if [ "$DEP_MISS" -gt 0 ]; then
+            echo "::warning::有 $DEP_MISS 个依赖不在 feeds 中，第 7 步会再确认一次"
+          fi
+
+          # --- 第三方源码 ---
+          rm -rf package/luci-app-mosdns package/v2ray-geodata package/turboacc
+
+          # MosDNS：仓库内同时含 mosdns / geo2txt / luci-app-mosdns 三个包
+          # 注意 -b 必须在 URL 前面；原写法 "git clone URL -v v5 dir" 实参过多会直接失败
+          git clone --depth=1 -b v5 https://github.com/sbwml/luci-app-mosdns.git package/luci-app-mosdns
+
+          # GeoData：提供 v2ray-geoip / v2ray-geosite（不是 v2ray-geodata）
+          git clone --depth=1 https://github.com/sbwml/v2ray-geodata.git package/v2ray-geodata
+
+          # TurboACC：25.12 的 luci feed 已经没有 luci-app-turboacc
+          git clone --depth=1 https://github.com/chenmozhijin/turboacc.git package/turboacc
+
+          # --- xray-core 版本对齐（必须）---
+          # feeds 的 xray-core 是 26.3.27，而 luci-app-passwall 是 26.10.x，
+          # 新版 PassWall 生成的配置要求 xray >= 26.7.11，否则报
+          #   "this config must be run on version 26.7.11 or higher" 并启动失败。
+          # 因此只从 PassWall 官方包仓库取同期的 xray-core 替换，其余依赖仍用 feeds。
+          rm -rf /tmp/pp
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git /tmp/pp
+          rm -rf package/xray-core package/feeds/packages/xray-core
+          cp -r /tmp/pp/xray-core package/xray-core
+          rm -rf /tmp/pp
+
+          # 该仓库的 Makefile 用相对路径 include golang，挪到 package/ 下会找不到 → 改绝对路径
+          sed -i -E 's#include[[:space:]]+\.\./\.\./lang/golang/#include $(TOPDIR)/feeds/packages/lang/golang/#' \
+            package/xray-core/Makefile || true
+
+          XV=$(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)
+          PV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)
+          echo "  · luci-app-passwall : $PV"
+          echo "  · xray-core         : $XV   （PassWall 要求 ≥ 26.7.11）"
+
+          # 硬断言：版本不够就直接失败，绝不产出"能刷但不能用"的固件
+          if [ -z "$XV" ]; then
+            echo "::error::读不到 xray-core 版本，passwall-packages 结构与预期不符"
+            exit 1
+          fi
+          LOWEST=$(printf '%s\n%s\n' "26.7.11" "$XV" | sort -V | head -n1)
+          if [ "$LOWEST" != "26.7.11" ]; then
+            echo "::error::xray-core $XV 低于 PassWall $PV 要求的 26.7.11，构建中止（先别刷）"
+            exit 1
+          fi
+          echo "  ✅ 版本对齐通过"
+
+          # --- 同名包去重：一律以本地源码为准 ---
+          rm -rf package/feeds/luci/luci-app-mosdns \
+                 package/feeds/luci/luci-app-turboacc \
+                 package/feeds/packages/mosdns \
+                 package/feeds/packages/geo2txt \
+                 package/feeds/packages/v2ray-geoip \
+                 package/feeds/packages/v2ray-geosite
+
+          # --- 源码完整性硬校验（绝不 || true）---
+          MISSING_SRC=0
+          for m in package/luci-app-mosdns/mosdns \
+                   package/luci-app-mosdns/geo2txt \
+                   package/luci-app-mosdns/luci-app-mosdns \
+                   package/v2ray-geodata \
+                   package/turboacc/luci-app-turboacc \
+                   package/feeds/luci/luci-app-passwall \
+                   package/xray-core; do
+            if [ -f "$m/Makefile" ]; then
+              echo "  ✅ $m"
+            else
+              echo "::error::源码缺失：$m"
+              MISSING_SRC=1
+            fi
+          done
+          [ "$MISSING_SRC" -eq 0 ] || exit 1
+          echo "✅ feeds 与第三方源码全部就绪"
+
+      # ---------------------------------------------------------------
+      - name: 5. 生成预置配置 (files/)
+        run: |
+          cd immortalwrt
+          mkdir -p files/etc/uci-defaults files/etc/hotplug.d/net \
+                   files/etc/config files/etc/crontabs files/usr/bin
+
+          # ---------- A. 系统 / LuCI 默认语言 / 主机名 / NTP ----------
+          # ⚠️ 铁律：首次启动脚本【只改已存在的配置段】，绝不新建
+          #    新建空的 network/system 段会让 config_generate 认为配置已存在而跳过，
+          #    结果是 LAN 没有 proto/device → br-lan 建不出来 → 全屋拿不到 IP。
+          cat > files/etc/uci-defaults/90-luci << 'EOF'
+          #!/bin/sh
+
+          # 系统信息：段存在才改
+          if uci -q get system.@system[0] >/dev/null 2>&1; then
+              uci set system.@system[0].hostname='Newifi-D2'
+              uci set system.@system[0].timezone='CST-8'
+              uci set system.@system[0].zonename='Asia/Shanghai'
+              if uci -q get system.ntp >/dev/null 2>&1; then
+                  uci -q delete system.ntp.server
+                  uci add_list system.ntp.server='ntp.aliyun.com'
+                  uci add_list system.ntp.server='cn.pool.ntp.org'
+                  uci add_list system.ntp.server='time.cloudflare.com'
+              fi
+              uci commit system
+          fi
+
+          # 默认中文：段存在才改
+          if uci -q get luci.main >/dev/null 2>&1; then
+              uci set luci.main.lang='zh_cn'
+              uci commit luci
+          fi
+
+          # LAN 地址：这里【不写】。由构建时对 config_generate 的 sed 决定（与原配置同一做法），
+          # 避免在配置尚未生成时创建残段。万一仍然异常，由 /etc/rc.local 的自愈逻辑兜底修复。
+          exit 0
+          EOF
+
+          # ---------- B. 无线：双频开启 + 中国区 + WPA2 ----------
+          # 同样遵守铁律：无线配置不存在就完全不碰，交给系统自己生成
+          cat > files/etc/uci-defaults/91-wireless << 'EOF'
+          #!/bin/sh
+          [ -f /etc/config/wireless ] || exit 0
+          uci -q get wireless.radio0 >/dev/null 2>&1 || exit 0
+
+          uci set wireless.radio0.disabled='0'
+          uci set wireless.radio0.country='CN'
+          uci set wireless.radio0.channel='11'
+          uci set wireless.radio0.htmode='HT20'
+          uci set wireless.radio1.disabled='0'
+          uci set wireless.radio1.country='CN'
+          uci set wireless.radio1.channel='36'
+          uci set wireless.radio1.htmode='VHT80'
+
+          uci set wireless.default_radio0.ssid='alon'
+          uci set wireless.default_radio0.encryption='psk2'
+          uci set wireless.default_radio0.key='alon12345678'
+          uci set wireless.default_radio0.disabled='0'
+          uci set wireless.default_radio1.ssid='alon-5G'
+          uci set wireless.default_radio1.encryption='psk2'
+          uci set wireless.default_radio1.key='alon12345678'
+          uci set wireless.default_radio1.disabled='0'
+
+          uci commit wireless
+          exit 0
+          EOF
+
+          # ---------- C. MosDNS / PassWall / TurboACC 默认参数 ----------
+          cat > files/etc/uci-defaults/92-services << 'EOF'
+          #!/bin/sh
+          # ---- MosDNS：字段名以 sbwml v5 的 /etc/config/mosdns 为准 ----
+          if uci -q get mosdns.@mosdns[0] >/dev/null 2>&1; then
+              uci set mosdns.@mosdns[0].enabled='1'
+              uci set mosdns.@mosdns[0].listen_port='5335'
+              uci set mosdns.@mosdns[0].redirect='1'
+              uci set mosdns.@mosdns[0].geoip_type='geoip-only-cn-private'
+              # 关闭 MosDNS 自带的 geodata 自动更新：它会往 /usr/share/v2ray 写 1.3MB，
+              # 32MB 闪存的 overlay 经不起反复覆盖，且弱网下下载失败会报错。
+              # 规则新鲜度分两路保证：
+              #   ① geoip/geosite 二进制库 —— 每次固件构建时拉最新（本周构建 = 本周数据）
+              #   ② gfwlist/chnlist 文本规则 —— 路由器上每周六 04:30 由 rule-refresh 自更新
+              uci set mosdns.@mosdns[0].geo_auto_update='0'
+              # ---- 广告拦截 ----
+              # 只吃固件自带的 geosite 分类 category-ads-all：
+              #   不联网、不写 flash（geo2txt 在 /var 现转）、误杀率低。
+              #   规则新鲜度 = 固件版本（每次 CI 构建都会拉最新 geosite）
+              # 想加大力度可追加（务必是纯域名/hosts 格式，不支持 ||xxx^ 语法）：
+              #   uci add_list mosdns.@mosdns[0].ad_source='https://anti-ad.net/domains.txt'
+              # 出问题要关掉：adblock 改 0 后 /etc/init.d/mosdns restart，或直接跑 dns-recover
+              uci set mosdns.@mosdns[0].adblock='1'
+              uci -q delete mosdns.@mosdns[0].ad_source
+              uci add_list mosdns.@mosdns[0].ad_source='geosite.dat'
+              # 上游是 list remote_dns，没有 remote_dns_server 这个键
+              uci -q delete mosdns.@mosdns[0].remote_dns
+              uci add_list mosdns.@mosdns[0].remote_dns='tls://1.1.1.1'
+              uci add_list mosdns.@mosdns[0].remote_dns='tls://8.8.8.8'
+              uci commit mosdns
+              /etc/init.d/mosdns enable
+          fi
+
+          # ---- PassWall ----
+          if uci -q get passwall.@global[0] >/dev/null 2>&1; then
+              uci set passwall.@global[0].enabled='1'
+              uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].udp_proxy_mode='gfwlist'
+              uci set passwall.@global[0].dns_mode='dnsmasq'
+              uci set passwall.@global[0].tcp_fastopen='1'
+              uci commit passwall
+          fi
+
+          # ---- TurboACC ----
+          if uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
+              uci set turboacc.@turboacc[0].sw_flow='1'
+              uci set turboacc.@turboacc[0].hw_flow='1'
+              uci set turboacc.@turboacc[0].bbr_cca='1'
+              # 全锥 NAT 默认关：需要 kmod-nft-fullcone，当前镜像未编入。
+              # 想开：先确认 feeds 有该 kmod（.config 里 INCLUDE_NFT_FULLCONE 改 y），再把这里改 1
+              uci set turboacc.@turboacc[0].fullcone_nat='0'
+              uci commit turboacc
+          fi
+
+          # ---- 防火墙流量分载：不依赖 TurboACC，装了/没装都生效 ----
+          # TurboACC 只是 UI + 额外选项；核心加速走 firewall4 原生 offload。
+          if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+              uci set firewall.@defaults[0].flow_offloading='1'
+              uci commit firewall
+          fi
+
+          # ---- 只 enable，不在这里 start（此时网络还没起来）----
+          for s in ksmbd p910nd zram cron; do
+              [ -x "/etc/init.d/$s" ] && /etc/init.d/$s enable
+          done
+          exit 0
+          EOF
+
+          # ---------- C2. DNS 应急回滚：一条命令关掉 MosDNS 接管 ----------
+          # 万一 DNS 出问题（打不开网页但能 ping 通 IP），SSH 里执行 dns-recover 即可
+          cat > files/usr/bin/dns-recover << 'EOF'
+          #!/bin/sh
+          # 关闭 MosDNS 接管 + 广告拦截，恢复 dnsmasq 直连
+          echo "== 停用 MosDNS（含广告拦截）=="
+          uci -q set mosdns.@mosdns[0].enabled='0'
+          uci -q set mosdns.@mosdns[0].adblock='0'
+          uci -q commit mosdns
+          /etc/init.d/mosdns stop 2>/dev/null
+          /etc/init.d/mosdns disable 2>/dev/null
+
+          echo "== 重启 dnsmasq =="
+          /etc/init.d/dnsmasq restart
+          sleep 2
+
+          if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+              echo "✅ DNS 已恢复（MosDNS 已停用，DNS 层广告拦截已关闭）"
+              echo "   排查完后想重新开启：uci set mosdns.@mosdns[0].enabled=1 && uci commit mosdns && /etc/init.d/mosdns enable && /etc/init.d/mosdns start"
+          else
+              echo "⚠️ 仍无法解析，可能 WAN 断线。执行 logread | tail -n 50 看日志"
+          fi
+          exit 0
+          EOF
+
+          # ---------- D. USB 网卡 / 随身 WiFi 热插拔自动挂 WAN ----------
+          cat > files/etc/hotplug.d/net/20-usbwan << 'EOF'
+          #!/bin/sh
+          [ -n "$INTERFACE" ] || exit 0
+          case "$INTERFACE" in usb*|wwan*|eth1|eth2) ;; *) exit 0 ;; esac
+
+          is_usb() {
+              _d=$(readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null)
+              case "$_d" in */usb*) return 0 ;; esac
+              [ -f "/sys/class/net/$INTERFACE/device/uevent" ] && \
+                  grep -q 'DEVTYPE=usb_interface' "/sys/class/net/$INTERFACE/device/uevent"
+          }
+
+          wan_zone() {
+              uci show firewall 2>/dev/null \
+                  | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p" \
+                  | head -n1
+          }
+
+          case "$ACTION" in
+            add)
+              is_usb || exit 0
+              [ "$(uci -q get network.usbwan.device)" = "$INTERFACE" ] && exit 0
+              uci set network.usbwan=interface
+              uci set network.usbwan.proto='dhcp'
+              uci set network.usbwan.device="$INTERFACE"
+              uci set network.usbwan.metric='10'
+              uci commit network
+              _z=$(wan_zone)
+              if [ -n "$_z" ]; then
+                  uci -q del_list "firewall.$_z.network=usbwan"
+                  uci add_list "firewall.$_z.network=usbwan"
+                  uci commit firewall
+                  /etc/init.d/firewall reload
+              fi
+              /etc/init.d/network reload
+              logger -t usbwan "已绑定 $INTERFACE -> usbwan"
+              ;;
+            remove)
+              [ "$(uci -q get network.usbwan.device)" = "$INTERFACE" ] || exit 0
+              uci -q delete network.usbwan
+              uci commit network
+              _z=$(wan_zone)
+              if [ -n "$_z" ]; then
+                  uci -q del_list "firewall.$_z.network=usbwan"
+                  uci commit firewall
+                  /etc/init.d/firewall reload
+              fi
+              /etc/init.d/network reload
+              logger -t usbwan "$INTERFACE 已移除，清理 usbwan"
+              ;;
+          esac
+          exit 0
+          EOF
+
+          # ---------- E. ksmbd / p910nd ----------
+          cat > files/etc/config/ksmbd << 'EOF'
+          config globals
+              option workgroup 'WORKGROUP'
+              option description 'Newifi-D2'
+
+          config share
+              option name 'usb'
+              option path '/mnt/sda1'
+              option read_only 'no'
+              option guest_ok 'yes'
+              option create_mask '0666'
+              option dir_mask '0777'
+          EOF
+
+          cat > files/etc/config/p910nd << 'EOF'
+          config p910nd
+              option enabled '1'
+              option device '/dev/usb/lp0'
+              option port '0'
+              option bidirectional '0'
+          EOF
+
+          # ---------- F. 内核调优（针对 MT7621 双核 / 128MB 内存）----------
+          cat > files/etc/sysctl.conf << 'EOF'
+          # ---- 缓冲与队列：BBR 需要 fq，rmem/wmem 上限要放开否则 tcp_rmem 白设 ----
+          net.core.default_qdisc = fq
+          net.core.somaxconn = 1024
+          net.core.rmem_max = 8388608
+          net.core.wmem_max = 8388608
+          net.ipv4.tcp_rmem = 4096 87380 8388608
+          net.ipv4.tcp_wmem = 4096 65536 8388608
+          net.ipv4.tcp_congestion_control = bbr
+          net.ipv4.tcp_fastopen = 3
+          net.ipv4.tcp_max_syn_backlog = 8192
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.tcp_tw_reuse = 1
+          # ---- 内存：小内存机器不要把 16MB 锁死，8MB 足够 ----
+          vm.min_free_kbytes = 8192
+          vm.swappiness = 10
+          # ---- 保留 VFS 缓存：ksmbd/USB 共享读写更稳 ----
+          vm.vfs_cache_pressure = 50
+          # ---- 内核 panic 后 10 秒自动重启，避免软路由挂着 ----
+          kernel.panic = 10
+          EOF
+
+          cat > files/etc/crontabs/root << 'EOF'
+          # 每日 04:00 释放页缓存，缓解 128MB 内存压力
+          0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
+          # 每周六 04:30 刷新 PassWall 文本规则（gfwlist / chnlist），失败自动回滚
+          30 4 * * 6 /usr/bin/rule-refresh
+          # 每 5 分钟巡检上游(wwan)，连续 2 次拿不到地址才重连（避免抖动）
+          */5 * * * * /usr/bin/wan-watchdog --quick
+          EOF
+
+          # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
+          cat > files/etc/rc.local << 'EOF'
+          #!/bin/sh
+          # conntrack 上限：128MB 机器上 32K 是性价比最高的档位（默认 16K，P2P 会打满）
+          if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+              echo 32768 > /proc/sys/net/netfilter/nf_conntrack_max
+              echo 3600  > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established
+          fi
+
+          # CPU 调频：MT7621 有 cpufreq 就锁 performance，软路由不需要省电
+          for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+              [ -e "$g" ] && echo performance > "$g"
+          done
+
+          # ---- 自愈看门狗（后台，20 秒后检查一次）----
+          # 1) LAN 段不完整 → 自动补齐并重载网络（这是"全家断网"的兜底）
+          # 2) dnsmasq 没跑 → 回滚 MosDNS 接管
+          (
+              sleep 20
+              _dirty=0
+              if ! uci -q get network.lan.proto >/dev/null 2>&1; then
+                  logger -t netguard "LAN 段缺少 proto，自动修复"
+                  uci set network.lan='interface'
+                  [ -n "$(uci -q get network.lan.device)" ] || uci set network.lan.device='br-lan'
+                  uci set network.lan.proto='static'
+                  uci set network.lan.ipaddr='192.168.2.1'
+                  uci set network.lan.netmask='255.255.255.0'
+                  _dirty=1
+              fi
+              if ! uci -q get network.lan.device >/dev/null 2>&1; then
+                  uci set network.lan.device='br-lan'
+                  _dirty=1
+              fi
+              if [ "$_dirty" = "1" ]; then
+                  uci commit network
+                  logger -t netguard "网络配置已修复，重载中"
+                  /etc/init.d/network reload
+                  sleep 5
+              fi
+
+              if ! pidof dnsmasq >/dev/null 2>&1; then
+                  logger -t netguard "dnsmasq 未运行，回滚 MosDNS 接管"
+                  uci -q set mosdns.@mosdns[0].enabled='0'
+                  uci -q set mosdns.@mosdns[0].redirect='0'
+                  uci -q commit mosdns
+                  /etc/init.d/mosdns stop 2>/dev/null
+                  /etc/init.d/dnsmasq restart
+              fi
+          ) &
+
+          # ---- 上游看门狗：无线中继开机常"关联上了但没拿到租约"，自动重连避免手动重启 ----
+          ( /usr/bin/wan-watchdog >/dev/null 2>&1 & )
+
+          exit 0
+          EOF
+
+          # ---------- H. 规则自更新（每周六 04:30，见 crontabs）----------
+          # 只刷文本规则 gfwlist/chnlist（合计约 1.4MB）：
+          #   geoip.dat / geosite.dat 是 ROM 里的 6MB 二进制库，在 32MB 闪存上原地覆盖
+          #   会把 overlay 撑爆，所以那两份只随"每周重编固件"更新。
+          # 下载 → 校验 → 备份 → 替换 → 重启 PassWall → 确认 xray 还活着，否则回滚。
+          cat > files/usr/bin/rule-refresh << 'EOF'
+          #!/bin/sh
+          LOG=/var/log/rule-refresh.log
+          RULES=/usr/share/passwall/rules
+          TMP=/tmp/rules.$$
+          log() { echo "$(date '+%F %T') $*" >> "$LOG"; logger -t rule-refresh "$*"; }
+
+          [ -d "$RULES" ] || { log "跳过：$RULES 不存在（未装 PassWall）"; exit 0; }
+          mkdir -p "$TMP" || exit 1
+
+          # 空间预检：两份规则约 1.4MB，留 3MB 余量，不够就安静跳过
+          FREE=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print int($4/1024)}')
+          if [ -n "$FREE" ] && [ "$FREE" -lt 3 ]; then
+              log "跳过：overlay 仅剩 ${FREE}MB"
+              rm -rf "$TMP"; exit 0
+          fi
+
+          fetch() {
+              _url="$1"; _out="$2"
+              curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -m 300 \
+                   "$_url" -o "$TMP/$_out" || { log "失败：$_out 下载出错"; return 1; }
+              _n=$(wc -l < "$TMP/$_out" | tr -d ' ')
+              [ "$_n" -ge 1000 ] || { log "失败：$_out 行数异常($_n)"; return 1; }
+              if grep -qE '^(domain|full|regexp|keyword|include):' "$TMP/$_out"; then
+                  log "失败：$_out 是 v2ray 格式，不能直接当 gfwlist"; return 1
+              fi
+              log "完成：$_out 下载($_n 行)"
+          }
+
+          fetch "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" gfwlist \
+              || { rm -rf "$TMP"; exit 0; }
+          fetch "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" chnlist \
+              || { rm -rf "$TMP"; exit 0; }
+
+          cp -f "$RULES/gfwlist" "$TMP/gfwlist.bak" 2>/dev/null
+          cp -f "$RULES/chnlist" "$TMP/chnlist.bak" 2>/dev/null
+          mv -f "$TMP/gfwlist" "$RULES/gfwlist"
+          mv -f "$TMP/chnlist" "$RULES/chnlist"
+
+          if [ -x /etc/init.d/passwall ]; then
+              /etc/init.d/passwall restart >/dev/null 2>&1
+              sleep 20
+              if ! pidof xray >/dev/null 2>&1; then
+                  log "回滚：重启后 xray 未运行"
+                  [ -f "$TMP/gfwlist.bak" ] && cp -f "$TMP/gfwlist.bak" "$RULES/gfwlist"
+                  [ -f "$TMP/chnlist.bak" ] && cp -f "$TMP/chnlist.bak" "$RULES/chnlist"
+                  /etc/init.d/passwall restart >/dev/null 2>&1
+              else
+                  log "生效：规则已替换，xray 运行中"
+              fi
+          fi
+
+          rm -rf "$TMP"
+          exit 0
+          EOF
+
+          # ---------- H2. 上游(wwan)看门狗 ----------
+          # 真实故障复现：无线中继(STA)重启后 phy1-sta0 关联成功，但 wwan 的 DHCP
+          # 请求发生在 STA 就绪之前，拿不到租约 → 没有默认路由 → 全家断网，
+          # 必须再重启一次才好。此脚本把"再重启一次"自动化掉。
+          #   开机模式：每 30 秒查一次，最多 4 分钟，期间交替重连；最后兜底 wifi reload
+          #   巡检模式(--quick)：cron 每 5 分钟跑，连续 2 次没地址才动作，防抖动
+          cat > files/usr/bin/wan-watchdog << 'EOF'
+          #!/bin/sh
+          # 上游(wwan)看门狗：无 IPv4/无网关时自动重连，避免"重启一下就有网"
+          IFACE=wwan
+          STATE=/tmp/wan-watchdog.miss
+          RELOADED=/tmp/wan-watchdog.reloaded
+          LOCK=/var/run/wan-watchdog.lock
+          log() { logger -t wan-watchdog "$*"; }
+
+          uci -q get network.$IFACE >/dev/null 2>&1 || exit 0
+
+          # 原子锁：开机模式与 cron 巡检不互相踩踏
+          mkdir "$LOCK" 2>/dev/null || exit 0
+          trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+          has_ip() {
+              _s=$(ubus call network.interface.$IFACE status 2>/dev/null)
+              echo "$_s" | grep -q '"address"' || return 1
+              echo "$_s" | grep -q '"nexthop"' || return 1
+              return 0
+          }
+
+          reconnect() {
+              log "重连 $IFACE"
+              ubus call network.interface.$IFACE down 2>/dev/null
+              sleep 3
+              ubus call network.interface.$IFACE up 2>/dev/null
+          }
+
+          if [ "$1" = "--quick" ]; then
+              if has_ip; then rm -f "$STATE" "$RELOADED"; exit 0; fi
+              N=$(cat "$STATE" 2>/dev/null || echo 0)
+              N=$((N + 1))
+              echo "$N" > "$STATE"
+              log "巡检：$IFACE 无有效地址（第 $N 次）"
+              # 连续 20 分钟仍然不通 → 说明不是租约问题而是关联丢了，reload 一次无线
+              # 每个开机周期只 reload 一次，避免上游真断线时反复踢掉自己的 WiFi 客户端
+              if [ "$N" -ge 4 ] && [ ! -f "$RELOADED" ]; then
+                  log "多次重连无效，执行 wifi reload（本次开机仅此一次）"
+                  wifi reload >/dev/null 2>&1
+                  touch "$RELOADED"
+              elif [ "$N" -ge 2 ]; then
+                  reconnect
+              fi
+              exit 0
+          fi
+
+          # ---- 开机模式 ----
+          i=0
+          while [ "$i" -lt 8 ]; do
+              has_ip && { log "开机检查：$IFACE 已就绪"; exit 0; }
+              sleep 30
+              i=$((i + 1))
+              [ $((i % 2)) -eq 0 ] && reconnect
+          done
+
+          log "开机 4 分钟仍未拨通，尝试 wifi reload"
+          wifi reload >/dev/null 2>&1
+          sleep 30
+          if has_ip; then
+              log "wifi reload 后恢复"
+          else
+              log "仍未恢复：请检查上游信号强度/密码/邻居路由是否在运行"
+          fi
+          exit 0
+          EOF
+
+          # ---------- I. 固件自检脚本（刷机后 SSH 执行 fw-selftest）----------
+          mkdir -p files/usr/bin
+          cat > files/usr/bin/fw-selftest << 'EOF'
+          #!/bin/sh
+          # 固件自检：一条命令看全系统状态
+          P=0; F=0
+          ok() { printf '  \033[32m✅\033[0m %s\n' "$1"; P=$((P + 1)); }
+          ng() { printf '  \033[31m❌\033[0m %s\n' "$1"; F=$((F + 1)); }
+          t()  { d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else ng "$d"; fi; }
+
+          echo "===== Newifi-D2 固件自检 ====="
+          t "xray 可执行"        xray -version
+          t "mosdns 可执行"      mosdns -v
+          t "mosdns 运行中"      pidof mosdns
+          t "dnsmasq 运行中"     pidof dnsmasq
+          t "DNS 解析正常"       nslookup www.baidu.com 127.0.0.1
+          t "NAT 转发开启"       test -e /proc/sys/net/ipv4/ip_forward
+
+          [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ok "ip_forward=1" || ng "ip_forward≠1"
+          [ "$(uci -q get mosdns.@mosdns[0].adblock)" = "1" ] && ok "广告拦截已开" || ng "广告拦截未开"
+          [ "$(uci -q get passwall.@global[0].enabled)" = "1" ] && ok "PassWall 已启用" || ng "PassWall 未启用"
+          [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ] && ok "BBR 生效" || ng "BBR 未生效"
+          [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
+          [ -d /mnt/sda1 ] && ok "U 盘已挂载 /mnt/sda1" || ng "未检测到 U 盘（未插可忽略）"
+
+          echo
+          printf '通过 %d 项，失败 %d 项\n' "$P" "$F"
+          if [ "$F" -eq 0 ]; then echo "🎉 一切正常"; else echo "⚠️  有失败项，按上面 ❌ 对应功能排查"; fi
+          exit 0
+          EOF
+
+          # ---------- I. 内置使用说明页（http://192.168.2.1/guide.html）----------
+          mkdir -p files/www
+          cat > files/www/guide.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="zh-CN">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Newifi-D2 使用说明</title>
+          <style>
+          body{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.75;color:#222}
+          h1{font-size:1.4em;border-bottom:2px solid #4a90d9;padding-bottom:6px}
+          h2{font-size:1.05em;margin-top:26px;color:#1a5fb4}
+          code{background:#f2f4f7;padding:1px 5px;border-radius:3px;font-size:.92em}
+          table{border-collapse:collapse;width:100%}
+          td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:.95em}
+          .warn{background:#fff6e5;border-left:4px solid #f0a020;padding:8px 12px;margin:12px 0}
+          </style>
+          </head>
+          <body>
+          <h1>Newifi-D2 使用说明</h1>
+          <p>固件已预配置完毕，刷入后基本不需要再设置。</p>
+
+          <h2>1. 登录</h2>
+          <p>浏览器打开 <code>http://192.168.2.1</code>，首次登录会要求设置 root 密码。</p>
+
+          <h2>2. 无线</h2>
+          <table><tr><th>频段</th><th>名称</th><th>密码</th></tr>
+          <tr><td>2.4G</td><td>alon</td><td>alon12345678</td></tr>
+          <tr><td>5G</td><td>alon-5G</td><td>alon12345678</td></tr></table>
+          <div class="warn">建议改掉默认密码：网络 → 无线 → 修改。</div>
+
+          <h2>3. 科学上网（PassWall）</h2>
+          <p>固件<b>不含节点</b>：服务 → PassWall → 节点列表 → 导入订阅链接 → 保存并应用。</p>
+          <p>模式已设为 gfwlist：名单内走代理，其余直连。</p>
+
+          <h2>4. DNS 与去广告</h2>
+          <p>MosDNS 已接管 DNS（5335），广告拦截已开启，规则来自固件自带 geosite，不联网更新。</p>
+          <p>网站/App 突然打不开，多半是规则误杀：服务 → MosDNS → 关闭广告拦截。</p>
+
+          <h2>5. 文件共享 / 打印</h2>
+          <table>
+          <tr><td>共享</td><td>插上 U 盘后访问 <code>\\192.168.2.1\usb</code>（/mnt/sda1，匿名可写）</td></tr>
+          <tr><td>打印</td><td>USB 打印机接上，客户端添加网络打印机 <code>192.168.2.1:9100</code></td></tr>
+          </table>
+
+          <h2>6. 随身 WiFi / 4G 网卡</h2>
+          <p>直接插上即可，自动作为备份线路（主线路优先）。</p>
+
+          <h2>7. 出问题三招</h2>
+          <table><tr><th>现象</th><th>处理</th></tr>
+          <tr><td>能 ping 通 IP、网页打不开</td><td>SSH 执行 <code>dns-recover</code></td></tr>
+          <tr><td>某个 App 突然不通</td><td>关掉 MosDNS 广告拦截</td></tr>
+          <tr><td>科学上网时快时慢</td><td>TurboACC 关掉硬件分载</td></tr>
+          <tr><td>重启后能连 WiFi、但上不了网</td><td>等 2 分钟（<code>wan-watchdog</code> 会自动重连）；仍不行就 SSH 执行 <code>wan-watchdog</code></td></tr></table>
+          <p>看整体状态：SSH 执行 <code>fw-selftest</code>。</p>
+
+          <h2>7.1 关于"重启后上不了网"</h2>
+          <p>无线中继（连别人家 WiFi 当上游）时，开机偶尔会出现"WiFi 关联成功但没拿到 IP"，
+             表现就是能连上路由器却上不了网。<b>现在系统会自己修</b>：
+             开机后每 30 秒检查一次上游，最多查 4 分钟，中间自动重连；之后每 5 分钟还会巡检一次。
+             日志：<code>logread | grep wan-watchdog</code>。</p>
+
+          <h2>8. 更新固件</h2>
+          <p>固件本体不自动升级：要新版本请重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
+          <p>但 <b>PassWall 规则会自己更新</b>：每周六 04:30 跑一次 <code>rule-refresh</code>
+             （gfwlist / chnlist，约 1.4MB）。想看日志：<code>cat /var/log/rule-refresh.log</code>；
+             想立即刷一次：<code>rule-refresh</code>。失败会自动回滚，不会断网。</p>
+          </body>
+          </html>
+          EOF
+
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh \
+                   files/usr/bin/wan-watchdog \
+                   files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
+          echo "🔧 files/ 预置完成："
+          find files -type f | sort
+
+          # 打包覆盖层快照：第 12 步"缺失补齐"时可一键还原，不用重跑整个 step
+          tar -C . -czf /workdir/files-overlay.tgz files
+          echo "覆盖层快照: $(du -h /workdir/files-overlay.tgz | cut -f1)"
+
+      # ---------------------------------------------------------------
+      - name: 6. 缓存 ccache 与 dl
+        if: inputs.clean_build != true
+        uses: actions/cache@v4
+        with:
+          path: |
+            /workdir/immortalwrt/.ccache
+            /workdir/immortalwrt/dl
+          key: ${{ runner.os }}-d2-v17-${{ hashFiles('newifi-d2.config', '.github/workflows/build-immortalwrt.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-d2-v17-
+
+      # ---------------------------------------------------------------
+      - name: 7. 应用 .config 并做依赖硬校验
+        run: |
+          cd immortalwrt
+
+          # ---------- Go 工具链版本 ----------
+          # feeds 的 GO_DEFAULT_VERSION 决定 xray-core / mosdns 用哪个 Go 编译。
+          # openwrt-25.12 默认 1.26，正好满足 xray 26.3.27 的 go>=1.26。
+          # 若日志出现 "go.mod requires go >= 1.XX"，把 go_version 输入改成 1.XX 重跑。
+          GO_VER="${{ inputs.go_version }}"
+          if [ -n "$GO_VER" ] && [ "$GO_VER" != "auto" ]; then
+            sed -i "s/^GO_DEFAULT_VERSION:=.*/GO_DEFAULT_VERSION:=$GO_VER/" \
+              feeds/packages/lang/golang/golang-values.mk
+            echo "🔧 已强制 Go 版本为 $GO_VER"
+          fi
+          echo "---- 当前 Go 工具链 ----"
+          grep -n '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk
+          ls -d feeds/packages/lang/golang/golang[0-9]* 2>/dev/null | sed 's/^/  可用版本: /'
+          echo "xray-core 版本: $(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)"
+          echo "passwall 版本 : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)"
+          echo "mosdns 版本   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
+
+          # ---------- Go 模块缓存移出 dl（关键）----------
+          # dl/ 会被 actions/cache 缓存。之前构建中断时把"残缺的模块目录"也存进了缓存，
+          # 下次恢复后 Go 把残缺副本当完整用，于是出现一堆
+          #   "no required module provides package X/internal/y"
+          #   "build constraints exclude all Go files"
+          # 把 GOMODCACHE 指到不进缓存的目录，从根上消除这个隐患（代价：每次多下 1~2 分钟）
+          sed -i 's#^GO_MOD_CACHE_DIR:=.*#GO_MOD_CACHE_DIR:=/workdir/gomod#' \
+            feeds/packages/lang/golang/golang-values.mk
+          mkdir -p /workdir/gomod
+          grep -n '^GO_MOD_CACHE_DIR' feeds/packages/lang/golang/golang-values.mk
+          # 清掉旧缓存里可能残缺的那份
+          rm -rf dl/go-mod-cache
+
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+
+          # ---------- 可选：关闭 TurboACC ----------
+          # 它是第三方 v1.4；万一与 25.12 的 LuCI 不兼容导致编译失败，
+          # 用 with_turboacc=false 重跑即可，加速能力不受影响
+          #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
+          EFF_TURBO="true"
+          # 定时触发（schedule）时 inputs.* 全是空串，这里统一回落到默认值 true，
+          # 否则每周自动构建会误把 TurboACC 当成"用户要求关闭"而悄悄漏掉。
+          TURBO="${{ inputs.with_turboacc }}"
+          [ -z "$TURBO" ] && TURBO="true"
+          if [ "$TURBO" != "true" ]; then
+            sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
+            EFF_TURBO="false"
+            echo "⏭  已按输入关闭 TurboACC"
+          fi
+          # 记录"实际生效状态"：第 11 步可能自动降级把它关掉，第 12 步审计要读这个文件
+          echo "$EFF_TURBO" > /workdir/state-turboacc
+
+          make defconfig 2>&1 | tee defconfig.log
+
+          if grep -q 'recursive dependency detected' defconfig.log; then
+            echo "::error::Kconfig 检测到递归依赖（未知新增的冲突包），可能已丢包"
+            grep -A4 'recursive dependency' defconfig.log | head -n 20
+            exit 1
+          fi
+
+          if grep -qi 'warning' defconfig.log; then
+            echo "::warning::defconfig 存在告警，以下符号可能被丢弃："
+            grep -i 'warning' defconfig.log | head -n 50
+          fi
+
+          echo "======== 关键组件校验 ========"
+          MISSING=0
+          check() {
+            if grep -qx "$1=y" .config; then
+              printf '  ✅ %s\n' "$1"
+            else
+              printf '::error::未生效：%s（包不存在或依赖不满足）\n' "$1"
+              MISSING=1
+            fi
+          }
+          check CONFIG_PACKAGE_dnsmasq-full
+          check CONFIG_PACKAGE_luci-app-passwall
+          check CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray
+          check CONFIG_PACKAGE_xray-core
+          check CONFIG_PACKAGE_luci-app-mosdns
+          check CONFIG_PACKAGE_mosdns
+          check CONFIG_PACKAGE_v2ray-geoip
+          check CONFIG_PACKAGE_v2ray-geosite
+          if [ "$TURBO" = "true" ]; then
+            check CONFIG_PACKAGE_luci-app-turboacc
+          else
+            echo "  ⏭  TurboACC 按要求跳过（不影响 offload / BBR）"
+          fi
+          check CONFIG_PACKAGE_zram-swap
+          check CONFIG_PACKAGE_luci-app-ksmbd
+          check CONFIG_PACKAGE_ksmbd-server
+          check CONFIG_PACKAGE_kmod-fs-ksmbd
+          check CONFIG_PACKAGE_luci-app-p910nd
+          check CONFIG_PACKAGE_p910nd
+          check CONFIG_PACKAGE_kmod-usb-net-rndis
+          check CONFIG_PACKAGE_kmod-usb-net-cdc-ncm
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
+            echo "---- feeds 里这些包是否存在（1=有，0=没有）----"
+            for p in luci-app-passwall xray-core chinadns-ng dns2socks ipt2socks \
+                     microsocks tcping lyaml luci-app-turboacc luci-app-mosdns \
+                     v2ray-geoip v2ray-geosite; do
+              printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
+            done
+            echo "排查建议："
+            echo "  1) 缺哪个包，就把对应源码加进第 4 步（或改成 feeds 里已有的等价包）"
+            echo "  2) 看本步骤上方 make defconfig 的告警，通常会点出缺失的依赖"
+            echo "  3) 若是编译期报 'go.mod requires go >= 1.XX'，把 go_version 输入改成 1.XX 重跑"
+            exit 1
+          fi
+          echo "🎉 全部组件校验通过"
+
+          {
+            echo "### 📦 参与构建的关键包"
+            echo ""
+            echo '```'
+            grep -E '^CONFIG_PACKAGE_(luci-app-passwall|xray-core|luci-app-mosdns|mosdns|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full|luci-app-ksmbd|zram-swap)=' .config | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      - name: 8. LAN 网段改为 192.168.2.1
+        run: |
+          cd immortalwrt
+          GEN="package/base-files/files/bin/config_generate"
+          if [ -f "$GEN" ]; then
+            sed -i 's/192\.168\.1\.1/192.168.2.1/g' "$GEN"
+            grep -q '192.168.2.1' "$GEN" \
+              || { echo "::error::LAN IP 注入失败"; exit 1; }
+            echo "✅ config_generate 已改为 192.168.2.1"
+          else
+            echo "::warning::$GEN 不存在，跳过（首启仍由 uci-defaults/90-luci 设置）"
+          fi
+
+      # ---------------------------------------------------------------
+      - name: 9. 预置 PassWall 分流规则（带格式校验，失败则保留包内自带）
+        run: |
+          cd immortalwrt
+          RULES="files/usr/share/passwall/rules"
+          mkdir -p "$RULES"
+
+          fetch_rule() {
+            _url="$1"; _out="$2"
+            curl -fsSL --retry 3 --retry-delay 2 "$_url" -o "$_out.tmp" || {
+              echo "⚠️ 下载失败，跳过：$_out"; rm -f "$_out.tmp"; return 0; }
+            _lines=$(wc -l < "$_out.tmp" | tr -d ' ')
+            if [ "$_lines" -lt 1000 ] \
+               || grep -qE '^(domain|full|regexp|keyword|include):' "$_out.tmp"; then
+              echo "⚠️ 格式不符（行数 $_lines 或带 v2ray 前缀），保留包内自带：$_out"
+              rm -f "$_out.tmp"
+            else
+              mv "$_out.tmp" "$_out"
+              echo "✅ $_out（$_lines 行）"
+            fi
+          }
+
+          fetch_rule "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" \
+                     "$RULES/gfwlist"
+          fetch_rule "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" \
+                     "$RULES/chnlist"
+
+          echo "ℹ️  GeoIP/GeoSite 不在此处下载：v2ray-geoip / v2ray-geosite 会在编译期"
+          echo "    自动拉取 geoip-only-cn-private.dat(≈90KB) 与 geosite.dat(≈1.2MB) 并校验 sha256。"
+
+      # ---------------------------------------------------------------
+      - name: 10. 下载源码包（失败重试；无进展立即中断并诊断）
+        run: |
+          cd immortalwrt
+          # 只下载 .config 已选中的包所需源码：make download 按依赖图遍历，未选中的包不会下载
+          export GIT_HTTP_LOW_SPEED_LIMIT=1000
+          export GIT_HTTP_LOW_SPEED_TIME=60
+
+          diag_download() {
+            echo "::group::📋 下载失败诊断"
+            echo "--- 残缺/异常文件（<1KB）---"
+            find dl -type f -size -1024c -exec ls -l {} \; 2>/dev/null || echo "  （无）"
+            echo "--- 日志里的失败线索 ---"
+            grep -hE "Download failed|Hash mismatch|404 Not Found|404:|ERROR|Connection (timed out|refused|reset)|Temporary failure|Could not resolve|unable to|No space left" /tmp/dl-*.log 2>/dev/null | sort -u | head -n 25 || echo "  （未匹配到关键字）"
+            echo "--- 涉及的源码包 ---"
+            grep -hoE "dl/[A-Za-z0-9._+@-]+\.(tar\.gz|tar\.xz|tar\.bz2|zip|tgz|git)" /tmp/dl-*.log 2>/dev/null | sort -u | tail -n 30 || true
+            echo "--- 磁盘 ---"
+            df -h . | tail -n1
+            echo "::endgroup::"
+            echo "处理建议：① 直接重跑（dl 缓存复用，只补缺的）"
+            echo "          ② 勾选 clean_build 清空 dl 重下"
+            echo "          ③ 日志为 404/哈希不符 → 该包源地址或版本在 feeds 里已失效，需要改版本"
+            echo "          ④ 大量 403/404 且集中在 GitHub → 限流，隔几分钟重跑"
+          }
+
+          DL_OK=0
+          PREV_FILES=-1
+          PREV_BAD=-1
+          for i in 1 2 3 4 5; do
+            JOBS=8
+            if [ "$i" -gt 1 ]; then JOBS=4; fi
+            echo "================ 下载第 $i 轮（-j${JOBS}）================"
+
+            RC=0
+            make download -j"$JOBS" V=s 2>&1 | tee "/tmp/dl-$i.log" || RC=$?
+
+            FILES=$(find dl -type f 2>/dev/null | wc -l)
+            BAD=$(find dl -type f -size -1024c 2>/dev/null | wc -l)
+
+            if [ "$RC" -eq 0 ] && [ "$BAD" -eq 0 ]; then
+              echo "✅ 下载完整：${FILES} 个文件，共 $(du -sh dl | cut -f1)"
+              DL_OK=1
+              break
+            fi
+
+            echo "⚠️  第 $i 轮结果：退出码=${RC}，残缺=${BAD}，总文件=${FILES}"
+
+            if [ "$i" -gt 1 ] && [ "$FILES" -le "$PREV_FILES" ] && [ "$BAD" -ge "$PREV_BAD" ]; then
+              echo "::error::下载连续两轮零进展（文件数 ${PREV_FILES}→${FILES}，残缺 ${PREV_BAD}→${BAD}），提前中断，不再空跑"
+              diag_download
+              exit 1
+            fi
+            PREV_FILES=$FILES
+            PREV_BAD=$BAD
+
+            find dl -type f -size -1024c -print -delete 2>/dev/null || true
+            if [ "$i" -lt 5 ]; then sleep 10; fi
+          done
+
+          if [ "$DL_OK" -ne 1 ]; then
+            echo "::error::5 轮下载仍未完成，已中断构建（不进入编译，避免浪费 2 小时）"
+            diag_download
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      - name: 11. 编译固件
+        id: build
+        run: |
+          cd immortalwrt
+          export CCACHE_DIR="$CCACHE_DIR"
+          export CCACHE_MAXSIZE="$CCACHE_MAXSIZE"
+          set -o pipefail
+
+          : > build.log
+          {
+            echo "==== 构建环境 ===="
+            echo "Go: $(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)"
+            echo "xray-core: $(sed -n 's/^PKG_VERSION:=//p' package/xray-core/Makefile)"
+            echo "passwall : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)"
+            echo "mosdns   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
+            echo "===================="
+          } >> build.log
+
+          # ---- 阶段 0：先装 host 工具与交叉工具链（必须！）----
+          # 关键教训：`make package/xxx/compile` 这类单包目标【不会】自动构建 tools/ 和
+          # toolchain/。在干净工作区里直接跑，会因 staging_dir/host/bin/sed 不存在而报
+          #   bash: .../staging_dir/host/bin/sed: No such file or directory
+          #   ERROR: package/utils/lua [host] failed to build.
+          # 于是把本该在整机编译里做的事，提前到这里做完。
+          echo "🏗  阶段0：构建 host 工具 + 交叉工具链（约 20~30 分钟）..."
+          if ! make -j"$(nproc)" prereq tools/install toolchain/install 2>&1 | tee -a build.log; then
+            echo "::error::host 工具 / 工具链构建失败"
+            echo "::group::📋 失败详情"
+            tail -n 80 build.log
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "✅ host 工具与工具链就绪（$(ls staging_dir/host/bin/sed 2>/dev/null || echo '无 sed')）"
+
+          # ---- 阶段 1：单独预编 3 个 Go 组件（-j1 V=s）----
+          # 1) 失败能在几十分钟内暴露真实错误（整机 -j 编译时错误会被 make 吞掉）
+          # 2) 顺序执行，消除"Go 工具链还没就绪就开始编"的竞态
+          GOVER=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
+          echo "🔧 预编译 Go 组件（Go ${GOVER} + mosdns + xray）..."
+
+          try_build() {
+            make -j1 V=s "$1" 2>&1 | tee -a build.log
+          }
+
+          # Go 构建统一入口：遇到"模块缓存残缺"类错误，自动清空 GOMODCACHE 重试一次
+          # 典型报错：build constraints exclude all Go files / no required module provides package
+          go_build() {
+            _t="$1"; _n="$2"
+            try_build "$_t" && return 0
+            if grep -qE "build constraints exclude all Go files|no required module provides package" build.log; then
+              echo "::warning::${_n} 报 Go 模块缓存残缺，清空 /workdir/gomod 后重试一次"
+              rm -rf /workdir/gomod
+              mkdir -p /workdir/gomod
+              make "${_t%/compile}/clean" >/dev/null 2>&1 || true
+              try_build "$_t" && return 0
+            fi
+            return 1
+          }
+
+          die_with_log() {
+            echo "::error::$1 预编译失败（真实错误见下）"
+            echo "::group::📋 失败详情"
+            tail -n 80 build.log
+            echo "::endgroup::"
+            exit 1
+          }
+
+          # ① host Go 工具链
+          GT="package/feeds/packages/golang${GOVER}/host/compile"
+          if [ -d "$(dirname "${GT%/compile}")" ]; then
+            echo "================ 预编 $GT ================"
+            try_build "$GT" || die_with_log "Go ${GOVER} 工具链"
+          else
+            echo "::warning::找不到 golang${GOVER} 目录，跳过工具链预编"
+          fi
+
+          # ② mosdns
+          # 注意：mosdns 自己 pin 了 Go 版本（日志里是 go-1.24.13），
+          # 所以只有在【日志明确报 'requires go >='】时才回退重试，否则会掩盖真实错误。
+          echo "================ 预编 mosdns ================"
+          if ! go_build "package/luci-app-mosdns/mosdns/compile" "mosdns"; then
+            if grep -q "requires go >=" build.log && [ -d feeds/packages/lang/golang/golang1.26 ]; then
+              echo "::warning::mosdns 报 Go 版本不足，改用 Go 1.26 重试"
+              sed -i -E 's#^PKG_BUILD_DEPENDS:=.*#PKG_BUILD_DEPENDS:=golang1.26/host#' \
+                package/luci-app-mosdns/mosdns/Makefile
+              make package/luci-app-mosdns/mosdns/clean >/dev/null 2>&1 || true
+              try_build "package/luci-app-mosdns/mosdns/compile" \
+                || die_with_log "mosdns（Go 1.26 退回后仍失败）"
+              echo "  ✅ mosdns 已用 Go 1.26 编过"
+            else
+              die_with_log "mosdns"
+            fi
+          fi
+
+          # ③ xray（必须 ≥26.7.11，只能跟随主 Go 版本）
+          echo "================ 预编 xray-core ================"
+          go_build "package/xray-core/compile" "xray-core" || die_with_log "xray-core"
+
+          echo "✅ Go 组件预编译全部通过"
+
+          build_once() {
+            RC=0
+            make -j"$(nproc)" 2>&1 | tee -a build.log || RC=$?
+            return "$RC"
+          }
+
+          echo "🚀 第 1 次编译 (-j$(nproc))"
+          if build_once; then
+            echo "✅ 编译完成"
+            ccache -s || true
+            exit 0
+          fi
+
+          # ================= 自动降级重试（最多 2 次）=================
+          for attempt in 1 2; do
+            echo "::warning::编译失败，进入第 ${attempt} 次自动修复"
+            FIXED=0
+
+            if grep -qE "requires go >= *[0-9]" build.log; then
+              NEED=$(grep -oE "requires go >= *[0-9]+\.[0-9]+" build.log | head -n1 | grep -oE "[0-9]+\.[0-9]+")
+              CUR=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
+              if [ -n "$NEED" ] && [ "$NEED" != "$CUR" ]; then
+                echo "  · Go 版本不足：当前 ${CUR} → 需要 ${NEED}，自动切换"
+                sed -i "s/^GO_DEFAULT_VERSION:=.*/GO_DEFAULT_VERSION:=$NEED/" \
+                  feeds/packages/lang/golang/golang-values.mk
+                rm -rf staging_dir/hostpkg/lib/go-* staging_dir/hostpkg/bin/go*
+                make defconfig >/dev/null 2>&1 || true
+                FIXED=1
+              fi
+            fi
+
+            if [ "$FIXED" -eq 0 ] && grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
+              if grep -q "^CONFIG_PACKAGE_luci-app-turboacc=y" .config; then
+                echo "  · TurboACC 编译失败，自动移出本次构建（加速由 firewall4 分载 + BBR 承担）"
+                sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
+                echo "false" > /workdir/state-turboacc
+                make defconfig >/dev/null 2>&1 || true
+                FIXED=1
+              fi
+            fi
+
+            # 阶段 3：Go 主版本已对上但仍报 requires go（说明要的是补丁版本，
+            # 例如 1.27.3 而 feeds 只提供 1.27.1）→ 允许 Go 在构建时自动取工具链
+            if [ "$FIXED" -eq 0 ] && grep -q "requires go >=" build.log; then
+              if grep -q "GOTOOLCHAIN=local" feeds/packages/lang/golang/golang-package.mk; then
+                echo "  · 需要更高的 Go 补丁版本，切换为 GOTOOLCHAIN=auto（构建时自动下载对应工具链）"
+                sed -i 's/GOTOOLCHAIN=local/GOTOOLCHAIN=auto/' \
+                  feeds/packages/lang/golang/golang-package.mk
+                FIXED=1
+              fi
+            fi
+
+            if [ "$FIXED" -eq 0 ]; then
+              break
+            fi
+
+            echo "🔁 修复完成，重新编译 ..."
+            if build_once; then
+              echo "✅ 降级重试后编译完成（日志见 build.log）"
+              ccache -s || true
+              exit 0
+            fi
+          done
+
+          # ================= 仍失败：明确报错 =================
+          echo "---- 失败包清单 ----"
+          grep -oE "package/[A-Za-z0-9_./-]+ failed to build" build.log | sed 's/ failed to build//' | sort -u || true
+          echo "::group::📋 编译失败诊断（最后 40 行）"
+          tail -n 40 build.log || true
+          echo "::endgroup::"
+          if grep -q "requires go >=" build.log; then
+            echo "::error::编译失败：Go 版本仍不满足（自动切换已尝试），请手动把 go_version 设为日志要求的版本"
+          elif grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
+            echo "::error::编译失败：TurboACC 编译错误（自动移除已尝试），请用 with_turboacc=false 重跑"
+          elif grep -q "No space left on device" build.log; then
+            echo "::error::编译失败：磁盘不足，重跑（缓存复用）或改用 larger runner"
+          else
+            echo "::error::编译失败且无法自动修复，详见上方日志末 40 行"
+          fi
+          exit 1
+
+      # ---------------------------------------------------------------
+      - name: 12. 固件内容审计（缺失自动补齐，最多 3 轮）
+        id: audit
+        if: steps.build.outcome == 'success'
+        run: |
+          cd immortalwrt
+
+          # ================= 审计脚本（可重复调用）=================
+          # 退出码：0=通过  1=有缺失（可补齐）  2=致命（无产物）
+          cat > /workdir/fw-audit.sh << 'EOS'
+          #!/bin/sh
+          MISS_PKG=/workdir/missing-pkgs.txt
+          MISS_FILE=/workdir/missing-files.txt
+          : > "$MISS_PKG"
+          : > "$MISS_FILE"
+          LOST=0
+
+          cd bin/targets/ramips/mt7621 2>/dev/null || { echo "::error::产物目录不存在"; exit 2; }
+          MANIFEST=$(ls -1 *.manifest 2>/dev/null | head -n1)
+          [ -n "$MANIFEST" ] || { echo "::error::未找到 .manifest"; exit 2; }
+          echo "包清单: $MANIFEST（$(wc -l < "$MANIFEST") 个包）"
+
+          MUST="xray-core luci-app-passwall mosdns luci-app-mosdns v2ray-geoip v2ray-geosite dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
+          [ "$1" = "true" ] && MUST="$MUST luci-app-turboacc"
+
+          echo "---- 软件包 ----"
+          for p in $MUST; do
+            L=$(grep -m1 "^$p " "$MANIFEST")
+            if [ -n "$L" ]; then
+              printf '  ✅ %-22s %s\n' "$p" "$(echo "$L" | awk '{print $3}')"
+            else
+              printf '  ❌ %-22s 缺失\n' "$p"
+              echo "$p" >> "$MISS_PKG"
+              LOST=$((LOST + 1))
+            fi
+          done
+
+          ROOTFS=$(ls -d ../../../../build_dir/target-*/root-ramips 2>/dev/null | head -n1)
+          if [ -n "$ROOTFS" ]; then
+            echo "---- 关键文件 ----"
+            chk() {
+              _n="$1"; shift
+              for c in "$@"; do
+                if [ -e "$ROOTFS/$c" ]; then
+                  printf '  ✅ %-40s %s\n' "$c" "$(du -h "$ROOTFS/$c" 2>/dev/null | cut -f1)"
+                  return 0
+                fi
+              done
+              printf '  ❌ %-40s 缺失\n' "$_n"
+              echo "$_n" >> "$MISS_FILE"
+              LOST=$((LOST + 1))
+              return 0
+            }
+            chk xray        usr/bin/xray
+            chk mosdns      usr/bin/mosdns usr/sbin/mosdns
+            chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
+            chk ksmbd-init  etc/init.d/ksmbd
+            chk mosdns-init etc/init.d/mosdns
+            chk geoip       usr/share/v2ray/geoip.dat
+            chk geosite     usr/share/v2ray/geosite.dat
+            chk uci-90      etc/uci-defaults/90-luci
+            chk uci-91      etc/uci-defaults/91-wireless
+            chk uci-92      etc/uci-defaults/92-services
+            chk usbwan      etc/hotplug.d/net/20-usbwan
+            chk dns-recover usr/bin/dns-recover
+            chk fw-selftest usr/bin/fw-selftest
+            chk rule-refresh usr/bin/rule-refresh
+          chk wan-watchdog usr/bin/wan-watchdog
+            chk guide       www/guide.html
+            chk cfg-ksmbd   etc/config/ksmbd
+            chk cfg-p910nd  etc/config/p910nd
+            chk sysctl      etc/sysctl.conf
+          else
+            echo "::warning::未找到 root-ramips，跳过文件级检查"
+          fi
+
+          # ---- 版本对齐复查：Xray 必须 ≥ PassWall 要求的 26.7.11 ----
+          XRAY_MV=$(grep -m1 '^xray-core ' "$MANIFEST" | awk '{print $3}' | cut -d- -f1)
+          if [ -n "$XRAY_MV" ]; then
+            _low=$(printf '%s\n%s\n' "26.7.11" "$XRAY_MV" | sort -V | head -n1)
+            if [ "$_low" != "26.7.11" ]; then
+              printf '  ❌ %-22s %s（低于 26.7.11，PassWall 无法启动）\n' "xray-core" "$XRAY_MV"
+              echo "xray-core" >> "$MISS_PKG"
+              LOST=$((LOST + 1))
+            else
+              printf '  ✅ %-22s %s（版本对齐）\n' "xray-core" "$XRAY_MV"
+            fi
+          fi
+
+          echo "缺失合计: $LOST（包 $(wc -l < "$MISS_PKG") / 文件 $(wc -l < "$MISS_FILE")）"
+          echo "$LOST" > /workdir/audit-count.txt
+          [ "$LOST" -eq 0 ] || exit 1
+          exit 0
+          EOS
+          chmod +x /workdir/fw-audit.sh
+
+          # ================= 审计 → 补齐 → 再审计（无进展立即中断）=================
+          diag_repair() {
+            echo "::group::📋 缺失原因诊断"
+            echo "--- 缺失包（config / feeds / ipk 三处状态）---"
+            if [ -s /workdir/missing-pkgs.txt ]; then
+              while read -r p; do
+                [ -n "$p" ] || continue
+                printf '  · %s\n' "$p"
+                if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+                  echo "      config: 已选中"
+                else
+                  echo "      config: 未被 defconfig 保留（依赖不满足，或包名不存在）"
+                fi
+                if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
+                  echo "      feeds : 存在"
+                else
+                  echo "      feeds : 不存在（包名拼错 / 未加入 feeds / 源码未克隆）"
+                fi
+                _ipk=$(find bin/packages -name "${p}_*.ipk" 2>/dev/null | head -n1)
+                if [ -n "$_ipk" ]; then
+                  echo "      ipk   : $_ipk"
+                else
+                  echo "      ipk   : 未生成（包没有编译成功）"
+                fi
+              done < /workdir/missing-pkgs.txt
+            else
+              echo "  （无）"
+            fi
+            echo "--- 缺失文件 ---"
+            if [ -s /workdir/missing-files.txt ]; then
+              sed 's/^/  · /' /workdir/missing-files.txt
+              echo "  → 说明 files/ 覆盖层没有生效，或对应包未安装"
+            else
+              echo "  （无）"
+            fi
+            echo "--- defconfig 告警（最后 15 条）---"
+            grep -i 'warning' defconfig.log 2>/dev/null | tail -n 15 || echo "  （无）"
+            echo "::endgroup::"
+            echo "处理建议：按上面三行状态定位——config 未选中＝依赖问题；feeds 不存在＝包名或源问题；ipk 未生成＝编译失败"
+          }
+
+          OK=0
+          PREV=999
+          # 读"实际生效"的 TurboACC 状态（第 11 步可能已自动降级关掉它）
+          EFF_TURBO=$(cat /workdir/state-turboacc 2>/dev/null || echo "true")
+          echo "TurboACC 实际生效状态: ${EFF_TURBO}"
+          for round in 1 2 3; do
+            echo "================ 审计第 $round 轮 ================"
+            RC=0
+            /workdir/fw-audit.sh "$EFF_TURBO" || RC=$?
+
+            if [ "$RC" -eq 0 ]; then
+              OK=1
+              break
+            fi
+
+            if [ "$RC" -eq 2 ]; then
+              echo "::error::产物缺失（没有 manifest 或输出目录），无法补齐，立即中断"
+              exit 1
+            fi
+
+            COUNT=$(cat /workdir/audit-count.txt 2>/dev/null || echo 999)
+
+            # 补齐后缺失数没有下降 → 补不动了，立即中断，不再空跑第 2/3 轮
+            if [ "$round" -gt 1 ] && [ "$COUNT" -ge "$PREV" ]; then
+              echo "::error::第 $round 轮缺失数未下降（${PREV} → ${COUNT}），继续补齐无效，立即中断"
+              diag_repair
+              exit 1
+            fi
+            PREV=$COUNT
+
+            if [ "$round" -eq 3 ]; then
+              echo "::error::已补齐 3 轮仍有 ${COUNT} 项缺失，中断构建"
+              diag_repair
+              exit 1
+            fi
+
+            echo "⚙️  发现缺失（${COUNT} 项），执行第 $round 轮补齐"
+
+            # (a) 重新部署 files/ 覆盖层（用第 5 步的快照还原）
+            if [ -f /workdir/files-overlay.tgz ]; then
+              rm -rf files
+              tar -C . -xzf /workdir/files-overlay.tgz
+              echo "  · files/ 覆盖层已重新部署"
+            fi
+
+            # (b) 缺失软件包写回 .config 并重建配置
+            if [ -s /workdir/missing-pkgs.txt ]; then
+              echo "  · 补装软件包: $(tr '\n' ' ' < /workdir/missing-pkgs.txt)"
+              while read -r p; do
+                [ -n "$p" ] || continue
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config || echo "CONFIG_PACKAGE_${p}=y" >> .config
+              done < /workdir/missing-pkgs.txt
+              make defconfig 2>&1 | tail -n 15
+            fi
+
+            # (c) 重建根文件系统与镜像（只重装+重打包，不重编已完成的包）
+            rm -rf build_dir/target-*/root-ramips build_dir/target-*/stamp
+            echo "  · 重建 rootfs + 镜像 ..."
+            RC2=0
+            make -j"$(nproc)" 2>&1 | tee -a build.log || RC2=$?
+            if [ "$RC2" -ne 0 ]; then
+              echo "::error::补齐重建失败（退出码 ${RC2}），最后 40 行："
+              tail -n 40 build.log || true
+              exit 1
+            fi
+          done
+
+          [ "$OK" -eq 1 ] || { echo "::error::审计未通过，拒绝输出固件"; exit 1; }
+
+          # ================= 体积 / 哈希 / 产物 =================
+          cd bin/targets/ramips/mt7621
+          ls -lh
+
+          FIRMWARE=$(ls -1 *sysupgrade.bin 2>/dev/null | head -n1)
+          [ -n "$FIRMWARE" ] || { echo "::error::未找到 sysupgrade.bin"; exit 1; }
+
+          SIZE=$(stat -c%s "$FIRMWARE")
+          SIZE_MB=$(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1048576}')
+          LIMIT_MB=$(awk -v s="$MAX_FIRMWARE_SIZE" 'BEGIN{printf "%.2f", s/1048576}')
+          echo "文件: $FIRMWARE"
+          echo "体积: ${SIZE_MB} MiB (${SIZE} B) / 分区上限 ${LIMIT_MB} MiB (${MAX_FIRMWARE_SIZE} B)"
+          [ "$SIZE" -gt 0 ] || { echo "::error::固件为 0 字节"; exit 1; }
+          [ "$SIZE" -le "$MAX_FIRMWARE_SIZE" ] || { echo "::error::固件超出 firmware 分区，刷入会变砖"; exit 1; }
+
+          PKG_COUNT=$(wc -l < "$(ls -1 *.manifest | head -n1)")
+
+          # 余量告警：overlay（可写分区）太小时，LuCI 改配置容易写失败
+          SPARE=$((MAX_FIRMWARE_SIZE - SIZE))
+          if [ "$SPARE" -lt 2097152 ]; then
+            echo "::warning::固件余量只有 $(awk -v s="$SPARE" 'BEGIN{printf "%.2f", s/1048576}') MiB，overlay 会很紧张"
+          fi
+
+          # ================= 版本快照（本次构建到底用了哪些版本）=================
+          {
+            echo "# ImmortalWrt 25.12 for Newifi-D2 — 构建版本快照"
+            echo ""
+            echo "构建时间 : $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "源码分支 : openwrt-25.12 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
+            echo "固件体积 : ${SIZE_MB} MiB / ${LIMIT_MB} MiB"
+            echo "包总数   : ${PKG_COUNT}"
+            echo ""
+            echo "## 关键组件"
+            grep -E '^(luci-app-passwall|xray-core|mosdns|luci-app-mosdns|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap) ' \
+                 "$(ls -1 *.manifest | head -n1)" | sort
+          } > versions.txt
+          cat versions.txt
+
+          sha256sum "$FIRMWARE" > sha256sums.txt
+          cat sha256sums.txt
+
+          {
+            echo "### ✅ 固件审计通过（含内容核对）"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 文件 | \`$FIRMWARE\` |"
+            echo "| 体积 | **${SIZE_MB} MiB** |"
+            echo "| 分区上限 | ${LIMIT_MB} MiB (0x1FB0000) |"
+            echo "| 余量 | $(awk -v a="$MAX_FIRMWARE_SIZE" -v b="$SIZE" 'BEGIN{printf "%.2f", (a-b)/1048576}') MiB |"
+            echo "| 固件内包数 | ${PKG_COUNT} |"
+            echo "| 关键包/文件缺失 | 0 |"
+            echo "| 自动补齐轮次 | ${round} |"
+            echo "| TurboACC | ${EFF_TURBO} |"
+            echo ""
+            echo "<details><summary>本次构建的组件版本</summary>"
+            echo ""
+            echo '```'
+            echo "源码: openwrt-25.12 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
+            grep -E '^(luci-app-passwall|xray-core|mosdns|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full) ' \
+                 "$(ls -1 *.manifest | head -n1)" | sort
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "FIRMWARE_DIR=$PWD" >> "$GITHUB_ENV"
+          echo "FIRMWARE_NAME=$FIRMWARE" >> "$GITHUB_ENV"
+          echo "TAG_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      - name: 13. 上传固件 artifact
+        if: steps.audit.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-d2-${{ env.TAG_DATE }}
+          path: |
+            ${{ env.FIRMWARE_DIR }}/*sysupgrade.bin
+            ${{ env.FIRMWARE_DIR }}/sha256sums.txt
+            ${{ env.FIRMWARE_DIR }}/versions.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      # ---------------------------------------------------------------
+      - name: 14. 记录回退点（上一个可用版本）
+        if: steps.audit.outcome == 'success'
+        run: |
+          # 本步骤只读，不删任何东西：历史 Release 全部保留，随时可回退
+          PREV=$(git ls-remote --tags --refs origin 2>/dev/null \
+                 | awk -F'refs/tags/' '{print $2}' | grep -E '^D2-' | sort -V | tail -n1)
+          echo "PREV_TAG=${PREV:-（这是首个版本）}" >> "$GITHUB_ENV"
+          echo "本次源码提交: ${{ github.sha }}"
+          echo "上一个可用版本: ${PREV:-无}"
+          {
+            echo ""
+            echo "### 回退点"
+            echo "- 本次源码提交: \`${{ github.sha }}\`"
+            echo "- 上一个可用版本: \`${PREV:-无}\`"
+            echo "- 触发方式: \`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      - name: 15. 发布 Release
+        if: steps.audit.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: D2-${{ env.TAG_DATE }}-r${{ github.run_number }}
+          name: ImmortalWrt 25.12 for Newifi-D2 [${{ env.TAG_DATE }}]
+          body: |
+            ## ImmortalWrt 25.12 · Newifi-D2
+
+            > **固件本体是"冻结"版本**：软件版本锁定在编译时，**不自升级**；要新版本就刷入新构建。
+            > **规则会自更新**：PassWall 的 gfwlist / chnlist 每周六 04:30 由 `rule-refresh` 刷新
+            > （失败自动回滚，不会把路由器停在半坏状态）。geoip/geosite 二进制库仍随固件版本。
+            >
+            > 本仓库已开启**每周六 02:17（北京）定时构建**，源码每次取
+            > `openwrt-25.12` / feeds / 第三方 `main` 的最新提交，所以每周都会有新 Release。
+
+            默认管理地址 **192.168.2.1** · 无 root 密码（首次登录请自行设置）
+
+            ### 本次使用的版本
+            见 Release 附件 **`versions.txt`**（含源码提交号与各组件版本号）。
+
+            ### ↩️ 回退（出问题时）
+            - 本次源码提交：`${{ github.sha }}`
+            - 上一个可用版本：**`${{ env.PREV_TAG }}`**
+            - 方法：在下方 Releases 列表里找到上一个版本，下载它的 `sysupgrade.bin`，
+              在 LuCI「系统 → 备份/升级」中**保留配置**刷入即可（3 分钟内完成）。
+            - 历史 Release 一律不删，都是可回退点。
+
+            ### 内置组件
+            - **PassWall + Xray**（nftables 透明代理；仅编入 Xray，省掉 SS-Rust / Simple-Obfs）
+            - **MosDNS**（5335，DoT 上游，geoip 用 `geoip-only-cn-private`）
+              · DNS 广告拦截已开启，规则源为固件内 geosite `category-ads-all`（随固件版本，不联网更新）
+            - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
+            - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
+            - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
+            - 性能调优：BBR + `fq` + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
+            - **上游自愈**：`wan-watchdog` 开机 4 分钟内自动重连、之后每 5 分钟巡检
+              （专治"无线中继重启后能连 WiFi 但上不了网，要再重启一次才好"）
+
+            ### 无线
+            - 2.4G：`alon` @ ch11 HT20 · 5G：`alon-5G` @ ch36 VHT80 · WPA2 `alon12345678`（**请立即修改**）
+
+            ### 出问题怎么办
+            路由器里已内置说明页：**http://192.168.2.1/guide.html**
+            自检命令：SSH 执行 **`fw-selftest`**（逐项 ✅/❌，一眼看出哪个功能没起来）
+
+            | 现象 | 处理 |
+            | --- | --- |
+            | 能 ping 通 IP、但网页打不开 | SSH 执行 **`dns-recover`** |
+            | 某个 App / 网站突然不通 | LuCI → 服务 → MosDNS → 关闭「广告拦截」 |
+            | 科学上网时快时慢 | TurboACC 里把硬件分载 `hw_flow` 关掉再试 |
+            | 重启后能连 WiFi 但上不了网 | 等 2 分钟（`wan-watchdog` 自动重连）；仍不行 SSH 执行 **`wan-watchdog`** |
+
+            ### 校验
+            `sha256sums.txt`；体积已通过 32MB(0x1FB0000) 分区上限审计。
+          files: |
+            ${{ env.FIRMWARE_DIR }}/*sysupgrade.bin
+            ${{ env.FIRMWARE_DIR }}/sha256sums.txt
+            ${{ env.FIRMWARE_DIR }}/versions.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------
+      # 放在最后：编译 / 审计 / 发布任一阶段失败都能捞到日志
+      - name: 16. 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            immortalwrt/build.log
+            immortalwrt/defconfig.log
+            immortalwrt/.config
+          if-no-files-found: warn
+          retention-days: 7
