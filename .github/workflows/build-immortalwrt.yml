@@ -876,10 +876,25 @@ jobs:
             echo "===================="
           } >> build.log
 
-          # ---- 先单独预编 3 个 Go 组件（-j1 V=s）----
-          # 1) 失败能 10 分钟内暴露真实错误（整机 -j 编译时错误会被 make 吞掉）
-          # 2) 顺序执行，彻底消除"Go 工具链还没就绪就开始编"的竞态
-          # 3) mosdns 若与新 Go 不兼容，自动退回 Go 1.26 重试
+          # ---- 阶段 0：先装 host 工具与交叉工具链（必须！）----
+          # 关键教训：`make package/xxx/compile` 这类单包目标【不会】自动构建 tools/ 和
+          # toolchain/。在干净工作区里直接跑，会因 staging_dir/host/bin/sed 不存在而报
+          #   bash: .../staging_dir/host/bin/sed: No such file or directory
+          #   ERROR: package/utils/lua [host] failed to build.
+          # 于是把本该在整机编译里做的事，提前到这里做完。
+          echo "🏗  阶段0：构建 host 工具 + 交叉工具链（约 20~30 分钟）..."
+          if ! make -j"$(nproc)" prereq tools/install toolchain/install 2>&1 | tee -a build.log; then
+            echo "::error::host 工具 / 工具链构建失败"
+            echo "::group::📋 失败详情"
+            tail -n 80 build.log
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "✅ host 工具与工具链就绪（$(ls staging_dir/host/bin/sed 2>/dev/null || echo '无 sed')）"
+
+          # ---- 阶段 1：单独预编 3 个 Go 组件（-j1 V=s）----
+          # 1) 失败能在几十分钟内暴露真实错误（整机 -j 编译时错误会被 make 吞掉）
+          # 2) 顺序执行，消除"Go 工具链还没就绪就开始编"的竞态
           GOVER=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
           echo "🔧 预编译 Go 组件（Go ${GOVER} + mosdns + xray）..."
 
@@ -904,11 +919,13 @@ jobs:
             echo "::warning::找不到 golang${GOVER} 目录，跳过工具链预编"
           fi
 
-          # ② mosdns（失败 → 自动退回 Go 1.26 重试）
+          # ② mosdns
+          # 注意：mosdns 自己 pin 了 Go 版本（日志里是 go-1.24.13），
+          # 所以只有在【日志明确报 'requires go >='】时才回退重试，否则会掩盖真实错误。
           echo "================ 预编 mosdns ================"
           if ! try_build "package/luci-app-mosdns/mosdns/compile"; then
-            if [ -d feeds/packages/lang/golang/golang1.26 ]; then
-              echo "::warning::mosdns 在 Go ${GOVER} 下编译失败，自动改用 Go 1.26 重试"
+            if grep -q "requires go >=" build.log && [ -d feeds/packages/lang/golang/golang1.26 ]; then
+              echo "::warning::mosdns 报 Go 版本不足，改用 Go 1.26 重试"
               sed -i -E 's#^PKG_BUILD_DEPENDS:=.*#PKG_BUILD_DEPENDS:=golang1.26/host#' \
                 package/luci-app-mosdns/mosdns/Makefile
               make package/luci-app-mosdns/mosdns/clean >/dev/null 2>&1 || true
@@ -916,7 +933,7 @@ jobs:
                 || die_with_log "mosdns（Go 1.26 退回后仍失败）"
               echo "  ✅ mosdns 已用 Go 1.26 编过"
             else
-              die_with_log "mosdns（且没有 golang1.26 可退回）"
+              die_with_log "mosdns"
             fi
           fi
 
