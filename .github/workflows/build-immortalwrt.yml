@@ -664,6 +664,19 @@ jobs:
           echo "passwall 版本 : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile)"
           echo "mosdns 版本   : $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-mosdns/mosdns/Makefile)"
 
+          # ---------- Go 模块缓存移出 dl（关键）----------
+          # dl/ 会被 actions/cache 缓存。之前构建中断时把"残缺的模块目录"也存进了缓存，
+          # 下次恢复后 Go 把残缺副本当完整用，于是出现一堆
+          #   "no required module provides package X/internal/y"
+          #   "build constraints exclude all Go files"
+          # 把 GOMODCACHE 指到不进缓存的目录，从根上消除这个隐患（代价：每次多下 1~2 分钟）
+          sed -i 's#^GO_MOD_CACHE_DIR:=.*#GO_MOD_CACHE_DIR:=/workdir/gomod#' \
+            feeds/packages/lang/golang/golang-values.mk
+          mkdir -p /workdir/gomod
+          grep -n '^GO_MOD_CACHE_DIR' feeds/packages/lang/golang/golang-values.mk
+          # 清掉旧缓存里可能残缺的那份
+          rm -rf dl/go-mod-cache
+
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
 
           # ---------- 可选：关闭 TurboACC ----------
@@ -902,6 +915,21 @@ jobs:
             make -j1 V=s "$1" 2>&1 | tee -a build.log
           }
 
+          # Go 构建统一入口：遇到"模块缓存残缺"类错误，自动清空 GOMODCACHE 重试一次
+          # 典型报错：build constraints exclude all Go files / no required module provides package
+          go_build() {
+            _t="$1"; _n="$2"
+            try_build "$_t" && return 0
+            if grep -qE "build constraints exclude all Go files|no required module provides package" build.log; then
+              echo "::warning::${_n} 报 Go 模块缓存残缺，清空 /workdir/gomod 后重试一次"
+              rm -rf /workdir/gomod
+              mkdir -p /workdir/gomod
+              make "${_t%/compile}/clean" >/dev/null 2>&1 || true
+              try_build "$_t" && return 0
+            fi
+            return 1
+          }
+
           die_with_log() {
             echo "::error::$1 预编译失败（真实错误见下）"
             echo "::group::📋 失败详情"
@@ -923,7 +951,7 @@ jobs:
           # 注意：mosdns 自己 pin 了 Go 版本（日志里是 go-1.24.13），
           # 所以只有在【日志明确报 'requires go >='】时才回退重试，否则会掩盖真实错误。
           echo "================ 预编 mosdns ================"
-          if ! try_build "package/luci-app-mosdns/mosdns/compile"; then
+          if ! go_build "package/luci-app-mosdns/mosdns/compile" "mosdns"; then
             if grep -q "requires go >=" build.log && [ -d feeds/packages/lang/golang/golang1.26 ]; then
               echo "::warning::mosdns 报 Go 版本不足，改用 Go 1.26 重试"
               sed -i -E 's#^PKG_BUILD_DEPENDS:=.*#PKG_BUILD_DEPENDS:=golang1.26/host#' \
@@ -939,7 +967,7 @@ jobs:
 
           # ③ xray（必须 ≥26.7.11，只能跟随主 Go 版本）
           echo "================ 预编 xray-core ================"
-          try_build "package/xray-core/compile" || die_with_log "xray-core"
+          go_build "package/xray-core/compile" "xray-core" || die_with_log "xray-core"
 
           echo "✅ Go 组件预编译全部通过"
 
