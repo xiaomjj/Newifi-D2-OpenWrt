@@ -128,6 +128,18 @@ jobs:
           # 同理，gst1-plugins-base 的 3 个可选依赖在 25.12 里不存在，只是噪声
           echo "已摘要无关包：weechat / luci-app-weechat"
 
+          # 规避 Kconfig 递归依赖（第 2 类）：dnsdist / snort3 / knot-resolver 这些包
+          # 共同点是 DEPENDS 里带 "@HAS_LUAJIT_ARCH +luajit"。上游 luajit 相关的
+          # provides 一变，它们就退化成"自依赖"（symbol PACKAGE_dnsdist depends on
+          # PACKAGE_dnsdist），make defconfig 会刷一屏 error（upstream issue 已复现多次）。
+          # 本固件一个都用不到，直接摘掉，从根上消掉这些 .config-package.in 条目。
+          for p in dnsdist snort snort3 knot-resolver openappid; do
+            if [ -e "package/feeds/packages/$p" ]; then
+              rm -rf "package/feeds/packages/$p"
+              echo "  已摘除（luajit 递归依赖受害包）：$p"
+            fi
+          done
+
           # --- PassWall 依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
           echo "---- PassWall 依赖预检 ----"
           DEP_MISS=0
@@ -1073,15 +1085,27 @@ jobs:
 
           make defconfig 2>&1 | tee defconfig.log
 
+          # Kconfig 的递归依赖报错属于"上游噪声"：dnsdist / snort3 / knot-resolver 这类
+          # 带 +luajit 的包，上游 luajit provides 一改动就会自依赖（见 upstream issue）。
+          # 它们本固件不用，第 4 步已摘除；这里只告警不阻断——真正决定"固件是否残缺"的
+          # 是下面那张 check 列表：任何一个必需的包没生效都会 ::error:: 并退出。
           if grep -q 'recursive dependency detected' defconfig.log; then
-            echo "::error::Kconfig 检测到递归依赖（未知新增的冲突包），可能已丢包"
-            grep -A4 'recursive dependency' defconfig.log | head -n 20
-            exit 1
+            echo "::warning::Kconfig 报递归依赖（无关包噪声，已忽略；关键包由下方 check 兜底）"
+            grep -A1 'recursive dependency detected' defconfig.log | grep 'symbol' | sed 's/^ */  /' | head -n 20
           fi
 
           if grep -qi 'warning' defconfig.log; then
             echo "::warning::defconfig 存在告警，以下符号可能被丢弃："
             grep -i 'warning' defconfig.log | head -n 50
+          fi
+
+          # 兜底：.config 是我们自己 cp 进来的，所以"文件非空"证明不了 defconfig 跑成功。
+          # kconfig 真正写回过的话，头几行一定有 "Automatically generated file"；
+          # 没有就说明它在递归依赖上报错退出了，别拿一份没解析过的配置去编译。
+          if ! head -n 3 .config | grep -q 'Automatically generated file'; then
+            echo "::error::defconfig 未真正生成配置（Kconfig 致命错误，见 defconfig.log）"
+            tail -n 30 defconfig.log
+            exit 1
           fi
 
           echo "======== 关键组件校验 ========"
