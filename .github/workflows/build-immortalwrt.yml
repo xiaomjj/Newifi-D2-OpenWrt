@@ -1,5 +1,5 @@
 # ============================================================
-#  ImmortalWrt 25.12 (openwrt-25.12) — newifi-d2 自动构建
+#  ImmortalWrt 25.12 (openwrt-25.12) — newifi-d2 构建（仅手动触发）
 #  设计原则：
 #   1. 依赖一律走官方 feeds，不再手工克隆 PassWall（避免同名包重复定义）
 #   2. 第三方源码只保留 TurboACC（不编 geo 数据、不用 MosDNS，DNS 交给 PassWall + dnsmasq）
@@ -28,11 +28,9 @@ on:
         type: boolean
         default: true
 
-  # ---- 每周自动构建：每周六 02:17（北京）= 每周五 18:17 UTC ----
-  # 只在默认分支生效；公开仓库 60 天无提交会被 GitHub 自动暂停（偶尔手动 Run 一次即可续上）。
-  # 避开整点：GitHub 的 cron 在 :00 排队最挤，延迟可能 20~40 分钟。
-  schedule:
-    - cron: '17 18 * * 5'
+  # ---- 只保留手动触发：已按要求关闭每周六定时构建 ----
+  # 想出新固件：Actions → 本工作流 → Run workflow（改过依赖就勾 clean_build）。
+  # 刷进路由器之后，固件不会联网自动下载/自动升级任何东西（规则与广告清单都在构建期写入镜像）。
 
 permissions:
   contents: write
@@ -334,6 +332,29 @@ jobs:
               uci commit passwall
           fi
 
+          # ---- 关掉 PassWall 的“自动更新规则 / 自动更新订阅” ----
+          #   为什么关得掉：规则文件（gfwlist / chnlist / chnroute / chnroute6）、广告清单
+          #   全部在构建期打进镜像，运行时不需要下载任何东西。
+          #   PassWall 的 tasks.sh 是个常驻循环，只有 *_update=1 或 update_week_mode=8 时
+          #   才真的去下载；这里全部置 0，等于给它上了锁。
+          #   想恢复联网更新：把 update_week_mode 改 8（按周）/ update_interval_mode 改小时数，
+          #   或把对应 *_update 改 1，再到 LuCI「PassWall → 规则列表」手动点更新。
+          if uci -q get passwall.@global_rules[0] >/dev/null 2>&1; then
+              uci set passwall.@global_rules[0].update_week_mode='0'
+              uci set passwall.@global_rules[0].update_interval_mode='0'
+              uci set passwall.@global_rules[0].gfwlist_update='0'
+              uci set passwall.@global_rules[0].chnlist_update='0'
+              uci set passwall.@global_rules[0].chnroute_update='0'
+              uci set passwall.@global_rules[0].chnroute6_update='0'
+              uci set passwall.@global_rules[0].geosite_update='0'
+              uci set passwall.@global_rules[0].geoip_update='0'
+          fi
+          # 顺带锁掉“每周定时重启”：默认没开，防止以后某次 LuCI 点击把它打开
+          if uci -q get passwall.@global_delay[0] >/dev/null 2>&1; then
+              uci set passwall.@global_delay[0].restart_week_mode='0'
+          fi
+          uci commit passwall
+
           # ---- TurboACC ----
           if uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
               uci set turboacc.@turboacc[0].sw_flow='1'
@@ -355,6 +376,14 @@ jobs:
           if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
               uci set firewall.@defaults[0].flow_offloading='1'
               uci commit firewall
+          fi
+
+          # ---- 系统 dnsmasq：缓存条数 150 → 1000 ----
+          #   路由器自身查询走 dnsmasq(53)；1000 条约 100~200KB 内存，命中率明显更高。
+          #   （dns-recover 清掉 cachesize 后也会重新写回 1000，见该脚本）
+          if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+              uci set dhcp.@dnsmasq[0].cachesize='1000'
+              uci commit dhcp
           fi
 
           # ---- 只 enable，不在这里 start（此时网络还没起来）----
@@ -386,7 +415,7 @@ jobs:
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "1" ]; then
               uci -q set dhcp.@dnsmasq[0].noresolv='0'
           fi
-          uci -q delete dhcp.@dnsmasq[0].cachesize
+          uci -q set dhcp.@dnsmasq[0].cachesize='1000'
           uci -q commit dhcp
           /etc/init.d/dnsmasq restart
           sleep 2
@@ -697,6 +726,12 @@ jobs:
           net.ipv4.tcp_max_syn_backlog = 8192
           net.ipv4.tcp_syncookies = 1
           net.ipv4.tcp_tw_reuse = 1
+          # ---- 代理链路最常见的“能连不能传”是路径 MTU 被黑洞：开启 MTU 探测自愈 ----
+          net.ipv4.tcp_mtu_probing = 1
+          # ---- 空闲后不重置拥塞窗口（BBR 下更平滑，长时间挂着不抖）----
+          net.ipv4.tcp_slow_start_after_idle = 0
+          # ---- FIN 超时收到 15 秒，端口回收更快（透明代理连接多）----
+          net.ipv4.tcp_fin_timeout = 15
           # ---- 内存：小内存机器不要把 16MB 锁死，8MB 足够 ----
           vm.min_free_kbytes = 8192
           vm.swappiness = 10
@@ -709,8 +744,8 @@ jobs:
           cat > files/etc/crontabs/root << 'EOF'
           # 每日 04:00 释放页缓存，缓解 128MB 内存压力
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
-          # 每周六 04:30 刷新 PassWall 文本规则（gfwlist / chnlist），失败自动回滚
-          30 4 * * 6 /usr/bin/rule-refresh
+          # 本固件不做任何自动下载：gfwlist / chnlist / chnroute / 广告清单全部在构建期
+          # 打进镜像，运行时一个字节都不从网上下。真要手动刷一次：SSH 执行 rule-refresh。
           # 每 5 分钟校正一次"PassWall 是否真的接管了 53"：没节点时别让全家断 DNS
           */5 * * * * /usr/bin/dns-guard
           # 每 6 小时确认加密上游还活着；被拦就回滚明文（宁可明文，不可断网）
@@ -776,13 +811,15 @@ jobs:
           exit 0
           EOF
 
-          # ---------- H. 规则自更新（每周六 04:30，见 crontabs）----------
-          # 只刷文本规则 gfwlist/chnlist（合计约 1.4MB）：
-          #   本固件不带 geoip.dat / geosite.dat（geosite.dat 一个就 10.9MB），分流全靠这
-          #   两份文本规则加包里自带的 chnroute，运行时只需要更新这两份。
-          # 下载 → 校验 → 备份 → 替换 → 重启 PassWall → 确认 xray 还活着，否则回滚。
+          # ---------- H. 规则手动刷新工具（固件不会自动调用它）----------
+          # 镜像里的 gfwlist / chnlist / chnroute 都是构建期写入的，运行时不联网更新，
+          # 所以这里保留一个“想刷才刷”的手动工具，默认没有任何 cron 会碰它。
+          # 流程：下载 → 校验 → 备份 → 替换 → 重启 PassWall → 确认 xray 还活着，否则回滚。
+          # 想恢复联网自动更新：uci set passwall.@global_rules[0].update_week_mode='8'
+          #   （按周，配 update_interval_mode）或把 gfwlist_update/chnlist_update 改 1。
           cat > files/usr/bin/rule-refresh << 'EOF'
           #!/bin/sh
+          # 注意：本脚本会联网下载，只在手动执行时才会跑；固件不会自动调用。
           LOG=/var/log/rule-refresh.log
           RULES=/usr/share/passwall/rules
           TMP=/tmp/rules.$$
@@ -861,6 +898,19 @@ jobs:
           [ -n "$BLOCK_N" ] || BLOCK_N=0
           [ "$BLOCK_N" -ge 50000 ] && ok "屏蔽列表 $BLOCK_N 条" || ng "屏蔽列表异常（$BLOCK_N 条）"
           t "chinadns-ng 运行中" pidof chinadns-ng
+          # 规则文件必须齐：gfwlist / chnlist / chnroute 都是构建期写进镜像的，运行时不下载
+          for _f in gfwlist chnlist chnroute; do
+              if [ -s "/usr/share/passwall/rules/$_f" ]; then ok "规则 $_f 已内置"; else ng "规则 $_f 缺失"; fi
+          done
+          [ "$(uci -q get passwall.@global_rules[0].update_week_mode)" = "0" ] \
+              && ok "PassWall 规则自动更新=关" || ng "PassWall 规则自动更新仍开着"
+          if grep -qE "rule_update|subscribe\.lua" /etc/crontabs/root 2>/dev/null; then
+              ng "crontab 里仍有自动下载任务"
+          else
+              ok "无自动下载任务"
+          fi
+          [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "1000" ] \
+              && ok "dnsmasq 缓存 1000 条" || ng "dnsmasq 缓存未调到 1000"
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
               ok "路由器 DNS 上游=DoT 加密"
           else
@@ -916,7 +966,7 @@ jobs:
           <p>客户端 DNS 由 PassWall 接管：chinadns-ng 分流（国内直连 / 国外走代理），
              所以"该不该走代理"是按域名判断的。</p>
           <p><b>去广告已开启</b>：PassWall「屏蔽列表」内置 anti-AD 规则（约 11 万条域名，
-             构建时打入固件，随每周固件一起更新），命中直接返回 NXDOMAIN。</p>
+             构建时打入固件，运行时不联网更新），命中直接返回 NXDOMAIN。</p>
           <p>想临时增删某条：服务 → PassWall → 规则列表 → 屏蔽列表（每行一个域名）。
              路由器自身的查询走系统 dnsmasq（53 → WAN 上游，默认明文）。</p>
           <p><b>路由器自身可以加密</b>：SSH 执行 <code>dns-secure</code> 会把 dnsmasq 的上游换成
@@ -944,13 +994,15 @@ jobs:
           <tr><td>科学上网时快时慢</td><td>TurboACC 关掉硬件分载</td></tr></table>
           <p>看整体状态：SSH 执行 <code>fw-selftest</code>。</p>
 
-          <h2>8. 更新固件</h2>
-          <p>固件本体不自动升级：要新版本请重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
-          <p>但 <b>PassWall 规则会自己更新</b>：每周六 04:30 跑一次 <code>rule-refresh</code>
-             （gfwlist / chnlist，约 1.4MB）。想看日志：<code>cat /var/log/rule-refresh.log</code>；
-             想立即刷一次：<code>rule-refresh</code>。失败会自动回滚，不会断网。</p>
-          <p>去广告清单（<code>/etc/passwall/rules/block_host</code>）不走运行时更新，
-             它跟固件一起打包：每次重新构建都会重新拉一份 anti-AD，所以更新固件即顺带更新规则。</p>
+          <h2>8. 更新固件 / 规则（全部手动）</h2>
+          <p>固件不自动升级、也不自动下载任何东西：规则清单（gfwlist / chnlist / chnroute）和
+             广告清单都在构建时打进镜像。要新版本就重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
+          <div class="warn">已关闭全部自动更新：PassWall 的规则更新、订阅自动更新、每周定时重启，
+             以及本仓库的每周定时构建，都不再自动跑。</div>
+          <p>偶尔想手动刷一次文本规则：SSH 执行 <code>rule-refresh</code>（gfwlist + chnlist，约 1.4MB，
+             失败自动回滚）；日志 <code>cat /var/log/rule-refresh.log</code>。
+             想恢复成“联网自动更新规则”，按该脚本头部注释里的两步改 uci 即可。</p>
+          <p>广告清单 <code>/etc/passwall/rules/block_host</code> 只能靠重新构建来更新（构建时重拉 anti-AD）。</p>
           </body>
           </html>
           EOF
@@ -1071,8 +1123,8 @@ jobs:
           # 用 with_turboacc=false 重跑即可，加速能力不受影响
           #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
           EFF_TURBO="true"
-          # 定时触发（schedule）时 inputs.* 全是空串，这里统一回落到默认值 true，
-          # 否则每周自动构建会误把 TurboACC 当成"用户要求关闭"而悄悄漏掉。
+          # inputs.* 在触发时可能全是空串，这里统一回落到默认值 true，
+          # 免得把 TurboACC 当成“用户要求关闭”而悄悄漏掉。
           TURBO="${{ inputs.with_turboacc }}"
           [ -z "$TURBO" ] && TURBO="true"
           if [ "$TURBO" != "true" ]; then
@@ -1516,6 +1568,10 @@ jobs:
             chk rule-refresh usr/bin/rule-refresh
             chk chinadns-ng usr/bin/chinadns-ng
             chk block-list  etc/passwall/rules/block_host
+            chk rules-gfw   usr/share/passwall/rules/gfwlist
+            chk rules-chn   usr/share/passwall/rules/chnlist
+            chk rules-route usr/share/passwall/rules/chnroute
+            chk rules-lan4  usr/share/passwall/rules/lanlist_ipv4
             chk guide       www/guide.html
             chk cfg-ksmbd   etc/config/ksmbd
             chk cfg-p910nd  etc/config/p910nd
@@ -1772,12 +1828,12 @@ jobs:
           body: |
             ## ImmortalWrt 25.12 · Newifi-D2
 
-            > **固件本体是"冻结"版本**：软件版本锁定在编译时，**不自升级**；要新版本就刷入新构建。
-            > **规则会自更新**：PassWall 的 gfwlist / chnlist 每周六 04:30 由 `rule-refresh` 刷新
-            > （失败自动回滚，不会把路由器停在半坏状态）。geo 数据不随固件提供，分流只用文本规则。
+            > **冻结版本，完全不自动**：软件版本锁定在编译时，**不自升级**；规则（gfwlist / chnlist /
+            > chnroute）与广告清单一律在构建时打进镜像，运行时**不联网下载、不自动更新、不自动重启**。
+            > geo 数据不随固件提供，分流只用文本规则。
             >
-            > 本仓库已开启**每周六 02:17（北京）定时构建**，源码每次取
-            > `openwrt-25.12` / feeds / 第三方 `main` 的最新提交，所以每周都会有新 Release。
+            > 本仓库已**关闭定时构建**：要新固件就手动 Actions → Run workflow，源码取
+            > `openwrt-25.12` / feeds / 第三方 `main` 的最新提交。
 
             默认管理地址 **192.168.2.1** · 无 root 密码（首次登录请自行设置）
 
@@ -1802,6 +1858,7 @@ jobs:
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
             - 性能调优：BBR + `fq` + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
+              + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 1000 条
 
             ### 无线
             - 2.4G：`alon` @ ch11 HT20 · 5G：`alon-5G` @ ch36 VHT80 · WPA2 `alon12345678`（**请立即修改**）
