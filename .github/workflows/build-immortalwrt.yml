@@ -335,7 +335,7 @@ jobs:
           #      代理侧的真实应答 —— 广告又被解析出来了。dnsmasq 模式下每域名只有一个
           #      上游，广告命中就是终局。
           #   2) use_block_list 关掉：去广告统一交给 MosDNS，两边各存一份 11 万条清单
-          #      只会白占约 10MB 内存（本机总共 128MB）。
+          #      只会白占约 10MB 内存。
           #   3) dns_redirect=1 必须留着：gfwlist 模式靠 DNS 劫持把域名写进 psw_gfw nftset，
           #      关掉等于关掉域名分流，只剩 IP 段硬碰。
           #   4) dns_mode 合法值只有 udp / tcp / dns2socks / sing-box / xray；
@@ -659,7 +659,7 @@ jobs:
               option bidirectional '0'
           EOF
 
-          # ---------- F. 内核调优（针对 MT7621 双核 / 128MB 内存）----------
+          # ---------- F. 内核调优（针对 MT7621 双核 / 512MB 内存）----------
           cat > files/etc/sysctl.conf << 'EOF'
           # ---- 缓冲与队列：BBR 需要 fq，rmem/wmem 上限要放开否则 tcp_rmem 白设 ----
           net.core.default_qdisc = fq
@@ -689,18 +689,77 @@ jobs:
           EOF
 
           cat > files/etc/crontabs/root << 'EOF'
-          # 每日 04:00 释放页缓存，缓解 128MB 内存压力
+          # 本固件不联网、不自动下载、不自动升级：规则与广告清单都在构建期写进镜像。
+          # 下面这些都是纯本地动作（一个字节都不出网）——只保留真正必要的自动化：
+          # 1) 每日 04:00 释放页缓存（P2P、LuCI 页面缓存都能把页缓存吃满）
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
-          # 本固件不做任何自动下载：gfwlist / chnlist / chnroute / 广告清单全部在构建期
-          # 打进镜像，运行时一个字节都不从网上下。真要手动刷一次：SSH 执行 rule-refresh。
-          # 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
+          # 2) 每 10 分钟看一眼可用内存：低于总量 8% 清页缓存，低于 4% 再截断大日志（不动任何进程）
+          */10 * * * * /usr/bin/memguard
+          # 3) 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
           */10 * * * * pidof mosdns >/dev/null 2>&1 || /etc/init.d/mosdns restart
+          # 4) 每周日 04:30 截断超过 512KB 的运行日志（/var/log 在 tmpfs 里，实打实吃内存）
+          30 4 * * 0 /usr/bin/memguard trim
+          EOF
+
+          # ---------- F2. 内存看门狗（必要自动化：只清缓存，不动进程）----------
+          cat > files/usr/bin/memguard << 'EOF'
+          #!/bin/sh
+          # 内存看门狗：页缓存把 MemAvailable 压到底时，LuCI 会卡、
+          # ksmbd 会拒连、dnsmasq 会被 OOM 牵连。这里只做三件不伤人的事：
+          #   1) drop_caches —— 页缓存随时可丢，丢完立刻能长回来（不影响正在跑的程序）
+          #   2) 截断超大日志 —— /var/log 在 tmpfs 里，实打实吃内存
+          #   3) 记一行日志 —— 回头能对上时间线
+          # 绝不 reboot、绝不杀进程、绝不重启服务（那些交给 procd 和用户自己）。
+          # 手动清一次：memguard trim
+          LOG=/var/log/memguard.log
+          AVAIL=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+          [ -n "$AVAIL" ] || exit 0
+
+          trim_logs() {
+              find /var/log -type f -size +512k 2>/dev/null | while read -r f; do
+                  : > "$f"
+                  echo "$(date '+%F %T') 截断日志 $f" >> "$LOG"
+              done
+          }
+
+          if [ "$1" = "trim" ]; then
+              trim_logs
+              exit 0
+          fi
+
+          # 阈值按总内存算，不写死 MB：可用内存 < 8% 只清页缓存，< 4% 再加截断日志。
+          # 写死 10MB 在大内存机器上等于永不触发，写死 40MB 在小内存机器上等于一直触发。
+          TOTAL=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+          [ -n "$TOTAL" ] || TOTAL=128
+          WARN=$((TOTAL * 8 / 100))
+          [ "$WARN" -ge 8192 ] || WARN=8192
+          DANGER=$((TOTAL * 4 / 100))
+          [ "$DANGER" -ge 4096 ] || DANGER=4096
+
+          if [ "$AVAIL" -lt "$DANGER" ]; then
+              sync
+              echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+              trim_logs
+              echo "$(date '+%F %T') 危险：可用 ${AVAIL}MB / 共 ${TOTAL}MB，已清缓存 + 日志" >> "$LOG"
+              logger -t memguard "可用内存 ${AVAIL}MB，已清缓存"
+          elif [ "$AVAIL" -lt "$WARN" ]; then
+              sync
+              echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+              echo "$(date '+%F %T') 紧张：可用 ${AVAIL}MB / 共 ${TOTAL}MB，已清页缓存" >> "$LOG"
+          fi
+
+          # 自己的日志别无限长（超过 64KB 只留最后 200 行）
+          if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 65536 ]; then
+              tail -n 200 "$LOG" > "$LOG.tmp"
+              mv "$LOG.tmp" "$LOG"
+          fi
+          exit 0
           EOF
 
           # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
           cat > files/etc/rc.local << 'EOF'
           #!/bin/sh
-          # conntrack 上限：128MB 机器上 32K 是性价比最高的档位（默认 16K，P2P 会打满）
+          # conntrack 上限：32K 是性价比最高的档位（默认 16K，P2P + 多设备会把表打满）
           if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
               echo 32768 > /proc/sys/net/netfilter/nf_conntrack_max
               echo 3600  > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established
@@ -782,8 +841,16 @@ jobs:
 
           fetch() {
               _url="$1"; _out="$2"
-              curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -m 300 \
-                   "$_url" -o "$TMP/$_out" || { log "失败：$_out 下载出错"; return 1; }
+              if command -v curl >/dev/null 2>&1; then
+                  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -m 300 \
+                       "$_url" -o "$TMP/$_out" || { log "失败：$_out 下载出错"; return 1; }
+              elif command -v uclient-fetch >/dev/null 2>&1; then
+                  uclient-fetch -q -O "$TMP/$_out" "$_url" || { log "失败：$_out 下载出错"; return 1; }
+              elif command -v wget >/dev/null 2>&1; then
+                  wget -q -O "$TMP/$_out" "$_url" || { log "失败：$_out 下载出错"; return 1; }
+              else
+                  log "失败：系统里没有 curl / uclient-fetch / wget，无法下载"; return 1
+              fi
               _n=$(wc -l < "$TMP/$_out" | tr -d ' ')
               [ "$_n" -ge 1000 ] || { log "失败：$_out 行数异常($_n)"; return 1; }
               if grep -qE '^(domain|full|regexp|keyword|include):' "$TMP/$_out"; then
@@ -840,7 +907,16 @@ jobs:
           [ "$(uci -q get passwall.@global[0].dns_shunt)" = "dnsmasq" ] && ok "DNS 分流器=dnsmasq" || ng "DNS 分流器不是 dnsmasq"
           [ "$(uci -q get passwall.@global[0].use_block_list)" = "0" ] && ok "PassWall 屏蔽列表已关（去广告归 MosDNS）" || ng "PassWall 屏蔽列表没关"
           t "MosDNS 运行中"       pidof mosdns
-          if netstat -lnu 2>/dev/null | grep -q ":5335"; then ok "MosDNS 监听 5335"; else ng "5335 没有监听"; fi
+          # 5335 = 0x14D7：直接读 /proc/net/udp{,6}，不依赖 busybox 是否编了 netstat
+          _p5335=0
+          for _pf in /proc/net/udp /proc/net/udp6; do
+              [ -r "$_pf" ] || continue
+              awk 'NR>1 && $2 ~ /:14D7$/ {f=1} END{exit !f}' "$_pf" && _p5335=1
+          done
+          if [ "$_p5335" = "0" ] && command -v netstat >/dev/null 2>&1; then
+              netstat -lnu 2>/dev/null | grep -q ":5335" && _p5335=1
+          fi
+          [ "$_p5335" = "1" ] && ok "MosDNS 监听 5335/UDP" || ng "5335 没有监听"
           AD_N=$(wc -l < /etc/mosdns/adblock.txt 2>/dev/null | tr -d " ")
           [ -n "$AD_N" ] || AD_N=0
           [ "$AD_N" -ge 50000 ] && ok "广告域名 $AD_N 条" || ng "广告域名清单异常（$AD_N 条）"
@@ -855,6 +931,14 @@ jobs:
           else
               ok "无自动下载任务"
           fi
+          [ -x /usr/bin/memguard ] && ok "内存看门狗已装（每 10 分钟）" || ng "memguard 缺失"
+          if grep -q 'memguard' /etc/crontabs/root 2>/dev/null; then
+            ok "crontab 里有本地清理任务（不联网）"
+          else
+            ng "crontab 里没有本地清理任务"
+          fi
+          _av=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+          [ -n "$_av" ] && printf '  · 可用内存 %sMB（低于总量 8%% 时 memguard 会自动清缓存）\n' "$_av"
           [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "1000" ] \
               && ok "dnsmasq 缓存 1000 条" || ng "dnsmasq 缓存未调到 1000"
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
@@ -878,7 +962,7 @@ jobs:
           EOF
 
           # ---------- I2. 无线诊断（刷机后 SSH 执行 wifi-doctor）----------
-          # 128MB 小机器上“信号弱 / 时有时无”最常见的原因不是硬件，而是：信道被邻居占满、
+          # 这类小机器上“信号弱 / 时有时无”最常见的原因不是硬件，而是：信道被邻居占满、
           # 法规域把功率压低、内存被吃光（OOM 杀 hostapd）、驱动/firmware 报错。
           # 这个脚本只读，不碰任何配置，把判断依据一次全打印出来。
           cat > files/usr/bin/wifi-doctor << 'EOF'
@@ -943,7 +1027,7 @@ jobs:
           echo
           echo '--- 5. 内存 / 驱动 ---'
           if [ -r /proc/meminfo ]; then
-              awk '/MemAvailable/{printf "  可用内存：%d MB / 128 MB\n", $2/1024}' /proc/meminfo
+              awk '/MemTotal/{t=int($2/1024)} /MemAvailable/{a=int($2/1024)} END{printf "  可用内存：%d MB / %d MB\n", a, t}' /proc/meminfo
           else
               echo '  读不到 /proc/meminfo'
           fi
@@ -1010,7 +1094,7 @@ jobs:
           </table>
           <p><b>去广告</b>：清单在 /etc/mosdns/adblock.txt（约 11 万条域名，构建时打入固件，
              运行时不联网），命中直接返回 0.0.0.0。PassWall 自带的「屏蔽列表」已关闭，
-             两边不重复存清单（128MB 内存省下约 10MB）。</p>
+             两边不重复存清单（省下约 10MB 内存）。</p>
           <p><b>上游加密</b>：MosDNS 用阿里 / 腾讯的 DoH，明文只在校验失败时兜底一次
              （典型场景：刚开机还没校时）。看状态：<code>logread | grep mosdns</code>。</p>
           <div class="warn">gfwlist 里的域名由 PassWall 经隧道解析，不经过 MosDNS，
@@ -1041,6 +1125,10 @@ jobs:
              广告清单都在构建时打进镜像。要新版本就重新构建，再「系统 → 备份/升级」刷入 sysupgrade 包（配置保留）。</p>
           <div class="warn">已关闭全部自动更新：PassWall 的规则更新、订阅自动更新、每周定时重启，
              以及本仓库的每周定时构建，都不再自动跑。</div>
+          <p>但<strong>本地</strong>的必要维护仍然保留（都不联网）：每日 04:00 释放一次页缓存；
+             每 10 分钟看一次可用内存（<code>memguard</code>，低于总内存 8% 自动清缓存、低于 4% 顺手截断大日志，
+             不杀进程、不重启服务）；每 10 分钟确认 MosDNS 进程还活着（procd 之外的第二道保险）；
+             每周日截断超过 512KB 的运行日志。想看它做过什么：<code>cat /var/log/memguard.log</code>。</p>
           <p>偶尔想手动刷一次文本规则：SSH 执行 <code>rule-refresh</code>（gfwlist + chnlist，约 1.4MB，
              失败自动回滚）；日志 <code>cat /var/log/rule-refresh.log</code>。
              想恢复成“联网自动更新规则”，按该脚本头部注释里的两步改 uci 即可。</p>
@@ -1053,9 +1141,23 @@ jobs:
           <tr><td>走远就掉、回来又自己连上</td><td>hostapd 因 ack 连续失败踢客户端，已置 disassoc_low_ack=0</td></tr>
           <tr><td>5G 整体消失几十秒</td><td>DFS 雷达静默；本固件默认把 5G 放在 149 段（非 DFS）</td></tr>
           <tr><td>隔一会儿卡半秒</td><td>AP 后台扫信道；已置 noscan=1</td></tr>
-          <tr><td>整机都慢、无线偶发消失</td><td>128MB 内存被吃光（OOM）：减插件，或把屏蔽列表减半后重刷</td></tr></table>
+          <tr><td>整机都慢、无线偶发消失</td><td>内存被吃光（OOM）：减插件，或把屏蔽列表减半后重刷</td></tr></table>
           <p>改信道不必重刷：<code>uci set wireless.radio0.channel=6; uci commit wireless; wifi reload</code>；
              80MHz 覆盖不够：<code>uci set wireless.radio1.htmode=VHT40; wifi reload</code>。</p>
+
+          <h2>10. 验收：怎么确认这个固件是完整的</h2>
+          <p>三处各看一眼。任何一处不对就别刷，先回去看构建日志——审计没过的固件根本不会出现在 Release 里。</p>
+          <table><tr><th>看哪里</th><th>正常长什么样</th></tr>
+          <tr><td>构建日志 · 第 12 步末行</td><td><code>缺失合计: 0（包 0 / 文件 0）</code></td></tr>
+          <tr><td>构建日志 · 包清单</td><td><code>包清单: xxx.manifest（200 个以上的包）</code></td></tr>
+          <tr><td>刷机后 · SSH</td><td>执行 <code>fw-selftest</code>，全部 ✅；有 ❌ 就照那一条去查</td></tr></table>
+          <p>审计脚本会逐个核对关键包（xray-core / luci-app-passwall / mosdns / dnsmasq-full / ksmbd / p910nd / zram-swap）、
+             关键文件（PassWall 真正干活的 <code>/usr/share/passwall/app.sh</code>、MosDNS 的 v5 配置、四份分流规则、
+             说明页、自检脚本……）和内核模块（<code>kmod-nft-tproxy</code> 等 TProxy 地基）。
+             发现缺件会<strong>自动补装，最多 3 轮</strong>；补不动（缺失数不再下降）就立刻中断并报错退出，
+             绝不会产出"刷完才发现少东西"的固件。</p>
+          <div class="warn">内核模块那一组只告警不阻断：<code>.ko</code> 文件名随内核版本变，
+             判死会误伤。看到 <code>镜像里没有 kmod-nft-tproxy</code> 这类告警要当真——表现是"能连上、网页打不开"。</div>
 
           </body>
           </html>
@@ -1107,7 +1209,7 @@ jobs:
             echo "::error::广告清单异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
             exit 1
           fi
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor \
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard \
                    files/etc/init.d/mosdns \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
@@ -1187,7 +1289,15 @@ jobs:
           # 记录"实际生效状态"：第 11 步可能自动降级把它关掉，第 12 步审计要读这个文件
           echo "$EFF_TURBO" > /workdir/state-turboacc
 
+          # GitHub 的默认 shell 带 -e -o pipefail：make defconfig 只要因上游 Kconfig
+          # 递归依赖返回非 0，这一步就会在这里直接退出（日志里只剩 Kconfig 报错，看不到
+          # 下面任何诊断），表现就是"莫名其妙 exit 1"。这里显式吞掉退出码，最终是否放行
+          # 交给下方的 .config 头校验判定——那才是"配置真的生成了没有"的唯一证据。
+          set +e
           make defconfig 2>&1 | tee defconfig.log
+          DEFCONF_RC=$?
+          set -e
+          echo "defconfig 退出码: $DEFCONF_RC（非 0 多为上游 Kconfig 噪声，关键包由下方 check 兜底）"
 
           # Kconfig 的递归依赖报错属于"上游噪声"：dnsdist / snort3 / knot-resolver 这类
           # 带 +luajit 的包，上游 luajit provides 一改动就会自依赖（见 upstream issue）。
@@ -1267,10 +1377,10 @@ jobs:
           if [ "$MISSING" -ne 0 ]; then
             echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
             echo "---- feeds 里这些包是否存在（1=有，0=没有）----"
-          for p in luci-app-passwall xray-core mosdns dns2socks ipt2socks \
-                     microsocks tcping lyaml luci-app-turboacc; do
-              printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
-            done
+            for p in luci-app-passwall xray-core mosdns dns2socks ipt2socks \
+                       microsocks tcping lyaml luci-app-turboacc; do
+                printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
+              done
             echo "排查建议："
             echo "  1) 缺哪个包，就把对应源码加进第 4 步（或改成 feeds 里已有的等价包）"
             echo "  2) 看本步骤上方 make defconfig 的告警，通常会点出缺失的依赖"
@@ -1328,8 +1438,110 @@ jobs:
           fetch_rule "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" \
                      "$RULES/chnlist"
 
+          # ---- 再补一层"高频、但上游清单常常漏"的域名 ----
+          # PassWall 的 gfwlist 是后缀匹配（dnsmasq 的 server=/域名/），写 apex 就覆盖全部子域，
+          # 所以只补主域名、不堆子域。Loyalsoldier 那份 gfw.txt 偏重"被墙网站"，对 AI 服务、
+          # 流媒体、云开发的收录往往是滞后的，这里补一份人工维护的小清单。
+          # 原则：只加真正需要走代理的；国内能直连的一个都不加（多走一跳代理只会更慢）。
+          if [ -s "$RULES/gfwlist" ]; then
+            _gb=$(wc -l < "$RULES/gfwlist" | tr -d " ")
+            cat >> "$RULES/gfwlist" << 'EXTRA'
+          openai.com
+          chatgpt.com
+          oaistatic.com
+          oaiusercontent.com
+          anthropic.com
+          claude.ai
+          gemini.google.com
+          ai.google.dev
+          generativelanguage.googleapis.com
+          aistudio.google.com
+          copilot.microsoft.com
+          perplexity.ai
+          poe.com
+          grok.com
+          x.ai
+          mistral.ai
+          huggingface.co
+          hf.co
+          midjourney.com
+          openrouter.ai
+          together.ai
+          replicate.com
+          netflix.com
+          nflxvideo.net
+          nflximg.net
+          disneyplus.com
+          hbomax.com
+          max.com
+          primevideo.com
+          spotify.com
+          scdn.co
+          soundcloud.com
+          twitch.tv
+          hulu.com
+          vimeo.com
+          twitter.com
+          x.com
+          t.co
+          facebook.com
+          instagram.com
+          threads.net
+          whatsapp.com
+          telegram.org
+          telegram.me
+          t.me
+          telegra.ph
+          discord.com
+          discordapp.com
+          reddit.com
+          signal.org
+          github.com
+          githubusercontent.com
+          githubassets.com
+          gitlab.com
+          docker.com
+          docker.io
+          npmjs.com
+          pypi.org
+          stackoverflow.com
+          medium.com
+          substack.com
+          notion.so
+          figma.com
+          slack.com
+          zoom.us
+          trello.com
+          atlassian.com
+          1password.com
+          bitwarden.com
+          protonmail.com
+          proton.me
+          tutanota.com
+          wikipedia.org
+          wikimedia.org
+          quora.com
+          bbc.com
+          nytimes.com
+          reuters.com
+          bloomberg.com
+          economist.com
+          EXTRA
+            _ga=$(wc -l < "$RULES/gfwlist" | tr -d " ")
+            echo "✅ gfwlist 追加 $((_ga - _gb)) 个高频域名（$_gb 行 → $_ga 行）"
+            [ "$_ga" -ge 1000 ] || echo "::warning::gfwlist 行数异常（$_ga 行），检查上游格式"
+          else
+            echo "⚠️  gfwlist 未生成（下载失败），跳过追加；运行时用包内自带那份"
+          fi
+
           echo "ℹ️  本固件不编入 GeoIP/GeoSite：v2ray-geoip(135KB) 与 v2ray-geosite(10.9MB) 都不要，"
           echo "    PassWall 只用上面两份文本规则分流，省下约 3MB 闪存。"
+
+          # 覆盖层快照必须包含这两份规则：第 12 步"缺件补齐"会用它还原 files/，
+          # 快照若停在下载之前，一旦触发补齐就等于把规则删了，而补齐逻辑只会重装包、
+          # 不会重新下载规则 → 审计永远补不回来，白跑 3 轮后失败。
+          tar -C . -czf /workdir/files-overlay.tgz files
+          echo "覆盖层快照已更新（含分流规则）: $(du -h /workdir/files-overlay.tgz | cut -f1)"
 
       # ---------------------------------------------------------------
       - name: 10. 下载源码包（失败重试；无进展立即中断并诊断）
@@ -1613,6 +1825,12 @@ jobs:
               return 0
             }
             chk xray        usr/bin/xray
+            # PassWall 干活的脚本在 passwall 包本身里，不在 luci-app-passwall 里：
+            # 少了 app.sh，LuCI 能点、开关也能拨，但实际一点分流都不做。
+            chk passwall-app usr/share/passwall/app.sh
+            chk passwall-cfg etc/config/passwall
+            # dnsmasq-full 是整条 DNS 链路的地基（副本 dnsmasq + nftset 都靠它）
+            chk dnsmasq-bin  usr/sbin/dnsmasq
             chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
             chk ksmbd-init  etc/init.d/ksmbd
             if [ -e "$ROOTFS/usr/share/v2ray/geosite.dat" ]; then
@@ -1640,6 +1858,7 @@ jobs:
             chk fw-selftest usr/bin/fw-selftest
             chk wifi-doctor usr/bin/wifi-doctor
             chk rule-refresh usr/bin/rule-refresh
+            chk memguard    usr/bin/memguard
             chk rules-gfw   usr/share/passwall/rules/gfwlist
             chk rules-chn   usr/share/passwall/rules/chnlist
             chk rules-route usr/share/passwall/rules/chnroute
@@ -1655,9 +1874,27 @@ jobs:
               echo "  广告域名: $_an 条"
               [ "$_an" -ge 50000 ] || echo "::warning::广告域名条数偏少($_an)，去广告基本不生效"
             fi
+            # 分流规则条数：上游格式漂移或下载失败会退化成几十行，这里点名
+            if [ -f "$ROOTFS/usr/share/passwall/rules/gfwlist" ]; then
+              _gn=$(wc -l < "$ROOTFS/usr/share/passwall/rules/gfwlist" | tr -d " ")
+              [ -n "$_gn" ] || _gn=0
+              echo "  代理域名(gfwlist): $_gn 条"
+              [ "$_gn" -ge 1000 ] || echo "::warning::gfwlist 只有 $_gn 行，分流规则基本没生效"
+            fi
           else
             echo "::warning::未找到 root-ramips，跳过文件级检查"
           fi
+
+          # ---- PassWall 空心化检查：三种分流模式都靠这几个内核模块 ----
+          # config 里选了不等于编进了镜像（kmod 会随依赖变化被静默丢掉），
+          # 所以拿 .manifest 复核一遍；缺 TProxy 的表现是"能连上、网页打不开"。
+          for p in kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun; do
+            if grep -q "^$p " "$MANIFEST"; then
+              printf '  ✅ %s\n' "$p"
+            else
+              printf '::warning::镜像里没有 %s（PassWall 的 TProxy/转发会失效）\n' "$p"
+            fi
+          done
 
           # ---- 版本对齐复查：Xray 必须 ≥ PassWall 要求的 26.7.11 ----
           XRAY_MV=$(grep -m1 '^xray-core ' "$MANIFEST" | awk '{print $3}' | cut -d- -f1)
@@ -1718,6 +1955,20 @@ jobs:
             grep -i 'warning' defconfig.log 2>/dev/null | tail -n 15 || echo "  （无）"
             echo "::endgroup::"
             echo "处理建议：按上面三行状态定位——config 未选中＝依赖问题；feeds 不存在＝包名或源问题；ipk 未生成＝编译失败"
+            # 失败时把缺件清单写进本次运行的总结页，不用翻整份日志
+            {
+              echo "### 固件缺件清单（补齐失败）"
+              echo ""
+              if [ -s /workdir/missing-pkgs.txt ]; then
+                echo "**缺失软件包**"
+                sed 's/^/- `/; s/$/`/' /workdir/missing-pkgs.txt
+                echo ""
+              fi
+              if [ -s /workdir/missing-files.txt ]; then
+                echo "**缺失文件**"
+                sed 's/^/- `/; s/$/`/' /workdir/missing-files.txt
+              fi
+            } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
           }
 
           OK=0
@@ -1931,6 +2182,10 @@ jobs:
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
             - 性能调优：BBR + `fq` + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
               + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 1000 条
+            - **分流规则**：构建期拉 Loyalsoldier 的 gfw.txt / china-list，再追加约 80 条人工维护的
+              高频域名（AI 服务 / 流媒体 / 社交 / 云开发），只补国内直连得不到的，不多走一跳代理
+            - **必要的本地自动化**（全部不联网）：每日释放页缓存、每 10 分钟的内存看门狗 `memguard`、
+              MosDNS 存活检查、每周截断超期日志；`/var/log/memguard.log` 可查它做过什么
 
             ### 无线
             - 2.4G：`alon` @ 自动信道 HT20 · 5G：`alon-5G` @ ch149 VHT80 · WPA2 `alon12345678`（**请立即修改**）
