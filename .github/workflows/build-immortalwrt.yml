@@ -341,6 +341,28 @@ jobs:
           #   4) dns_mode 合法值只有 udp / tcp / dns2socks / sing-box / xray；
           #      旧配置里的 dns_mode=dnsmasq 是非法值（app.sh 的 case 没有这个分支），
           #      后果是"该走代理的域名全部解析失败"。
+          # ---- 先确保 passwall 配置存在（否则下面所有 uci set 都是空转）----
+          #   构建期的镜像里本来就没有 /etc/config/passwall：PassWall 的默认配置由它
+          #   自带的 /usr/share/passwall/0_default_config 在首启生成。uci-defaults 跑在
+          #   服务之前，所以这里必须先把它生成出来，否则 uci -q get passwall.@global[0]
+          #   取不到值，整段设置被静默跳过 —— 表现是"能上网，但代理规则一条都没生效"。
+          if [ ! -f /etc/config/passwall ]; then
+              _dc=/usr/share/passwall/0_default_config
+              if [ -f "$_dc" ]; then
+                  if head -n 1 "$_dc" | grep -q "^#!" || grep -qE "^[[:space:]]*uci[[:space:]]" "$_dc"; then
+                      sh "$_dc" >/dev/null 2>&1 || true
+                  elif grep -qE "^[[:space:]]*config[[:space:]]" "$_dc"; then
+                      cp "$_dc" /etc/config/passwall 2>/dev/null || true
+                  else
+                      sh "$_dc" >/dev/null 2>&1 || true
+                  fi
+              fi
+          fi
+          # 兜底：上游脚本接口变了也还能落地一个最小骨架（直接写文件，不依赖 uci 的
+          # "add 到不存在的配置"这种边界行为），至少让下面每条 set 都有地方写
+          if [ ! -f /etc/config/passwall ]; then
+              printf 'config global\n\toption enabled 1\n\nconfig global_rules\n\nconfig global_delay\n\nconfig global_other\n' > /etc/config/passwall 2>/dev/null || true
+          fi
           if uci -q get passwall.@global[0] >/dev/null 2>&1; then
               uci set passwall.@global[0].enabled='1'
               uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
@@ -904,6 +926,8 @@ jobs:
 
           [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ok "ip_forward=1" || ng "ip_forward≠1"
           [ "$(uci -q get passwall.@global[0].enabled)" = "1" ] && ok "PassWall 已启用" || ng "PassWall 未启用"
+          # 配置没落盘时 enabled 也可能是空的，所以再看一条"必须由 92-services 写入"的项
+          [ "$(uci -q get passwall.@global[0].tcp_proxy_mode)" = "gfwlist" ] && ok "PassWall 分流模式=gfwlist" || ng "PassWall 分流模式不是 gfwlist（92-services 的配置没生效）"
           [ "$(uci -q get passwall.@global[0].dns_shunt)" = "dnsmasq" ] && ok "DNS 分流器=dnsmasq" || ng "DNS 分流器不是 dnsmasq"
           [ "$(uci -q get passwall.@global[0].use_block_list)" = "0" ] && ok "PassWall 屏蔽列表已关（去广告归 MosDNS）" || ng "PassWall 屏蔽列表没关"
           t "MosDNS 运行中"       pidof mosdns
@@ -1813,14 +1837,15 @@ jobs:
             echo "---- 关键文件 ----"
             chk() {
               _n="$1"; shift
+              _paths="$*"
               for c in "$@"; do
                 if [ -e "$ROOTFS/$c" ]; then
                   printf '  ✅ %-40s %s\n' "$c" "$(du -h "$ROOTFS/$c" 2>/dev/null | cut -f1)"
                   return 0
                 fi
               done
-              printf '  ❌ %-40s 缺失\n' "$_n"
-              echo "$_n" >> "$MISS_FILE"
+              printf '  ❌ %-40s 缺失（查过：%s）\n' "$_n" "$_paths"
+              echo "$_n（查过：$_paths）" >> "$MISS_FILE"
               LOST=$((LOST + 1))
               return 0
             }
@@ -1828,7 +1853,15 @@ jobs:
             # PassWall 干活的脚本在 passwall 包本身里，不在 luci-app-passwall 里：
             # 少了 app.sh，LuCI 能点、开关也能拨，但实际一点分流都不做。
             chk passwall-app usr/share/passwall/app.sh
-            chk passwall-cfg etc/config/passwall
+            # /etc/config/passwall 构建期本来就不存在：默认配置由 PassWall 自己在首启生成。
+          # 所以这里不判"文件在不在"，只判"92-services 有没有兜底生成逻辑"。
+          if [ -e "$ROOTFS/etc/config/passwall" ]; then
+              echo "  ✅ etc/config/passwall"
+          elif grep -q "0_default_config" "$ROOTFS/etc/uci-defaults/92-services" 2>/dev/null; then
+              echo "  ✅ passwall 配置首启生成（92-services 已兜底）"
+          else
+              echo "::warning::既没有 /etc/config/passwall，92-services 也没有兜底逻辑（PassWall 设置会不生效）"
+          fi
             # dnsmasq-full 是整条 DNS 链路的地基（副本 dnsmasq + nftset 都靠它）
             chk dnsmasq-bin  usr/sbin/dnsmasq
             chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
@@ -1862,7 +1895,13 @@ jobs:
             chk rules-gfw   usr/share/passwall/rules/gfwlist
             chk rules-chn   usr/share/passwall/rules/chnlist
             chk rules-route usr/share/passwall/rules/chnroute
-            chk rules-lan4  usr/share/passwall/rules/lanlist_ipv4
+            # lanlist_ipv4 是 PassWall 的"局域网直连"辅助名单（缺了只是这个开关没名单用，
+            # 不影响代理/分流），所以只告警、不阻断整份固件
+            if [ -e "$ROOTFS/usr/share/passwall/rules/lanlist_ipv4" ] || [ -e "$ROOTFS/usr/share/passwall/rules/lanlist_ipv4.txt" ]; then
+              echo "  ✅ lanlist_ipv4"
+            else
+              echo "::warning::镜像里没有 lanlist_ipv4（PassWall 的局域网直连名单为空，需要时在 LuCI 里生成）"
+            fi
             chk guide       www/guide.html
             chk cfg-ksmbd   etc/config/ksmbd
             chk cfg-p910nd  etc/config/p910nd
@@ -1995,14 +2034,14 @@ jobs:
 
             # 补齐后缺失数没有下降 → 补不动了，立即中断，不再空跑第 2/3 轮
             if [ "$round" -gt 1 ] && [ "$COUNT" -ge "$PREV" ]; then
-              echo "::error::第 $round 轮缺失数未下降（${PREV} → ${COUNT}），继续补齐无效，立即中断"
+              echo "::error::第 $round 轮缺失数未下降（${PREV} → ${COUNT}），继续补齐无效，立即中断。缺失项：$(cat /workdir/missing-pkgs.txt /workdir/missing-files.txt 2>/dev/null | tr "\n" " ")"
               diag_repair
               exit 1
             fi
             PREV=$COUNT
 
             if [ "$round" -eq 3 ]; then
-              echo "::error::已补齐 3 轮仍有 ${COUNT} 项缺失，中断构建"
+              echo "::error::已补齐 3 轮仍有 ${COUNT} 项缺失，中断构建。缺失项：$(cat /workdir/missing-pkgs.txt /workdir/missing-files.txt 2>/dev/null | tr "\n" " ")"
               diag_repair
               exit 1
             fi
