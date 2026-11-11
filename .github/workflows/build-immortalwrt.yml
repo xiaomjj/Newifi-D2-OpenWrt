@@ -2,7 +2,7 @@
 #  ImmortalWrt 25.12 (openwrt-25.12) — newifi-d2 自动构建
 #  设计原则：
 #   1. 依赖一律走官方 feeds，不再手工克隆 PassWall（避免同名包重复定义）
-#   2. 只保留 2 个第三方源码：GeoData / TurboACC（DNS 交给 PassWall + dnsmasq，不用 MosDNS）
+#   2. 第三方源码只保留 TurboACC（不编 geo 数据、不用 MosDNS，DNS 交给 PassWall + dnsmasq）
 #   3. defconfig 之后做"硬校验"，缺包直接失败，拒绝产出残缺固件
 #   4. 全流程日志落盘 build.log，失败必留日志
 # ============================================================
@@ -107,7 +107,7 @@ jobs:
           git log -1 --format='分支 %D | %h %s'
 
       # ---------------------------------------------------------------
-      - name: 4. 安装官方 feeds 并植入 3 个第三方源码
+      - name: 4. 安装官方 feeds 并植入第三方源码（TurboACC / xray-core）
         run: |
           cd immortalwrt
 
@@ -158,14 +158,14 @@ jobs:
           fi
 
           # --- 第三方源码 ---
-          rm -rf package/luci-app-mosdns package/mosdns package/geo2txt package/v2ray-geodata package/turboacc
+          rm -rf package/luci-app-mosdns package/mosdns package/geo2txt package/turboacc
 
           # MosDNS：本固件【不包含】。客户端 DNS 由 PassWall 的 chinadns-ng 接管，
           # 路由器自身走系统 dnsmasq 直连上游，不再克隆 sbwml/luci-app-mosdns。
-          # 省下约 6MB 二进制 + 1.3MB geodata 覆盖写入，开机也少一个进程。
+          # 省下约 6MB 二进制与一个常驻进程。
 
-          # GeoData：提供 v2ray-geoip / v2ray-geosite（不是 v2ray-geodata）
-          git clone --depth=1 https://github.com/sbwml/v2ray-geodata.git package/v2ray-geodata
+          # GeoData：本固件【也不包含】。不克隆 sbwml/v2ray-geodata，也就不产
+          # v2ray-geoip(135KB) / v2ray-geosite(10.9MB)；分流转而只靠第 9 步的文本规则。
 
           # TurboACC：25.12 的 luci feed 已经没有 luci-app-turboacc
           git clone --depth=1 https://github.com/chenmozhijin/turboacc.git package/turboacc
@@ -203,8 +203,9 @@ jobs:
           echo "  ✅ 版本对齐通过"
 
           # --- 同名包去重：一律以本地源码为准 ---
-          rm -rf package/feeds/luci/luci-app-turboacc \
-                 package/feeds/packages/v2ray-geoip \
+          rm -rf package/feeds/luci/luci-app-turboacc
+          # geo 数据的源码也一起摘掉：就算哪天 .config 里冒出 =y，也拉不进镜像
+          rm -rf package/feeds/packages/v2ray-geoip \
                  package/feeds/packages/v2ray-geosite
           # MosDNS 全家（含 geo2txt）在所有位置都清掉，防止被任何依赖拖进镜像
           rm -rf package/feeds/luci/luci-app-mosdns \
@@ -213,8 +214,7 @@ jobs:
 
           # --- 源码完整性硬校验（绝不 || true）---
           MISSING_SRC=0
-          for m in package/v2ray-geodata \
-                   package/turboacc/luci-app-turboacc \
+          for m in package/turboacc/luci-app-turboacc \
                    package/feeds/luci/luci-app-passwall \
                    package/xray-core; do
             if [ -f "$m/Makefile" ]; then
@@ -778,8 +778,8 @@ jobs:
 
           # ---------- H. 规则自更新（每周六 04:30，见 crontabs）----------
           # 只刷文本规则 gfwlist/chnlist（合计约 1.4MB）：
-          #   geoip.dat / geosite.dat 是 ROM 里的 6MB 二进制库，在 32MB 闪存上原地覆盖
-          #   会把 overlay 撑爆，所以那两份只随"每周重编固件"更新。
+          #   本固件不带 geoip.dat / geosite.dat（geosite.dat 一个就 10.9MB），分流全靠这
+          #   两份文本规则加包里自带的 chnroute，运行时只需要更新这两份。
           # 下载 → 校验 → 备份 → 替换 → 重启 PassWall → 确认 xray 还活着，否则回滚。
           cat > files/usr/bin/rule-refresh << 'EOF'
           #!/bin/sh
@@ -1128,8 +1128,13 @@ jobs:
           check CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray
           check CONFIG_PACKAGE_chinadns-ng
           check CONFIG_PACKAGE_xray-core
-          check CONFIG_PACKAGE_v2ray-geoip
-          check CONFIG_PACKAGE_v2ray-geosite
+          # geo 数据不编入，反过来确认它没被别的依赖偷偷拉回来（省约 3MB 闪存）
+          if grep -q '^CONFIG_PACKAGE_v2ray-geosite=y' .config; then
+            echo "::error::geosite 又被拉进镜像了（INCLUDE_V2ray_Geodata 应为 n），白占约 3MB"
+            MISSING=1
+          else
+            echo "  ✅ geo 数据未编入（省约 3MB 闪存）"
+          fi
           if [ "$TURBO" = "true" ]; then
             check CONFIG_PACKAGE_luci-app-turboacc
           else
@@ -1148,8 +1153,7 @@ jobs:
             echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
             echo "---- feeds 里这些包是否存在（1=有，0=没有）----"
             for p in luci-app-passwall xray-core chinadns-ng dns2socks ipt2socks \
-                     microsocks tcping lyaml luci-app-turboacc \
-                     v2ray-geoip v2ray-geosite; do
+                     microsocks tcping lyaml luci-app-turboacc; do
               printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
             done
             echo "排查建议："
@@ -1164,7 +1168,7 @@ jobs:
             echo "### 📦 参与构建的关键包"
             echo ""
             echo '```'
-            grep -E '^CONFIG_PACKAGE_(luci-app-passwall|xray-core|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full|luci-app-ksmbd|zram-swap)=' .config | sort
+            grep -E '^CONFIG_PACKAGE_(luci-app-passwall|xray-core|luci-app-turboacc|dnsmasq-full|luci-app-ksmbd|zram-swap)=' .config | sort
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1209,8 +1213,8 @@ jobs:
           fetch_rule "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/china-list.txt" \
                      "$RULES/chnlist"
 
-          echo "ℹ️  GeoIP/GeoSite 不在此处下载：v2ray-geoip / v2ray-geosite 会在编译期"
-          echo "    自动拉取 geoip-only-cn-private.dat(≈90KB) 与 geosite.dat(≈1.2MB) 并校验 sha256。"
+          echo "ℹ️  本固件不编入 GeoIP/GeoSite：v2ray-geoip(135KB) 与 v2ray-geosite(10.9MB) 都不要，"
+          echo "    PassWall 只用上面两份文本规则分流，省下约 3MB 闪存。"
 
       # ---------------------------------------------------------------
       - name: 10. 下载源码包（失败重试；无进展立即中断并诊断）
@@ -1462,7 +1466,7 @@ jobs:
           [ -n "$MANIFEST" ] || { echo "::error::未找到 .manifest"; exit 2; }
           echo "包清单: $MANIFEST（$(wc -l < "$MANIFEST") 个包）"
 
-          MUST="xray-core luci-app-passwall chinadns-ng v2ray-geoip v2ray-geosite dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
+          MUST="xray-core luci-app-passwall chinadns-ng dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
           [ "$1" = "true" ] && MUST="$MUST luci-app-turboacc"
 
           echo "---- 软件包 ----"
@@ -1496,8 +1500,11 @@ jobs:
             chk xray        usr/bin/xray
             chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
             chk ksmbd-init  etc/init.d/ksmbd
-            chk geoip       usr/share/v2ray/geoip.dat
-            chk geosite     usr/share/v2ray/geosite.dat
+            if [ -e "$ROOTFS/usr/share/v2ray/geosite.dat" ]; then
+              echo "::warning::geosite.dat 仍在镜像里（约 10.9MB），检查 INCLUDE_V2ray_Geodata"
+            else
+              echo "  ✅ 未带 geo 数据（省约 3MB）"
+            fi
             chk dns-secure  usr/bin/dns-secure
             chk dns-guard   usr/bin/dns-guard
             chk uci-90      etc/uci-defaults/90-luci
@@ -1687,7 +1694,7 @@ jobs:
             echo "包总数   : ${PKG_COUNT}"
             echo ""
             echo "## 关键组件"
-            grep -E '^(luci-app-passwall|xray-core|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap) ' \
+            grep -E '^(luci-app-passwall|xray-core|luci-app-turboacc|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap) ' \
                  "$(ls -1 *.manifest | head -n1)" | sort
           } > versions.txt
           cat versions.txt
@@ -1713,7 +1720,7 @@ jobs:
             echo ""
             echo '```'
             echo "源码: openwrt-25.12 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
-            grep -E '^(luci-app-passwall|xray-core|luci-app-turboacc|v2ray-geoip|v2ray-geosite|dnsmasq-full) ' \
+            grep -E '^(luci-app-passwall|xray-core|luci-app-turboacc|dnsmasq-full) ' \
                  "$(ls -1 *.manifest | head -n1)" | sort
             echo '```'
             echo ""
@@ -1767,7 +1774,7 @@ jobs:
 
             > **固件本体是"冻结"版本**：软件版本锁定在编译时，**不自升级**；要新版本就刷入新构建。
             > **规则会自更新**：PassWall 的 gfwlist / chnlist 每周六 04:30 由 `rule-refresh` 刷新
-            > （失败自动回滚，不会把路由器停在半坏状态）。geoip/geosite 二进制库仍随固件版本。
+            > （失败自动回滚，不会把路由器停在半坏状态）。geo 数据不随固件提供，分流只用文本规则。
             >
             > 本仓库已开启**每周六 02:17（北京）定时构建**，源码每次取
             > `openwrt-25.12` / feeds / 第三方 `main` 的最新提交，所以每周都会有新 Release。
@@ -1790,7 +1797,7 @@ jobs:
               不装 geoview、不占 overlay，清单随每次构建更新）
             - **DNS**：客户端查询由 PassWall 的 chinadns-ng 接管（分流 + 去广告）；
               路由器自身走系统 dnsmasq，开机自动尝试 DoT 加密（853/TLS），
-              失败立即回滚明文、不会断网；不装 MosDNS，省约 6MB 闪存
+              失败立即回滚明文、不会断网；不装 MosDNS，省约 6MB 闪存；不编 geo 数据，再省约 3MB
             - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
