@@ -2,7 +2,7 @@
 #  ImmortalWrt 25.12 (openwrt-25.12) — newifi-d2 构建（仅手动触发）
 #  设计原则：
 #   1. 依赖一律走官方 feeds，不再手工克隆 PassWall（避免同名包重复定义）
-#   2. 第三方源码只保留 TurboACC（不编 geo 数据、不用 MosDNS，DNS 交给 PassWall + dnsmasq）
+#   2. 第三方源码只保留 TurboACC（不编 geo 数据；DNS = PassWall 分流 + MosDNS 去广告/DoH）
 #   3. defconfig 之后做"硬校验"，缺包直接失败，拒绝产出残缺固件
 #   4. 全流程日志落盘 build.log，失败必留日志
 # ============================================================
@@ -109,7 +109,7 @@ jobs:
         run: |
           cd immortalwrt
 
-          # --- 官方 feeds（PassWall / Xray / chinadns-ng 等全部由 feeds 提供）---
+          # --- 官方 feeds（PassWall / Xray / MosDNS 等全部由 feeds 提供）---
           cat > feeds.conf.default << 'EOF'
           src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
           src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
@@ -141,7 +141,7 @@ jobs:
           # --- PassWall 依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
           echo "---- PassWall 依赖预检 ----"
           DEP_MISS=0
-          for p in chinadns-ng dns2socks ipt2socks microsocks tcping lyaml \
+          for p in mosdns dns2socks ipt2socks microsocks tcping lyaml \
                    xray-core luci-compat luci-lib-jsonc; do
             if [ -d "package/feeds/packages/$p" ] || [ -d "package/feeds/luci/$p" ] \
                || [ -d "package/$p" ]; then
@@ -156,11 +156,13 @@ jobs:
           fi
 
           # --- 第三方源码 ---
-          rm -rf package/luci-app-mosdns package/mosdns package/geo2txt package/turboacc
+          rm -rf package/luci-app-mosdns package/geo2txt package/turboacc
 
-          # MosDNS：本固件【不包含】。客户端 DNS 由 PassWall 的 chinadns-ng 接管，
-          # 路由器自身走系统 dnsmasq 直连上游，不再克隆 sbwml/luci-app-mosdns。
-          # 省下约 6MB 二进制与一个常驻进程。
+          # MosDNS：用官方 feeds 里的 mosdns 二进制（5.3.x），**不装** luci-app-mosdns。
+          #   luci-app-mosdns 的 LUCI_DEPENDS 里硬写了 +v2ray-geoip +v2ray-geosite
+          #   +geo2txt，一装就会把 10.9MB 的 geosite.dat 拉回镜像；而我们只要
+          #   "域名集合 + DoH 上游"两件事，自己写 /etc/mosdns/config.yaml 就够。
+          #   服务脚本与配置由第 5 步的 files/ 覆盖层提供（C3 节）。
 
           # GeoData：本固件【也不包含】。不克隆 sbwml/v2ray-geodata，也就不产
           # v2ray-geoip(135KB) / v2ray-geosite(10.9MB)；分流转而只靠第 9 步的文本规则。
@@ -205,15 +207,16 @@ jobs:
           # geo 数据的源码也一起摘掉：就算哪天 .config 里冒出 =y，也拉不进镜像
           rm -rf package/feeds/packages/v2ray-geoip \
                  package/feeds/packages/v2ray-geosite
-          # MosDNS 全家（含 geo2txt）在所有位置都清掉，防止被任何依赖拖进镜像
+          # luci-app-mosdns 要摘掉（它的 LUCI_DEPENDS 会拉 geoip/geosite/geo2txt），
+          # 但 mosdns 二进制本身必须留着 —— 去广告和上游加密都靠它
           rm -rf package/feeds/luci/luci-app-mosdns \
-                 package/feeds/packages/mosdns \
                  package/feeds/packages/geo2txt
 
           # --- 源码完整性硬校验（绝不 || true）---
           MISSING_SRC=0
           for m in package/turboacc/luci-app-turboacc \
                    package/feeds/luci/luci-app-passwall \
+                   package/feeds/packages/mosdns \
                    package/xray-core; do
             if [ -f "$m/Makefile" ]; then
               echo "  ✅ $m"
@@ -265,69 +268,88 @@ jobs:
           EOF
 
           # ---------- B. 无线：双频开启 + 中国区 + WPA2 ----------
-          # 同样遵守铁律：无线配置不存在就完全不碰，交给系统自己生成
+          # 铁律：无线配置不存在就完全不碰，交给系统自己生成
+          # 这里的参数全都可以在路由器上用 uci set 改掉，不用重新刷机
           cat > files/etc/uci-defaults/91-wireless << 'EOF'
           #!/bin/sh
+          # 无线参数：只改“怎么用”，不改“能不能用”——每一行都能单独 uci set 覆写
+          #   为什么信道不再写死：固定 2.4G=11 / 5G=36 时，只要邻居也占这两个信道，
+          #   协商速率就会反复跌落，体感就是“时强时弱、时有时无”。
+          # 首次开机时 /etc/config/wireless 可能还没被探测出来：先让系统探测一次，
+          # 否则下面这些设置会整段跳过（用户拿到的是默认 SSID/无密码，等于没开箱即用）。
+          # 探测失败就退出，绝不手写无线配置（写错会直接没信号）。
+          if [ ! -f /etc/config/wireless ]; then
+              /sbin/wifi config >/dev/null 2>&1
+          fi
           [ -f /etc/config/wireless ] || exit 0
           uci -q get wireless.radio0 >/dev/null 2>&1 || exit 0
 
+          # ---- 2.4G：交给 ACS 在 1/6/11 里挑最空的；noscan 关掉后台扫信道造成的周期性断流 ----
           uci set wireless.radio0.disabled='0'
           uci set wireless.radio0.country='CN'
-          uci set wireless.radio0.channel='11'
+          uci set wireless.radio0.channel='auto'
           uci set wireless.radio0.htmode='HT20'
+          uci set wireless.radio0.noscan='1'
+
+          # ---- 5G：默认落在 149 段（5.8G）。两个理由：
+          #   1) CN 法规里 5.8G 的允许 EIRP 比 5.1G(36-48) 高，同样的机器穿墙更好；
+          #   2) 149-165 不是 DFS 信道，不会被雷达检测强制静默 60 秒（“突然没信号”的常见元凶）。
+          #   个别老设备不认 5.8G 的话，把下面两行改成 channel='36' 即可。
           uci set wireless.radio1.disabled='0'
           uci set wireless.radio1.country='CN'
-          uci set wireless.radio1.channel='36'
+          uci set wireless.radio1.channel='149'
           uci set wireless.radio1.htmode='VHT80'
+          uci set wireless.radio1.noscan='1'
 
+          # ---- SSID / 密码保持原样 ----
           uci set wireless.default_radio0.ssid='alon'
           uci set wireless.default_radio0.encryption='psk2'
           uci set wireless.default_radio0.key='alon12345678'
           uci set wireless.default_radio0.disabled='0'
+          # 弱信号时不要因为连续 ack 失败就踢客户端（默认会踢，表现是“时不时掉线又自己回来”）
+          uci set wireless.default_radio0.disassoc_low_ack='0'
           uci set wireless.default_radio1.ssid='alon-5G'
           uci set wireless.default_radio1.encryption='psk2'
           uci set wireless.default_radio1.key='alon12345678'
           uci set wireless.default_radio1.disabled='0'
+          uci set wireless.default_radio1.disassoc_low_ack='0'
 
           uci commit wireless
           exit 0
           EOF
 
-          # ---------- C. PassWall / TurboACC 默认参数（DNS 不再经由 MosDNS）----------
-          cat > files/etc/uci-defaults/92-services << 'EOF'
+          # ---------- C. PassWall / TurboACC 默认参数（DNS = PassWall 分流 + MosDNS 去广告/加密）----------
+          cat > files/etc/uci-defaults/92-services << "EOF"
           #!/bin/sh
-          # ---- DNS 架构：不使用 MosDNS ----
-          #   客户端   :53 → nft 劫持 → PassWall 副本 dnsmasq(11400) → chinadns-ng（分流/去广告）
-          #   路由器自身 :53 → 系统 dnsmasq → WAN 上游 DNS（直连，无插件中转）
-          # 所以这里没有任何 mosdns.* 的 uci 写入；镜像里也不存在 mosdns 包，
-          # 从旧固件"保留配置"升上来时残留的 /etc/config/mosdns 不会被任何进程读取。
-
-          # ---- PassWall ----
-          # 分流链路（任何一条都别随手改，改错会直接断网）：
-          #   局域网客户端 →53→ nft 劫持 → PassWall 副本 dnsmasq(11400)
-          #      → chinadns-ng：屏蔽列表命中 → group null（NXDOMAIN，即去广告）
-          #                     gfwlist 命中   → 走代理解析，并把结果写进 psw_gfw nftset
-          #                     其余           → 用 direct_dns(默认 223.5.5.5) 直连解析
-          # 为什么这么配：
-          #   1) dns_mode 合法值只有 udp / tcp / dns2socks / sing-box / xray。
-          #      旧配置写的 dns_mode=dnsmasq 是非法值：app.sh 的 case 没有对应分支，
-          #      NEXT_DNS_LISTEN_PORT 没人监听，而副本 dnsmasq 的
-          #      server=127.0.0.1#那个端口 → 凡是"该走代理"的域名全部解析失败。
-          #   2) dns_shunt 必须是 chinadns-ng：屏蔽列表只有走它才会编译成
-          #      group-dnl / group null；换成 dnsmasq 就只剩 address=/域名/ 的老写法。
-          #   3) dns_redirect=1：gfwlist 模式靠 DNS 劫持把域名写进 psw_gfw nftset，
-          #      关掉它等于关掉域名分流（只剩 IP 段硬碰）。
-          #   4) 不再有 MosDNS 中转：客户端查询被 nft 截到 11400 走 PassWall，
-          #      路由器自身走系统 dnsmasq(53) 直接向上游解析，两条链路互不干扰。
+          # ---- DNS 架构（三段，各管一件事，别混）----
+          #   局域网客户端 :53 → nft 劫持 → PassWall 副本 dnsmasq(@11400，每域名只有一个上游)
+          #        gfwlist 命中 → 走隧道解析（remote_dns 1.1.1.1 经代理，链路本身已加密）
+          #                      → 同时把结果写进 psw_gfw nftset（域名分流靠它）
+          #        其余         → 127.0.0.1#5335 MosDNS
+          #   路由器自身 :53 → 系统 dnsmasq → 127.0.0.1#5335 MosDNS
+          #   MosDNS(5335)  → 广告域名集合命中：返回 0.0.0.0
+          #                   未命中：DoH 上游（阿里/腾讯）加密解析 + 进程内缓存
+          # 为什么这么配（都是踩过的坑）：
+          #   1) dns_shunt 必须用 dnsmasq，不能用 chinadns-ng：chinadns-ng 对每个域名
+          #      同时问"本地"和"代理侧"，本地(MosDNS)给出 0.0.0.0/NXDOMAIN 时它会改用
+          #      代理侧的真实应答 —— 广告又被解析出来了。dnsmasq 模式下每域名只有一个
+          #      上游，广告命中就是终局。
+          #   2) use_block_list 关掉：去广告统一交给 MosDNS，两边各存一份 11 万条清单
+          #      只会白占约 10MB 内存（本机总共 128MB）。
+          #   3) dns_redirect=1 必须留着：gfwlist 模式靠 DNS 劫持把域名写进 psw_gfw nftset，
+          #      关掉等于关掉域名分流，只剩 IP 段硬碰。
+          #   4) dns_mode 合法值只有 udp / tcp / dns2socks / sing-box / xray；
+          #      旧配置里的 dns_mode=dnsmasq 是非法值（app.sh 的 case 没有这个分支），
+          #      后果是"该走代理的域名全部解析失败"。
           if uci -q get passwall.@global[0] >/dev/null 2>&1; then
               uci set passwall.@global[0].enabled='1'
               uci set passwall.@global[0].tcp_proxy_mode='gfwlist'
               uci set passwall.@global[0].udp_proxy_mode='gfwlist'
-              uci set passwall.@global[0].dns_shunt='chinadns-ng'
+              uci set passwall.@global[0].dns_shunt='dnsmasq'
               uci set passwall.@global[0].dns_mode='tcp'
               uci set passwall.@global[0].remote_dns='1.1.1.1'
               uci set passwall.@global[0].dns_redirect='1'
-              uci set passwall.@global[0].use_block_list='1'
+              uci set passwall.@global[0].use_block_list='0'
               uci set passwall.@global[0].tcp_fastopen='1'
               uci commit passwall
           fi
@@ -378,260 +400,185 @@ jobs:
               uci commit firewall
           fi
 
-          # ---- 系统 dnsmasq：缓存条数 150 → 1000 ----
-          #   路由器自身查询走 dnsmasq(53)；1000 条约 100~200KB 内存，命中率明显更高。
-          #   （dns-recover 清掉 cachesize 后也会重新写回 1000，见该脚本）
+          # ---- 系统 dnsmasq：上游固定指向 MosDNS ----
+          #   只留一条 server=：PassWall 的副本 dnsmasq 会把 dhcp.@dnsmasq[0] 的
+          #   server=（不含 server=/域名/ 那些）当成自己的默认上游（app.sh 的 get_local_dns），
+          #   所以这一条同时决定"客户端的非 gfwlist 查询"和"路由器自身查询"都走 MosDNS。
           if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
-              uci set dhcp.@dnsmasq[0].cachesize='1000'
-              uci commit dhcp
+              uci -q delete dhcp.@dnsmasq[0].server
+              uci -q add_list dhcp.@dnsmasq[0].server="127.0.0.1#5335"
+              uci -q set dhcp.@dnsmasq[0].noresolv="1"
+              # 0.0.0.0 这类应答会被 rebind 保护拦掉，去广告就失效了
+              uci -q set dhcp.@dnsmasq[0].rebind_protection="0"
+              uci -q set dhcp.@dnsmasq[0].cachesize="1000"
+              uci -q commit dhcp
           fi
 
           # ---- 只 enable，不在这里 start（此时网络还没起来）----
-          for s in ksmbd p910nd zram cron; do
+          for s in ksmbd p910nd zram cron mosdns; do
               [ -x "/etc/init.d/$s" ] && /etc/init.d/$s enable
           done
           exit 0
           EOF
 
-          # ---------- C2. DNS 应急回滚：一条命令停掉 PassWall，把 53 还给 dnsmasq ----------
-          # 万一 DNS 出问题（网页打不开但能 ping 通 IP），SSH 里执行 dns-recover 即可
-          cat > files/usr/bin/dns-recover << 'EOF'
+          # ---------- C2. DNS 应急回滚：一条命令把 DNS 拉回可用状态 ----------
+          # 网页打不开但能 ping 通 IP 时，SSH 执行 dns-recover
+          cat > files/usr/bin/dns-recover << "EOF"
           #!/bin/sh
-          # 应急回滚：停掉 PassWall 的 DNS 接管，让所有查询回到 dnsmasq 直连
-          #   正常情况下客户端 :53 被 nft 劫持到 11400（chinadns-ng 分流）；
-          #   这里停掉 PassWall 并清残留 nft 链，再把 dnsmasq 的上游还原。
-          
-          echo "== 1/2 停用 PassWall =="
-          uci -q set passwall.@global[0].enabled='0'
+          # 应急回滚：三步，任何一步失败都继续往下退，绝不断网
+          #   1) 停 PassWall：解除 53 劫持（否则客户端查询被劫到没人监听的端口）
+          #   2) 确认 MosDNS 在跑（它挂了 dnsmasq 就没有上游可用）
+          #   3) dnsmasq 上游指回 MosDNS；MosDNS 也起不来就退回 WAN 明文上游
+
+          echo "== 1/3 停用 PassWall（解除 53 劫持）=="
+          uci -q set passwall.@global[0].enabled="0"
           uci -q commit passwall
           /etc/init.d/passwall stop 2>/dev/null
           # 兜底：PassWall 异常退出时可能残留 nft 链，重启防火墙一次清干净
           /etc/init.d/firewall restart 2>/dev/null
-          
-          echo "== 2/2 让 dnsmasq 直连上游 =="
-          # 旧固件（MosDNS 时代）会往 dnsmasq 塞 127.0.0.1#5335，可能有重复项，循环删干净
-          while uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5335'; do :; done
-          # noresolv=1 说明上游是 dns-secure 配的加密 DNS，别顺手关掉
-          if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "1" ]; then
-              uci -q set dhcp.@dnsmasq[0].noresolv='0'
+
+          echo "== 2/3 确认 MosDNS =="
+          if pidof mosdns >/dev/null 2>&1; then
+              echo "   MosDNS 运行中"
+          else
+              echo "   MosDNS 未运行，尝试启动"
+              /etc/init.d/mosdns restart 2>/dev/null
+              sleep 3
           fi
-          uci -q set dhcp.@dnsmasq[0].cachesize='1000'
+
+          echo "== 3/3 让 dnsmasq 指向 MosDNS =="
+          uci -q delete dhcp.@dnsmasq[0].server
+          uci -q add_list dhcp.@dnsmasq[0].server="127.0.0.1#5335"
+          uci -q set dhcp.@dnsmasq[0].noresolv="1"
+          uci -q set dhcp.@dnsmasq[0].rebind_protection="0"
+          uci -q set dhcp.@dnsmasq[0].cachesize="1000"
           uci -q commit dhcp
           /etc/init.d/dnsmasq restart
           sleep 2
-          
+
           if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
-              echo "✅ DNS 已恢复（PassWall 已停用，dnsmasq 直连上游）"
-              echo "   排查完想恢复原状：uci set passwall.@global[0].enabled=1 && uci commit passwall && /etc/init.d/passwall restart"
+              echo "✅ DNS 可用（PassWall 已停用，dnsmasq → MosDNS）"
+              echo "   想恢复代理：uci set passwall.@global[0].enabled=1 && uci commit passwall && /etc/init.d/passwall restart"
+              exit 0
+          fi
+
+          echo "   MosDNS 这条路也不通，退回 WAN 明文上游"
+          uci -q delete dhcp.@dnsmasq[0].server
+          uci -q set dhcp.@dnsmasq[0].noresolv="0"
+          uci -q commit dhcp
+          /etc/init.d/dnsmasq restart
+          sleep 2
+          if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+              echo "✅ DNS 已恢复（明文上游）。MosDNS 的问题看 logread | grep mosdns"
           else
-              # dns-recover 的承诺是"一定能上网"：DoT 要是坏了就退回明文再试一次
-              if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
-                  echo "   解析失败，先关掉 DoT 再试一次"
-                  /usr/bin/dns-secure off >/dev/null 2>&1
-                  sleep 2
-              fi
-              if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
-                  echo "✅ DNS 已恢复（已退回 WAN 明文上游）"
-              else
-                  echo "⚠️ 仍无法解析，可能 WAN 断线。执行 logread | tail -n 50 看日志"
-              fi
+              echo "⚠️ 仍无法解析，多半是 WAN 断线。执行 logread | tail -n 50 看日志"
           fi
           exit 0
           EOF
 
-          # ---------- C3. 加密 DNS（DoT）+ 劫持状态守护 ----------
-          # 补上两个"不合逻辑"的地方：
-          #   1) PassWall 只管局域网客户端的 53；路由器自己（升级、NTP、插件）走的是
-          #      dnsmasq -> WAN 明文上游。PassWall 一关，客户端也落回这条路。
-          #      dns-secure 把 dnsmasq 上游换成 DoT（853/TLS），自检失败自动回滚明文。
-          #   2) dns_redirect=1 但 chinadns-ng 没跑（典型：刚刷机还没导入节点）时，
-          #      53 被劫到没人监听的端口 = 全家断 DNS。dns-guard 让"劫持状态"始终与
-          #      "PassWall 是否真的可用"一致：不可用就先把 53 还给 dnsmasq。
-          cat > files/usr/bin/dns-secure << 'EOF'
-          #!/bin/sh
-          # 路由器自身的加密 DNS（DoT）
-          #   背景：PassWall 的 53 劫持只作用于局域网客户端；路由器自己（opkg 升级、NTP、
-          #   插件下载）走 dnsmasq -> WAN 下发的上游，默认是明文，ISP 能看到查询内容；
-          #   PassWall 一关，客户端也落回这条链路。
-          #   做法：dnsmasq-full 若编译了 DNSSEC 就具备 DoT 能力（server=IP#853 走 TLS），
-          #   把它设成唯一上游，再跑一次真实解析自检，不通立即回滚，绝不断网。
-          #   用法：dns-secure [on|off|status]；开机/巡检用 --boot / --check
-          SERVERS="223.5.5.5#853 223.6.6.6#853"
-          MARK=/etc/dns-secure.on
-          LOG=/var/log/dns-secure.log
+          # ---------- C3. MosDNS：去广告 + 上游加密（本固件唯一的 DNS 增强组件）----------
+          # 只装 feeds 里的 mosdns 二进制，不装 luci-app-mosdns（它会把 10.9MB 的
+          # geosite.dat 拉回来）。服务脚本和配置都由这里覆盖进镜像：
+          #   /etc/init.d/mosdns       —— 覆盖软件包自带的那份（绝对路径 + procd 守护）
+          #   /etc/mosdns/config.yaml  —— 去广告 + DoH
+          #   /etc/mosdns/adblock.txt  —— 构建期下载的广告域名（见 K 节）
+          mkdir -p files/etc/mosdns files/etc/init.d
+          cat > files/etc/init.d/mosdns << "EOF"
+          #!/bin/sh /etc/rc.common
+          # MosDNS 服务脚本（覆盖 mosdns 软件包自带的那份）
+          #   自带脚本写的是 -c ./config.yaml，靠 mosdns 自己先 chdir 才找得到配置；
+          #   这里全用绝对路径。它不做 nft 劫持（53 归 PassWall）、也不改 dnsmasq
+          #   （上游由 92-services 固定写好），职责单一，出问题好排查。
+          START=18
+          USE_PROCD=1
+          PROG=/usr/bin/mosdns
+          CONF=/etc/mosdns/config.yaml
+          DIR=/etc/mosdns
 
-          log() {
-              echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null
-              logger -t dns-secure "$*" 2>/dev/null
-              return 0
+          start_service() {
+              [ -x "$PROG" ] || { logger -t mosdns "找不到 $PROG"; return 1; }
+              [ -f "$CONF" ] || { logger -t mosdns "找不到 $CONF"; return 1; }
+              procd_open_instance mosdns
+              procd_set_param command "$PROG" start -c "$CONF" -d "$DIR"
+              procd_set_param env QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_set_param respawn 3600 5 0
+              procd_close_instance
           }
 
-          dot_supported() {
-              dnsmasq --version 2>/dev/null | grep -q DNSSEC
+          reload_service() {
+              stop
+              sleep 1
+              start
           }
-
-          dot_active() {
-              [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ] || return 1
-              uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q '#853'
-          }
-
-          dot_reachable() {
-              # 先摸一下 853 通不通；不通就别折腾 dnsmasq（省一段开机空窗）
-              if command -v nc >/dev/null 2>&1; then
-                  nc -w 4 223.5.5.5 853 </dev/null >/dev/null 2>&1
-              else
-                  return 0
-              fi
-          }
-
-          dns_ok() {
-              _i=0
-              while [ "$_i" -lt 3 ]; do
-                  if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
-                      nslookup www.github.com 127.0.0.1 >/dev/null 2>&1 && return 0
-                  fi
-                  _i=$((_i + 1))
-                  sleep 4
-              done
-              return 1
-          }
-
-          rollback() {
-              for _s in $SERVERS; do
-                  uci -q del_list dhcp.@dnsmasq[0].server="$_s"
-              done
-              uci -q delete dhcp.@dnsmasq[0].noresolv
-              uci -q commit dhcp
-              rm -f "$MARK"
-              /etc/init.d/dnsmasq restart >/dev/null 2>&1
-              log "已回滚为明文上游（WAN 下发），DNS 不会断"
-          }
-
-          enable() {
-              if ! dot_supported; then
-                  log "当前 dnsmasq 没有 DNSSEC/DoT 支持，保持 WAN 明文上游"
-                  return 1
-              fi
-              if ! dot_reachable; then
-                  log "上游 853 不可达（被拦或不在直连范围），保持 WAN 明文上游"
-                  return 1
-              fi
-              for _s in $SERVERS; do
-                  uci -q del_list dhcp.@dnsmasq[0].server="$_s"
-              done
-              for _s in $SERVERS; do
-                  uci add_list dhcp.@dnsmasq[0].server="$_s"
-              done
-              uci set dhcp.@dnsmasq[0].noresolv='1'
-              uci commit dhcp
-              /etc/init.d/dnsmasq restart >/dev/null 2>&1
-              sleep 4
-              if dns_ok; then
-                  date '+%F %T' > "$MARK" 2>/dev/null
-                  log "DoT 已启用：路由器自身查询走 853/TLS，不再明文出网"
-                  return 0
-              fi
-              log "DoT 自检失败（853 被拦或上游证书不被接受），回滚明文"
-              rollback
-              return 1
-          }
-
-          case "$1" in
-              off)
-                  rollback
-                  echo "已关闭 DoT，dnsmasq 回到 WAN 下发的明文上游"
-                  ;;
-              status)
-                  if dot_active; then
-                      echo "DoT：已开启（上游 $(uci -q get dhcp.@dnsmasq[0].server | tr '\n' ' ')）"
-                  elif dot_supported; then
-                      echo "DoT：未开启（dnsmasq 支持，执行 dns-secure 打开）"
-                  else
-                      echo "DoT：不支持（dnsmasq 未编译 DNSSEC）"
-                  fi
-                  ;;
-              --boot)
-                  [ -f "$MARK" ] && exit 0
-                  dot_active && exit 0
-                  _w=0
-                  while [ "$_w" -lt 18 ]; do
-                      ip route 2>/dev/null | grep -q '^default' && break
-                      sleep 10
-                      _w=$((_w + 1))
-                  done
-                  ip route 2>/dev/null | grep -q '^default' || exit 0
-                  sleep 3
-                  enable || true
-                  ;;
-              --check)
-                  dot_active || exit 0
-                  dns_ok && exit 0
-                  log "DoT 健康检查失败，回滚明文保证可用"
-                  rollback
-                  ;;
-              ""|on)
-                  enable
-                  ;;
-              *)
-                  echo "用法: dns-secure [on|off|status]"
-                  ;;
-          esac
-          exit 0
           EOF
 
-          cat > files/usr/bin/dns-guard << 'EOF'
-          #!/bin/sh
-          # DNS 劫持状态守护
-          #   要防的场景：PassWall 的 nft 规则把客户端 53 劫到 11400，但 chinadns-ng 没起来
-          #   （最常见：刚刷机还没导入节点）。这时查询没人应答 = 能 ping 通 IP 却打不开网页。
-          #   策略（幂等，不会来回抖）：
-          #     1) chinadns-ng 在跑：什么都不用做；若曾因故障关过劫持，这里恢复并重启 PassWall
-          #     2) chinadns-ng 没跑：先重启一次 PassWall；还不行就把 53 还给 dnsmasq，
-          #        保证全家不断网，等节点装好后自动恢复
-          MARK=/etc/passwall/.dns_guard_down
+          cat > files/etc/mosdns/config.yaml << "EOF"
+          # MosDNS 5.x 配置 —— 只干两件事：去广告、把上游换成 DoH（加密）
+          # 链路：客户端 / 系统 dnsmasq → 127.0.0.1:5335
+          #         广告域名 → 返回 0.0.0.0（集合来自 /etc/mosdns/adblock.txt）
+          #         其他     → DoH（阿里 / 腾讯）+ 进程内缓存
+          # 只监听回环地址：局域网和外网都碰不到它，53 劫持仍由 PassWall 负责。
+          log:
+            level: error
 
-          _uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)
-          if [ -n "$_uptime" ] && [ "$_uptime" -lt 120 ]; then
-              exit 0
-          fi
+          plugins:
+            - tag: ad_domains
+              type: domain_set
+              args:
+                files:
+                  - /etc/mosdns/adblock.txt
 
-          uci -q get passwall.@global[0] >/dev/null 2>&1 || exit 0
+            # 缓存只放内存（不写 dump 文件）：32MB 闪存经不起频繁写
+            - tag: cache
+              type: cache
+              args:
+                size: 8192
 
-          _enabled=$(uci -q get passwall.@global[0].enabled)
-          _redirect=$(uci -q get passwall.@global[0].dns_redirect)
-          [ -n "$_redirect" ] || _redirect=0
+            # 加密上游：DoH。地址用 IP 而不是域名 —— 免得"解析自己"打死自己
+            # （223.5.5.5 是阿里 DoH，1.12.12.12 是腾讯 DoH，证书都含 IP SAN）
+            - tag: forward_doh
+              type: forward
+              args:
+                concurrent: 2
+                upstreams:
+                  - addr: "https://223.5.5.5/dns-query"
+                  - addr: "https://1.12.12.12/dns-query"
 
-          if pidof chinadns-ng >/dev/null 2>&1; then
-              if [ "$_redirect" != "1" ] && [ -f "$MARK" ]; then
-                  uci set passwall.@global[0].dns_redirect='1'
-                  uci commit passwall
-                  rm -f "$MARK"
-                  logger -t dns-guard "chinadns-ng 已就绪，恢复 53 劫持并重启 PassWall"
-                  /etc/init.d/passwall restart >/dev/null 2>&1
-              fi
-              exit 0
-          fi
+            # 明文兜底：只在 DoH 完全没应答时用（典型场景：刚开机还没校时，
+            # TLS 证书校验必失败）。宁可这一次明文，也不要整个局域网 DNS 停摆。
+            - tag: forward_plain
+              type: forward
+              args:
+                concurrent: 2
+                upstreams:
+                  - addr: "223.5.5.5"
+                  - addr: "119.29.29.29"
 
-          # 已经在"暂不接管"状态：只等上面的复活分支，不再反复重启
-          [ -f "$MARK" ] && exit 0
-          [ "$_enabled" = "1" ] || exit 0
+            - tag: main
+              type: sequence
+              args:
+                - matches: "qname $ad_domains"
+                  exec: "black_hole 0.0.0.0 ::"
+                - exec: $cache
+                - matches: has_resp
+                  exec: accept
+                - exec: $forward_doh
+                - matches: has_resp
+                  exec: accept
+                - exec: $forward_plain
 
-          logger -t dns-guard "chinadns-ng 未运行，重启 PassWall 尝试恢复"
-          /etc/init.d/passwall restart >/dev/null 2>&1
-          sleep 15
-          if pidof chinadns-ng >/dev/null 2>&1; then
-              logger -t dns-guard "PassWall 已恢复，53 劫持正常"
-              exit 0
-          fi
-
-          uci set passwall.@global[0].dns_redirect='0'
-          uci commit passwall
-          mkdir -p /etc/passwall 2>/dev/null
-          # 目录写不进去就退到 /tmp，否则 MARK 永远不存在 = 每 5 分钟重启一次 PassWall
-          date '+%F %T' > "$MARK" 2>/dev/null || { MARK=/tmp/dns_guard_down; date '+%F %T' > "$MARK" 2>/dev/null; }
-          logger -t dns-guard "PassWall 起不来（多半没有可用节点），临时关闭 53 劫持；装好节点后自动恢复"
-          /etc/init.d/firewall reload >/dev/null 2>&1
-          exit 0
+            - tag: udp_server
+              type: udp_server
+              args:
+                entry: main
+                listen: "127.0.0.1:5335"
+            - tag: tcp_server
+              type: tcp_server
+              args:
+                entry: main
+                listen: "127.0.0.1:5335"
           EOF
 
           # ---------- D. USB 网卡 / 随身 WiFi 热插拔自动挂 WAN ----------
@@ -746,10 +693,8 @@ jobs:
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
           # 本固件不做任何自动下载：gfwlist / chnlist / chnroute / 广告清单全部在构建期
           # 打进镜像，运行时一个字节都不从网上下。真要手动刷一次：SSH 执行 rule-refresh。
-          # 每 5 分钟校正一次"PassWall 是否真的接管了 53"：没节点时别让全家断 DNS
-          */5 * * * * /usr/bin/dns-guard
-          # 每 6 小时确认加密上游还活着；被拦就回滚明文（宁可明文，不可断网）
-          23 */6 * * * /usr/bin/dns-secure --check
+          # 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
+          */10 * * * * pidof mosdns >/dev/null 2>&1 || /etc/init.d/mosdns restart
           EOF
 
           # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
@@ -768,7 +713,7 @@ jobs:
 
           # ---- 自愈看门狗（后台，20 秒后检查一次）----
           # 1) LAN 段不完整 → 自动补齐并重载网络（这是"全家断网"的兜底）
-          # 2) dnsmasq 没跑 → 重启一次；还起不来只记日志（"53 劫不劫持"由 dns-guard 统一决策）
+          # 2) dnsmasq 没跑 → 重启一次；还起不来只记日志（"53 劫不劫持"由 PassWall 自己决策）
           (
               sleep 20
               _dirty=0
@@ -797,16 +742,16 @@ jobs:
                   /etc/init.d/dnsmasq restart
                   sleep 3
                   if ! pidof dnsmasq >/dev/null 2>&1; then
-                      # "要不要劫持 53"归 dns-guard 管：两个看门狗各改各的会互相覆盖
+                      # 53 劫持归 PassWall 自己管，这里别动 dns_redirect
                       logger -t netguard "dnsmasq 仍起不来，检查 /tmp/resolv.conf.d 与 WAN 上游"
                   fi
               fi
           ) &
 
-          # ---- 加密 DNS：等 WAN 拿到地址后再试，失败自动回滚，不会断网 ----
-          ( sleep 25; /usr/bin/dns-secure --boot ) &
-          # ---- 劫持守护：PassWall 没节点/没起来时把 53 还给 dnsmasq ----
-          ( sleep 40; /usr/bin/dns-guard ) &
+          # ---- MosDNS：等 WAN 起来、NTP 校时完成后再重启一次 ----
+          # DoH 要校验证书，开机头几十秒时钟还是 1970 年，握手必失败（此时走明文兜底）；
+          # 重启一次让它切回加密上游。
+          ( sleep 25; /etc/init.d/mosdns restart ) &
 
           exit 0
           EOF
@@ -892,12 +837,13 @@ jobs:
 
           [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ok "ip_forward=1" || ng "ip_forward≠1"
           [ "$(uci -q get passwall.@global[0].enabled)" = "1" ] && ok "PassWall 已启用" || ng "PassWall 未启用"
-          [ "$(uci -q get passwall.@global[0].dns_shunt)" = "chinadns-ng" ] && ok "DNS 分流器=chinadns-ng" || ng "DNS 分流器不是 chinadns-ng"
-          [ "$(uci -q get passwall.@global[0].use_block_list)" = "1" ] && ok "屏蔽列表已启用" || ng "屏蔽列表未启用"
-          BLOCK_N=$(wc -l < /etc/passwall/rules/block_host 2>/dev/null | tr -d ' ')
-          [ -n "$BLOCK_N" ] || BLOCK_N=0
-          [ "$BLOCK_N" -ge 50000 ] && ok "屏蔽列表 $BLOCK_N 条" || ng "屏蔽列表异常（$BLOCK_N 条）"
-          t "chinadns-ng 运行中" pidof chinadns-ng
+          [ "$(uci -q get passwall.@global[0].dns_shunt)" = "dnsmasq" ] && ok "DNS 分流器=dnsmasq" || ng "DNS 分流器不是 dnsmasq"
+          [ "$(uci -q get passwall.@global[0].use_block_list)" = "0" ] && ok "PassWall 屏蔽列表已关（去广告归 MosDNS）" || ng "PassWall 屏蔽列表没关"
+          t "MosDNS 运行中"       pidof mosdns
+          if netstat -lnu 2>/dev/null | grep -q ":5335"; then ok "MosDNS 监听 5335"; else ng "5335 没有监听"; fi
+          AD_N=$(wc -l < /etc/mosdns/adblock.txt 2>/dev/null | tr -d " ")
+          [ -n "$AD_N" ] || AD_N=0
+          [ "$AD_N" -ge 50000 ] && ok "广告域名 $AD_N 条" || ng "广告域名清单异常（$AD_N 条）"
           # 规则文件必须齐：gfwlist / chnlist / chnroute 都是构建期写进镜像的，运行时不下载
           for _f in gfwlist chnlist chnroute; do
               if [ -s "/usr/share/passwall/rules/$_f" ]; then ok "规则 $_f 已内置"; else ng "规则 $_f 缺失"; fi
@@ -912,9 +858,14 @@ jobs:
           [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "1000" ] \
               && ok "dnsmasq 缓存 1000 条" || ng "dnsmasq 缓存未调到 1000"
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
-              ok "路由器 DNS 上游=DoT 加密"
+              ok "dnsmasq 只走 MosDNS（noresolv=1）"
           else
-              ng "路由器 DNS 上游=明文（执行 dns-secure 可加密）"
+              ng "dnsmasq 没锁定上游（noresolv 不是 1）"
+          fi
+          if uci -q show dhcp.@dnsmasq[0] | grep -q "127.0.0.1#5335"; then
+              ok "dnsmasq 上游=127.0.0.1#5335"
+          else
+              ng "dnsmasq 上游没指向 MosDNS（执行 dns-recover 可修）"
           fi
           [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ] && ok "BBR 生效" || ng "BBR 未生效"
           [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
@@ -923,6 +874,93 @@ jobs:
           echo
           printf '通过 %d 项，失败 %d 项\n' "$P" "$F"
           if [ "$F" -eq 0 ]; then echo "🎉 一切正常"; else echo "⚠️  有失败项，按上面 ❌ 对应功能排查"; fi
+          exit 0
+          EOF
+
+          # ---------- I2. 无线诊断（刷机后 SSH 执行 wifi-doctor）----------
+          # 128MB 小机器上“信号弱 / 时有时无”最常见的原因不是硬件，而是：信道被邻居占满、
+          # 法规域把功率压低、内存被吃光（OOM 杀 hostapd）、驱动/firmware 报错。
+          # 这个脚本只读，不碰任何配置，把判断依据一次全打印出来。
+          cat > files/usr/bin/wifi-doctor << 'EOF'
+          #!/bin/sh
+          # wifi-doctor：判断“信号弱 / 时有时无”到底是信道拥挤、法规限功率、内存被吃光，
+          # 还是驱动报错。只读脚本，不改任何配置。用法：SSH 登录后执行  wifi-doctor
+
+          command -v iw >/dev/null 2>&1 || { echo '缺少 iw（opkg install iw 后重试）'; exit 1; }
+          printf '\n===== Newifi-D2 无线诊断 =====\n\n'
+
+          echo '--- 1. 法规域（决定允许的最大发射功率）---'
+          if iw reg get 2>/dev/null | grep -q 'country 00'; then
+              echo '  ✗ country 00：法规域没设置，驱动会把功率压到最低档'
+          else
+              iw reg get 2>/dev/null | sed -n '1,4p' | sed 's/^/  /'
+          fi
+
+          IFACES=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
+
+          echo
+          echo '--- 2. 网卡 / 信道 / 带宽 / 发射功率 ---'
+          if [ -z "$IFACES" ]; then
+              echo '  ✗ 没有无线接口：无线被禁用或驱动没加载（看第 5 节 dmesg）'
+          else
+              for d in $IFACES; do
+                  iw dev "$d" info 2>/dev/null | awk -v D="$d" '
+                      /ssid/ { s=$2 }
+                      /channel/ { c=$2; for (i=1;i<=NF;i++) if ($i ~ /^width:/) w=$(i+1) }
+                      /txpower/ { p=$2 }
+                      END {
+                          if (!p) p="驱动未上报"; else p=p" dBm"
+                          printf "  %-6s ssid=%-18s 信道=%-4s 宽=%s 功率=%s\n", D, (s?s:"未启用/未关联"), (c?c:"?"), (w?w"MHz":"?"), p
+                          if (p+0 > 0 && p+0 < 15) print "        ✗ 功率低于 15dBm，属于被法规/驱动压过"
+                      }'
+              done
+          fi
+
+          echo
+          echo '--- 3. 信道占用率（只看 >=30% 的，>60% 就是“信号满格也卡”）---'
+          for d in $IFACES; do
+              iw dev "$d" survey dump 2>/dev/null | awk -v D="$d" '
+                  /frequency:/ { f=$2 }
+                  /channel active time:/ { a[f]=$4 }
+                  /channel busy time:/ { b[f]=$4 }
+                  END {
+                      for (k in a) if (a[k] > 0) {
+                          p = int(b[k]*100/a[k])
+                          if (p >= 60) printf "  %s %s MHz 占用 %d%%  <== 太挤，换信道\n", D, k, p
+                          else if (p >= 30) printf "  %s %s MHz 占用 %d%%\n", D, k, p
+                      }
+                  }'
+          done
+
+          echo
+          echo '--- 4. 已连客户端信号（低于 -70dBm 就是弱，-80 以下基本不可用）---'
+          for d in $IFACES; do
+              iw dev "$d" station dump 2>/dev/null | awk -v D="$d" '
+                  /^Station/ { m=$2 }
+                  /signal:/ { printf "  %s %s %s dBm\n", D, m, $2 }'
+          done
+
+          echo
+          echo '--- 5. 内存 / 驱动 ---'
+          if [ -r /proc/meminfo ]; then
+              awk '/MemAvailable/{printf "  可用内存：%d MB / 128 MB\n", $2/1024}' /proc/meminfo
+          else
+              echo '  读不到 /proc/meminfo'
+          fi
+          OOM=$(dmesg 2>/dev/null | grep -ciE "out of memory|killed process")
+          if [ "${OOM:-0}" -gt 0 ]; then
+              echo "  ✗ 内核出现过 ${OOM} 次 OOM：内存被吃光时 mt76/hostapd 会被杀，无线会凭空消失几秒"
+          fi
+          dmesg 2>/dev/null | grep -iE 'mt76|ieee80211|hostapd|firmware' | tail -n 10 | sed 's/^/  /'
+
+          echo
+          echo '--- 6. 怎么办 ---'
+          echo '  功率低      → wireless.radio0/1.country 必须是 CN（第 1 节看法规域）'
+          echo '  信道挤      → uci set wireless.radio0.channel=1（或 6/11）；wifi reload'
+          echo '  弱处掉线    → uci set wireless.default_radio0.disassoc_low_ack=0；wifi reload'
+          echo '  覆盖不够    → uci set wireless.radio1.htmode=VHT40；wifi reload'
+          echo '  内存不足    → 少装插件，或把屏蔽列表从 11 万条降到 5 万条后重新构建'
+          echo
           exit 0
           EOF
 
@@ -963,20 +1001,24 @@ jobs:
           <p>模式已设为 gfwlist：名单内走代理，其余直连。</p>
 
           <h2>4. DNS 与去广告</h2>
-          <p>客户端 DNS 由 PassWall 接管：chinadns-ng 分流（国内直连 / 国外走代理），
-             所以"该不该走代理"是按域名判断的。</p>
-          <p><b>去广告已开启</b>：PassWall「屏蔽列表」内置 anti-AD 规则（约 11 万条域名，
-             构建时打入固件，运行时不联网更新），命中直接返回 NXDOMAIN。</p>
-          <p>想临时增删某条：服务 → PassWall → 规则列表 → 屏蔽列表（每行一个域名）。
-             路由器自身的查询走系统 dnsmasq（53 → WAN 上游，默认明文）。</p>
-          <p><b>路由器自身可以加密</b>：SSH 执行 <code>dns-secure</code> 会把 dnsmasq 的上游换成
-             DoT（853/TLS，阿里 DNS）；开机也会自动试一次，853 被拦就自检失败、立刻回滚明文，
-             不会把 DNS 弄死。看状态：<code>dns-secure status</code>；长期用明文：<code>dns-secure off</code>。</p>
-          <div class="warn">PassWall 没启用 / 还没导入节点时，固件会在 5 分钟内自动把 53 还给 dnsmasq，
-             上网不受影响；节点导入并应用后也会自动恢复劫持（最多等 5 分钟，急用可 SSH 执行 <code>dns-guard</code>）。</div>
-          <div class="warn">去广告依赖 PassWall 在运行：PassWall 一停，既不走代理也不拦广告。</div>
-          <p>网站/App 突然打不开，多半是分流规则误判：SSH 执行 <code>dns-recover</code> 会把 PassWall 停掉、把 53 还给 dnsmasq（代理同时失效，属于应急手段）。</p>
-
+          <p>DNS 分三段，各管一件事：</p>
+          <table>
+          <tr><th>环节</th><th>谁负责</th></tr>
+          <tr><td>客户端 53 劫持 + 按域名分流</td><td>PassWall（副本 dnsmasq，gfwlist 命中走隧道解析）</td></tr>
+          <tr><td>去广告 + 上游加密</td><td>MosDNS（127.0.0.1:5335，广告域名返回 0.0.0.0，其余走 DoH）</td></tr>
+          <tr><td>本机缓存</td><td>系统 dnsmasq（上游只有一条：MosDNS）</td></tr>
+          </table>
+          <p><b>去广告</b>：清单在 /etc/mosdns/adblock.txt（约 11 万条域名，构建时打入固件，
+             运行时不联网），命中直接返回 0.0.0.0。PassWall 自带的「屏蔽列表」已关闭，
+             两边不重复存清单（128MB 内存省下约 10MB）。</p>
+          <p><b>上游加密</b>：MosDNS 用阿里 / 腾讯的 DoH，明文只在校验失败时兜底一次
+             （典型场景：刚开机还没校时）。看状态：<code>logread | grep mosdns</code>。</p>
+          <div class="warn">gfwlist 里的域名由 PassWall 经隧道解析，不经过 MosDNS，
+             所以挂在被代理域名下的广告子域拦不到（正常网站基本不受影响）。</div>
+          <p>广告没被拦：SSH 执行 <code>fw-selftest</code> 看「广告域名 N 条」，清单本体是
+             <code>/etc/mosdns/adblock.txt</code>；改完执行 <code>/etc/init.d/mosdns restart</code>。</p>
+          <p>网页打不开：SSH 执行 <code>dns-recover</code>，会停掉 PassWall 的劫持并让 dnsmasq
+             直连 MosDNS；MosDNS 也不通时自动退回 WAN 明文上游。</p>
           <h2>5. 文件共享 / 打印</h2>
           <table>
           <tr><td>共享</td><td>插上 U 盘后访问 <code>\\192.168.2.1\usb</code>（/mnt/sda1，匿名可写）</td></tr>
@@ -990,7 +1032,7 @@ jobs:
           <table><tr><th>现象</th><th>处理</th></tr>
           <tr><td>能 ping 通 IP、网页打不开</td><td>SSH 执行 <code>dns-recover</code></td></tr>
           <tr><td>某个 App 突然不通</td><td>SSH 执行 <code>dns-recover</code>，或检查 PassWall 分流规则</td></tr>
-          <tr><td>广告还在（没被拦）</td><td>SSH 执行 <code>fw-selftest</code> 看「屏蔽列表 N 条」；再进 服务 → PassWall → 规则列表 → 屏蔽列表 确认条目存在</td></tr>
+          <tr><td>广告还在（没被拦）</td><td><code>fw-selftest</code> 看「广告域名 N 条」；清单在 <code>/etc/mosdns/adblock.txt</code></td></tr>
           <tr><td>科学上网时快时慢</td><td>TurboACC 关掉硬件分载</td></tr></table>
           <p>看整体状态：SSH 执行 <code>fw-selftest</code>。</p>
 
@@ -1002,20 +1044,30 @@ jobs:
           <p>偶尔想手动刷一次文本规则：SSH 执行 <code>rule-refresh</code>（gfwlist + chnlist，约 1.4MB，
              失败自动回滚）；日志 <code>cat /var/log/rule-refresh.log</code>。
              想恢复成“联网自动更新规则”，按该脚本头部注释里的两步改 uci 即可。</p>
-          <p>广告清单 <code>/etc/passwall/rules/block_host</code> 只能靠重新构建来更新（构建时重拉 anti-AD）。</p>
+          <p>广告清单在 <code>/etc/mosdns/adblock.txt</code>（约 11 万条，构建时下载、运行时不联网）。</p>
+          <h2>9. WiFi 信号弱 / 时有时无</h2>
+          <p>SSH 执行 <code>wifi-doctor</code>，一次列出：法规域（决定允许的发射功率）、每个网卡的
+             信道与功率、邻居信道占用率、已连客户端信号、内存余量、驱动报错。</p>
+          <table><tr><th>现象</th><th>原因 / 处理</th></tr>
+          <tr><td>信号满格却时快时慢</td><td>信道被邻居占满（占用率 &gt;60%）：把 2.4G 换到 1/6/11</td></tr>
+          <tr><td>走远就掉、回来又自己连上</td><td>hostapd 因 ack 连续失败踢客户端，已置 disassoc_low_ack=0</td></tr>
+          <tr><td>5G 整体消失几十秒</td><td>DFS 雷达静默；本固件默认把 5G 放在 149 段（非 DFS）</td></tr>
+          <tr><td>隔一会儿卡半秒</td><td>AP 后台扫信道；已置 noscan=1</td></tr>
+          <tr><td>整机都慢、无线偶发消失</td><td>128MB 内存被吃光（OOM）：减插件，或把屏蔽列表减半后重刷</td></tr></table>
+          <p>改信道不必重刷：<code>uci set wireless.radio0.channel=6; uci commit wireless; wifi reload</code>；
+             80MHz 覆盖不够：<code>uci set wireless.radio1.htmode=VHT40; wifi reload</code>。</p>
+
           </body>
           </html>
           EOF
 
-          # ---------- K. 去广告：把 anti-AD 打进 PassWall 的"屏蔽列表" ----------
-          # 为什么不用 PassWall 自带的 geosite:CATEGORY-ADS-ALL：
-          #   那要 geoview（Go 静态二进制，mipsel 上 6~10MB）+ 展开 geosite.dat，
-          #   32MB 闪存 / 128MB 内存的机器扛不住。这里只放纯域名，chinadns-ng 按域名
-          #   哈希匹配，命中直接返回 NXDOMAIN，最省资源。
-          # 路径是 PassWall 写死的：USER_RULES_PATH=/etc/passwall/rules
-          #   （helper_chinadns_add.lua）。运行时它只写 /tmp 缓存，不动闪存。
-          mkdir -p files/etc/passwall/rules
-          BLOCK=files/etc/passwall/rules/block_host
+          # ---------- K. 去广告：把 anti-AD 编译成 MosDNS 的域名集合 ----------
+          # 为什么不再走 PassWall 的"屏蔽列表"：那份清单只有 chinadns-ng 会编译，而
+          # chinadns-ng 会把 MosDNS 返回的 0.0.0.0 换成代理侧的真实应答（见 C 节说明）。
+          # 现在统一由 MosDNS 的 domain_set 吃纯域名清单：命中直接返回 0.0.0.0，
+          # 进程内哈希匹配，运行时不联网、不写闪存。
+          mkdir -p files/etc/mosdns
+          BLOCK=files/etc/mosdns/adblock.txt
           RAW=/tmp/ad-raw.txt
           : > "$RAW"
           for u in \
@@ -1023,7 +1075,7 @@ jobs:
             "https://cdn.jsdelivr.net/gh/privacy-protection-tools/anti-AD@master/anti-ad-domains.txt" \
             "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt" \
             "https://gitee.com/privacy-protection-tools/anti-AD/raw/master/anti-ad-domains.txt" \
-            "https://small.oisd.nl/domainswild" ; do
+            "https://small.oisd.nl/domainswild"; do
             echo "下载广告域名清单: $u"
             if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 -m 240 "$u" -o "$RAW"; then
               [ "$(wc -c < "$RAW")" -gt 400000 ] && break
@@ -1043,23 +1095,23 @@ jobs:
             : > "$BLOCK"
           fi
 
-          BLOCK_N=$(wc -l < "$BLOCK" | tr -d ' ')
-          BLOCK_B=$(wc -c < "$BLOCK" | tr -d ' ')
+          BLOCK_N=$(wc -l < "$BLOCK" | tr -d " ")
+          BLOCK_B=$(wc -c < "$BLOCK" | tr -d " ")
           [ -n "$BLOCK_N" ] || BLOCK_N=0
           [ -n "$BLOCK_B" ] || BLOCK_B=0
-          echo "屏蔽列表: $BLOCK_N 条 / $BLOCK_B 字节（squashfs 压缩后约 +$((BLOCK_B / 3 / 1024)) KB）"
+          echo "广告域名清单: $BLOCK_N 条 / $BLOCK_B 字节（squashfs 压缩后约 +$((BLOCK_B / 3 / 1024)) KB）"
           if [ "$BLOCK_N" -lt 50000 ]; then
-            echo "::warning::屏蔽列表只有 $BLOCK_N 条（预期 >=50000），去广告效果会很差；上游格式可能变了"
+            echo "::warning::广告清单只有 $BLOCK_N 条（预期 >=50000），去广告效果会很差；上游格式可能变了"
           fi
           if [ "$BLOCK_N" -gt 250000 ] || [ "$BLOCK_B" -gt 5000000 ]; then
-            echo "::error::屏蔽列表异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
+            echo "::error::广告清单异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
             exit 1
           fi
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh \
-                   files/usr/bin/dns-secure files/usr/bin/dns-guard \
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor \
+                   files/etc/init.d/mosdns \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
-          for f in files/usr/bin/* files/etc/uci-defaults/* files/etc/hotplug.d/net/* files/etc/rc.local; do
+          for f in files/usr/bin/* files/etc/uci-defaults/* files/etc/hotplug.d/net/* files/etc/init.d/* files/etc/rc.local; do
             [ -f "$f" ] || continue
             sh -n "$f" || { echo "::error::脚本语法错误：$f"; exit 1; }
           done
@@ -1171,15 +1223,26 @@ jobs:
             fi
           }
           check CONFIG_PACKAGE_dnsmasq-full
-          if grep -qx 'CONFIG_PACKAGE_dnsmasq_full_dnssec=y' .config; then
-            echo "  ✅ dnsmasq 带 DNSSEC（DoT 可用）"
+          if grep -qx 'CONFIG_PACKAGE_ca-bundle=y' .config; then
+            echo "  ✅ ca-bundle 已编入（MosDNS 的 DoH 要校验证书）"
           else
-            echo "  ⚠️  dnsmasq 未编 DNSSEC：路由器上游只能明文（固件仍可用）"
+            echo "::error::缺 ca-bundle：MosDNS 的 DoH 会一直校验证书失败，只能退明文"
+            MISSING=1
           fi
           check CONFIG_PACKAGE_luci-app-passwall
           check CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray
-          check CONFIG_PACKAGE_chinadns-ng
+          check CONFIG_PACKAGE_mosdns
           check CONFIG_PACKAGE_xray-core
+          # 无线法规库/工具：缺 wireless-regdb 时 country=CN 会设置失败，2.4G 功率
+          # 退回 world 域（信号弱），5G 部分信道不可用（时有时无）；缺 iw 则
+          # wifi-doctor 与手动切信道都用不了。只警告，不阻断构建。
+          for s in CONFIG_PACKAGE_wireless-regdb CONFIG_PACKAGE_iw; do
+            if grep -qx "$s=y" .config; then
+              printf '  ✅ %s\n' "$s"
+            else
+              printf '::warning::未生效：%s（不影响构建，但会削弱无线能力）\n' "$s"
+            fi
+          done
           # geo 数据不编入，反过来确认它没被别的依赖偷偷拉回来（省约 3MB 闪存）
           if grep -q '^CONFIG_PACKAGE_v2ray-geosite=y' .config; then
             echo "::error::geosite 又被拉进镜像了（INCLUDE_V2ray_Geodata 应为 n），白占约 3MB"
@@ -1204,7 +1267,7 @@ jobs:
           if [ "$MISSING" -ne 0 ]; then
             echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
             echo "---- feeds 里这些包是否存在（1=有，0=没有）----"
-            for p in luci-app-passwall xray-core chinadns-ng dns2socks ipt2socks \
+          for p in luci-app-passwall xray-core mosdns dns2socks ipt2socks \
                      microsocks tcping lyaml luci-app-turboacc; do
               printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
             done
@@ -1518,7 +1581,7 @@ jobs:
           [ -n "$MANIFEST" ] || { echo "::error::未找到 .manifest"; exit 2; }
           echo "包清单: $MANIFEST（$(wc -l < "$MANIFEST") 个包）"
 
-          MUST="xray-core luci-app-passwall chinadns-ng dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
+          MUST="xray-core luci-app-passwall mosdns dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
           [ "$1" = "true" ] && MUST="$MUST luci-app-turboacc"
 
           echo "---- 软件包 ----"
@@ -1557,17 +1620,26 @@ jobs:
             else
               echo "  ✅ 未带 geo 数据（省约 3MB）"
             fi
-            chk dns-secure  usr/bin/dns-secure
-            chk dns-guard   usr/bin/dns-guard
+            chk mosdns-bin   usr/bin/mosdns
+            chk mosdns-init  etc/init.d/mosdns
+            chk mosdns-conf  etc/mosdns/config.yaml
+            # 覆盖层必须赢过软件包自带的那份：v4 语法的 config.yaml 会让 mosdns 直接起不来
+            if [ -f "$ROOTFS/etc/mosdns/config.yaml" ] && grep -q "type: sequence" "$ROOTFS/etc/mosdns/config.yaml"; then
+              echo "  ✅ MosDNS 配置为覆盖版（v5 语法）"
+            else
+              echo "  ❌ MosDNS 配置不是覆盖版（v4 语法会让服务起不来）"
+              echo "mosdns-conf-v5" >> "$MISS_FILE"
+              LOST=$((LOST + 1))
+            fi
+            chk adblock      etc/mosdns/adblock.txt
             chk uci-90      etc/uci-defaults/90-luci
             chk uci-91      etc/uci-defaults/91-wireless
             chk uci-92      etc/uci-defaults/92-services
             chk usbwan      etc/hotplug.d/net/20-usbwan
             chk dns-recover usr/bin/dns-recover
             chk fw-selftest usr/bin/fw-selftest
+            chk wifi-doctor usr/bin/wifi-doctor
             chk rule-refresh usr/bin/rule-refresh
-            chk chinadns-ng usr/bin/chinadns-ng
-            chk block-list  etc/passwall/rules/block_host
             chk rules-gfw   usr/share/passwall/rules/gfwlist
             chk rules-chn   usr/share/passwall/rules/chnlist
             chk rules-route usr/share/passwall/rules/chnroute
@@ -1577,11 +1649,11 @@ jobs:
             chk cfg-p910nd  etc/config/p910nd
             chk sysctl      etc/sysctl.conf
             # 屏蔽列表条数：构建期下载失败时会退化成一个空文件，这里显式警告一次
-            if [ -f "$ROOTFS/etc/passwall/rules/block_host" ]; then
-              _bn=$(wc -l < "$ROOTFS/etc/passwall/rules/block_host" | tr -d ' ')
-              [ -n "$_bn" ] || _bn=0
-              echo "  屏蔽列表: $_bn 条"
-              [ "$_bn" -ge 50000 ] || echo "::warning::屏蔽列表条数偏少($_bn)，去广告基本不生效"
+            if [ -f "$ROOTFS/etc/mosdns/adblock.txt" ]; then
+              _an=$(wc -l < "$ROOTFS/etc/mosdns/adblock.txt" | tr -d " ")
+              [ -n "$_an" ] || _an=0
+              echo "  广告域名: $_an 条"
+              [ "$_an" -ge 50000 ] || echo "::warning::广告域名条数偏少($_an)，去广告基本不生效"
             fi
           else
             echo "::warning::未找到 root-ramips，跳过文件级检查"
@@ -1849,11 +1921,11 @@ jobs:
 
             ### 内置组件
             - **PassWall + Xray**（nftables 透明代理；仅编入 Xray，省掉 SS-Rust / Simple-Obfs）
-            - **去广告**：PassWall「屏蔽列表」内置 anti-AD（约 11 万条域名，命中返回 NXDOMAIN；
-              不装 geoview、不占 overlay，清单随每次构建更新）
-            - **DNS**：客户端查询由 PassWall 的 chinadns-ng 接管（分流 + 去广告）；
-              路由器自身走系统 dnsmasq，开机自动尝试 DoT 加密（853/TLS），
-              失败立即回滚明文、不会断网；不装 MosDNS，省约 6MB 闪存；不编 geo 数据，再省约 3MB
+            - **去广告**：MosDNS 的域名集合吃 anti-AD（约 11 万条域名，命中返回 0.0.0.0；
+              清单构建期下载、运行时不联网、不占 overlay）
+            - **DNS**：客户端 53 → PassWall 副本 dnsmasq（gfwlist 命中走隧道解析）→ 其余交给
+              MosDNS（127.0.0.1:5335）去广告 + DoH 加密上游（阿里/腾讯），明文只做兜底；
+              不装 luci-app-mosdns、不编 geo 数据，省约 3MB 闪存
             - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
@@ -1861,7 +1933,7 @@ jobs:
               + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 1000 条
 
             ### 无线
-            - 2.4G：`alon` @ ch11 HT20 · 5G：`alon-5G` @ ch36 VHT80 · WPA2 `alon12345678`（**请立即修改**）
+            - 2.4G：`alon` @ 自动信道 HT20 · 5G：`alon-5G` @ ch149 VHT80 · WPA2 `alon12345678`（**请立即修改**）
 
             ### 出问题怎么办
             路由器里已内置说明页：**http://192.168.2.1/guide.html**
@@ -1871,9 +1943,9 @@ jobs:
             | --- | --- |
             | 能 ping 通 IP、但网页打不开 | SSH 执行 **`dns-recover`** |
             | 某个 App / 网站突然不通 | SSH 执行 `dns-recover`，或检查 PassWall 分流规则 |
-            | 广告还在（没被拦） | SSH 执行 **`fw-selftest`** 看「屏蔽列表 N 条」；服务 → PassWall → 规则列表 → 屏蔽列表 确认条目在 |
-            | 导入节点后代理没马上生效 | 最多等 5 分钟自动接管，或 SSH 执行 **`dns-guard`** |
-            | 想关掉路由器自身的 DNS 加密 | SSH 执行 **`dns-secure off`** |
+            | 广告还在（没被拦） | SSH 执行 **fw-selftest** 看「广告域名 N 条」；清单在 `/etc/mosdns/adblock.txt` |
+            | 改了广告清单不生效 | SSH 执行 **/etc/init.d/mosdns restart**（域名集合只在启动时读） |
+            | 代理域名下的广告拦不到 | 正常现象：gfwlist 域名走隧道解析，不经过 MosDNS |
             | 科学上网时快时慢 | TurboACC 里把硬件分载 `hw_flow` 关掉再试 |
 
             ### 校验
