@@ -4646,7 +4646,22 @@ jobs:
           fi
           echo "✅ host 工具与工具链就绪（$(ls staging_dir/host/bin/sed 2>/dev/null || echo '无 sed')）"
 
-          # ---- 阶段 1：单独预编 1 个 Go 组件（-j1 V=s）----
+          # ---- 阶段 1：先编目标内核，再做单包预编 ----
+          # CI 实测教训：sing-box 依赖 kmod-inet-diag，而编 kmod 要先有
+          #   build_dir/target-*/linux-ramips_mt7621/linux-6.6.x/.config
+          # 直接 make package/feeds/packages/sing-box/compile 会顺着依赖去编
+          #   package/kernel/gpio-button-hotplug，然后死在
+          #   make[2]: *** No rule to make target '.../linux-6.6.159/.config'
+          #   ERROR: package/kernel/gpio-button-hotplug failed to build (build variant: tiny)
+          # 所以先把 target/linux 编出来。整机编译验证过这一层，不会白花时间。
+          echo "🧩 阶段1：构建目标内核（生成 linux .config 与 Module.symvers，约 10~20 分钟）..."
+          PREBUILD=1
+          if ! make -j"$(nproc)" target/linux/compile 2>&1 | tee -a build.log; then
+            echo "::warning::目标内核预编失败，跳过单包预编，直接进入整机编译（以整机编译结果为准）"
+            PREBUILD=0
+          fi
+
+          # ---- 阶段 2：单独预编 1 个 Go 组件（-j1 V=s）----
           # 1) 失败能在几十分钟内暴露真实错误（整机 -j 编译时错误会被 make 吞掉）
           # 2) 顺序执行，消除"Go 工具链还没就绪就开始编"的竞态
           GOVER=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
@@ -4690,14 +4705,20 @@ jobs:
           fi
 
           # ② sing-box（唯一依赖 Go 的运行时组件；先单独编一遍，失败几十分钟内就能看到真实错误）
-          echo "================ 预编 sing-box ================"
-          # 必须指定 BUILD_VARIANT=tiny：不带时 make 只会编默认变体（full），
-          # 白烧十分钟还占满 build_dir，而整机编译要的其实是 tiny。
-          MAKE_EXTRA="BUILD_VARIANT=tiny"
-          go_build "package/feeds/packages/sing-box/compile" "sing-box" || die_with_log "sing-box"
-          MAKE_EXTRA=""
+          if [ "$PREBUILD" = "1" ]; then
+            echo "================ 预编 sing-box ================"
+            # 必须指定 BUILD_VARIANT=tiny：不带时 make 只会编默认变体（full），
+            # 白烧十分钟还占满 build_dir，而整机编译要的其实是 tiny。
+            MAKE_EXTRA="BUILD_VARIANT=tiny"
+            go_build "package/feeds/packages/sing-box/compile" "sing-box" || die_with_log "sing-box"
+            MAKE_EXTRA=""
+          fi
 
-          echo "✅ Go 组件预编译全部通过"
+          if [ "$PREBUILD" = "1" ]; then
+            echo "✅ Go 组件预编译全部通过"
+          else
+            echo "⏭  已跳过单包预编，直接整机编译"
+          fi
 
           build_once() {
             RC=0
