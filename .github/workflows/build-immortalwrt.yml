@@ -318,6 +318,12 @@ jobs:
           uci set wireless.radio1.channel='149'
           uci set wireless.radio1.htmode='VHT80'
           uci set wireless.radio1.noscan='1'
+          # ---- 5G 两点说明（跟 2.4G 不是同一套问题）----
+          #   · 上面 channel='149' 只在 5G 当 AP 时有意义。若把 radio1 改成中继（mode=sta），
+          #     驱动会忽略它、跟着上游 AP 的信道跑（很常见，不是配置没生效）。
+          #   · legacy_rates='0'：关掉 802.11a/b/g 老速率。老设备本来也上不了 5G，留着只会让
+          #     个别慢设备用 6Mbps 占满空口；2.4G 不能这么干（老 IoT 会直接连不上）。
+          uci set wireless.radio1.legacy_rates='0'
 
           # ---- SSID / 密码保持原样 ----
           uci set wireless.default_radio0.ssid='alon'
@@ -1926,6 +1932,34 @@ jobs:
 
           # ---------- 6. 无线 ----------
           sec "6. 无线"
+          # 中继口（mode=sta）单独看链路质量：AP 还在发信标 != 上游连得上
+          _sta=0
+          for _v in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+            [ "$(uci -q get wireless.$_v.mode)" = "sta" ] || continue
+            _sta=1
+            _sn=$(uci -q get wireless.$_v.ssid)
+            _sif=$(for _x in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+                     _t=$(iw dev "$_x" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1)
+                     [ "$_t" = "managed" ] && { echo "$_x"; break; }
+                   done)
+            if [ -z "$_sif" ]; then
+              warn "中继接口没起来（ssid=${_sn:-?}）：wifi reload 后看 logread -e wpa_supplicant"
+              continue
+            fi
+            _sig=$(iw dev "$_sif" link 2>/dev/null | sed -n 's/.*signal: *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -n 1)
+            _rate=$(iw dev "$_sif" link 2>/dev/null | sed -n 's/.*bitrate: *\([0-9.]*\) *MBit\/s.*/\1/p' | head -n 1)
+            [ -n "$_rate" ] && _rate=" / ${_rate} Mbit/s"
+            if [ -z "$_sig" ]; then
+              warn "中继 $_sif 未连上上游（ssid=${_sn:-?}）"
+            elif [ "$_sig" -ge -67 ]; then
+              ok "中继 $_sif → ${_sn:-?}  ${_sig} dBm${_rate}"
+            elif [ "$_sig" -ge -72 ]; then
+              warn "中继 $_sif → ${_sn:-?}  ${_sig} dBm 偏弱：可试 VHT40（见 wifi-doctor 第 5 节）"
+            else
+              warn "中继 $_sif → ${_sn:-?}  ${_sig} dBm 太弱：先调位置/朝向"
+            fi
+          done
+          [ "$_sta" = "1" ] || ok "没配无线中继（5G 是本地 AP）"
           for _r in radio0 radio1; do
             uci -q get wireless.$_r >/dev/null 2>&1 || continue
             _dis=$(uci -q get wireless.$_r.disabled)
@@ -2059,7 +2093,34 @@ jobs:
           done
 
           echo
-          echo '--- 5. 内存 / 驱动 ---'
+          echo
+          echo '--- 5. 5G 中继链路（Mode: Client 的接口才是中继；-67 以上算好，-72 以下不稳）---'
+          _saw5=0
+          for d in $IFACES; do
+              _md=$(iwinfo "$d" info 2>/dev/null | sed -n 's/^ *Mode: *//p' | head -n 1)
+              case "$_md" in
+                  *Client*) ;;
+                  *) continue ;;
+              esac
+              _saw5=1
+              echo "  $d"
+              iw dev "$d" link 2>/dev/null | grep -E 'SSID:|freq:|signal:|bitrate:' | sed 's/^[[:space:]]*/    /'
+              _sig=$(iw dev "$d" link 2>/dev/null | sed -n 's/.*signal: *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -n 1)
+              _wth=$(iwinfo "$d" info 2>/dev/null | sed -n 's/.*HT Mode: *//p' | head -n 1)
+              [ -n "$_wth" ] && echo "    带宽模式：$_wth"
+              if [ -z "$_sig" ]; then
+                  echo '    ⚠️ 读不到信号强度：可能刚断开，或驱动没上报'
+              elif [ "$_sig" -ge -67 ]; then
+                  echo '    ✅ 链路够好，VHT80 的每子载波 SNR 撑得住'
+              elif [ "$_sig" -ge -72 ]; then
+                  echo '    ⚠️ 链路偏弱：降到 VHT40 通常比硬撑 VHT80 的实际吞吐更高（见第 8 节）'
+              else
+                  echo '    ❌ 链路太弱（-72 以下）：先调中继位置/朝向，带宽压到 VHT40 甚至 HT20'
+              fi
+          done
+          [ "$_saw5" = "1" ] || echo '  （没有 Client 模式的接口：这台机器没在做无线中继）'
+          echo
+          echo '--- 6. 内存 / 驱动 ---'
           if [ -r /proc/meminfo ]; then
               awk '/MemTotal/{t=int($2/1024)} /MemAvailable/{a=int($2/1024)} END{printf "  可用内存：%d MB / %d MB\n", a, t}' /proc/meminfo
           else
@@ -2073,7 +2134,7 @@ jobs:
 
           echo
           echo
-          echo '--- 6. mt76 驱动稳定性（“信号忽高忽低”的头号嫌疑）---'
+          echo '--- 7. mt76 驱动稳定性（“信号忽高忽低”的头号嫌疑）---'
           _hw=$(dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash|mcu message' | tr -d ' ')
           [ -n "$_hw" ] || _hw=0
           if [ "$_hw" -eq 0 ]; then
@@ -2093,7 +2154,7 @@ jobs:
                   head -n 6 "/sys/kernel/debug/ieee80211/$_phy/mt76/rate_txpower" 2>/dev/null | sed 's/^/     /'
               fi
           done
-          echo '--- 7. 怎么办 ---'
+          echo '--- 8. 怎么办 ---'
           echo '  信号虚高但慢 → 第 2 节「生效功率」≥27 dBm 就是过驱动（法规 30 dBm 顶格吃满），2.4G 降到 20：'
           echo '                uci set wireless.radio0.txpower=20；uci commit wireless；wifi reload'
           echo '  功率低      → wireless.radio0/1.country 必须是 CN（第 1 节看法规域）'
@@ -2149,6 +2210,11 @@ jobs:
                   [ -d "/sys/class/net/$1" ]
               fi
           }
+
+          # 中继（STA）是否真的连上：iw 的 link 里没有 Connected to 就是断了
+          sta_link() {
+              iw dev "$1" link 2>/dev/null | grep -q 'Connected to'
+          }
           
           recover() {
               if [ "$CN" -ge "$MAXH" ]; then
@@ -2181,16 +2247,25 @@ jobs:
               [ "$_h" = "$HOUR" ] && CN=${_c:-0}
           fi
           
-          # 只盯 AP 接口：STA（中继）会自己重连，在这里重启反而把上游连接打断
+          # 按内核真实存在的接口枚举：uci 里的 section 名（default_radio0 / wwan）不是网卡名，
+          # 网卡名是 phy0-ap0 / phy1-sta0 这种。原来的写法拿 section 名去 iwinfo，永远读不到，
+          # 会把“正常”误判成“掉线”，每 6 分钟 wifi 重启一次。
           AP_IFS=""
-          for _s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
-              [ "$(uci -q get wireless.$_s.mode)" = "sta" ] && continue
-              _dev=$(uci -q get wireless.$_s.device)
-              [ -n "$_dev" ] || continue
-              [ "$(uci -q get wireless.$_dev.disabled)" = "1" ] && continue
-              [ "$(uci -q get wireless.$_s.disabled)" = "1" ] && continue
-              AP_IFS="$AP_IFS $_s"
+          STA_IFS=""
+          _IFLIST=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
+          if [ -z "$_IFLIST" ]; then
+              _IFLIST=$(ls /sys/class/net 2>/dev/null | grep -E '^phy[0-9]+-(ap|sta)[0-9]+$')
+          fi
+          for _d in $_IFLIST; do
+              _t=$(iw dev "$_d" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1)
+              [ -n "$_t" ] || case "$_d" in *-ap*) _t=AP ;; *-sta*) _t=managed ;; esac
+              case "$_t" in
+                  AP) AP_IFS="$AP_IFS $_d" ;;
+                  managed) STA_IFS="$STA_IFS $_d" ;;
+              esac
           done
+          # 中继是否纳入监控：没有 iw 就没法判断“连没连上”，宁可不看也不误判
+          command -v iw >/dev/null 2>&1 || STA_IFS=""
           
           DEAD_LIST=""
           for _if in $AP_IFS; do
@@ -2219,6 +2294,64 @@ jobs:
           else
               rm -f "$HARD"
           fi
+
+          # 中继口单独判：AP 还在发信标，不代表上游连得上。断 3 轮（约 9 分钟）才 wifi reload，
+          # 因为 reload 会把整机无线都重启一遍，代价比 wifi up 大。
+          # 两道保险，避免"没配上游"或"上游彻底关机"时没完没了地 reload：
+          #   seen   —— 本次开机连上过上游才管；从没连上过说明是中继没配好，不该动它
+          #   gaveup —— 连续 4 次 reload 都救不回来，就停手只记日志（等人工介入）
+          SEEN=$TMP/wifi-watchdog.sta.seen
+          GIVE=$TMP/wifi-watchdog.sta.gaveup
+          TRIES=$TMP/wifi-watchdog.sta.tries
+          STA_DEAD=""
+          for _if in $STA_IFS; do
+              _f=$TMP/wifi-watchdog.sta.$_if
+              if sta_link "$_if"; then
+                  rm -f "$_f" "$GIVE" "$TRIES"
+                  : > "$SEEN"
+                  [ "$1" = "status" ] && printf '  ✅ %-9s 中继已连上\n' "$_if"
+                  continue
+              fi
+              _n=0
+              [ -r "$_f" ] && _n=$(cat "$_f" 2>/dev/null)
+              _n=$((_n + 1))
+              printf '%s\n' "$_n" > "$_f"
+              if [ "$_n" -lt 3 ]; then
+                  [ "$1" = "status" ] && printf '  ⚠️  %-9s 中继未连上（第 %s 次）\n' "$_if" "$_n"
+                  continue
+              fi
+              if [ ! -f "$SEEN" ]; then
+                  [ "$1" = "status" ] && printf '  ⚠️  %-9s 中继从没连上过（没用起来？）\n' "$_if"
+                  continue
+              fi
+              if [ -f "$GIVE" ]; then
+                  log "中继 $_if 已连续 4 次救不回来，暂停自动恢复（等人工处理）"
+                  [ "$1" = "status" ] && printf '  ❌ %-9s 已放弃自动恢复（救 4 次无效）\n' "$_if"
+                  continue
+              fi
+              STA_DEAD="$STA_DEAD $_if"
+              [ "$1" = "status" ] && printf '  ❌ %-9s 中继已断（连续 %s 次）\n' "$_if" "$_n"
+          done
+
+          if [ -n "$STA_DEAD" ]; then
+              if [ "$CN" -ge "$MAXH" ]; then
+                  log "本小时已恢复 ${CN} 次，达到上限，中继断线只记录不动作（$STA_DEAD）"
+              else
+                  CN=$((CN + 1))
+                  printf '%s %s\n' "$HOUR" "$CN" > "$CNT_FILE"
+                  _tr=0
+                  [ -r "$TRIES" ] && _tr=$(cat "$TRIES" 2>/dev/null)
+                  _tr=$((_tr + 1))
+                  printf '%s\n' "$_tr" > "$TRIES"
+                  log "中继链路断开（$STA_DEAD），第 ${CN} 次恢复（累计第 ${_tr} 次重建）：wifi reload"
+                  wifi reload >/dev/null 2>&1
+                  if [ "$_tr" -ge 4 ]; then
+                      : > "$GIVE"
+                      log "中继已重建 ${_tr} 次仍连不上，暂停自动恢复（查上游路由器 / 中继位置）"
+                  fi
+              fi
+              for _if in $STA_DEAD; do rm -f "$TMP/wifi-watchdog.sta.$_if"; done
+          fi
           
           HW=$(hw_count)
           [ -n "$HW" ] || HW=0
@@ -2234,6 +2367,7 @@ jobs:
           if [ "$1" = "status" ]; then
               printf '\n无线看门狗状态\n'
               printf '  AP 接口：%s\n' "${AP_IFS:-（无）}"
+              printf '  中继接口：%s\n' "${STA_IFS:-（无）}"
               printf '  本小时已恢复 %s 次（上限 %s）\n' "$CN" "$MAXH"
               printf '  内核无线驱动报错累计 %s 条\n' "$HW"
               if [ -s "$LOG" ]; then
