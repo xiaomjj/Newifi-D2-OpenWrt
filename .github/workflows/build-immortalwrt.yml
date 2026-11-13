@@ -276,8 +276,8 @@ jobs:
           cat > files/etc/uci-defaults/91-wireless << 'EOF'
           #!/bin/sh
           # 无线参数：只改“怎么用”，不改“能不能用”——每一行都能单独 uci set 覆写
-          #   为什么信道不再写死：固定 2.4G=11 / 5G=36 时，只要邻居也占这两个信道，
-          #   协商速率就会反复跌落，体感就是“时强时弱、时有时无”。
+          #   信道策略：2.4G 钉 1、5G 钉 149，两家都不交给 ACS。都钉住以后，邻居撞信道时的
+          #   体感是“速率低一点”，而不是“时强时弱、时有时无”；2.4G 也不会被 ACS 挑到 12/13。
           # 首次开机时 /etc/config/wireless 可能还没被探测出来：先让系统探测一次，
           # 否则下面这些设置会整段跳过（用户拿到的是默认 SSID/无密码，等于没开箱即用）。
           # 探测失败就退出，绝不手写无线配置（写错会直接没信号）。
@@ -287,12 +287,27 @@ jobs:
           [ -f /etc/config/wireless ] || exit 0
           uci -q get wireless.radio0 >/dev/null 2>&1 || exit 0
 
-          # ---- 2.4G：交给 ACS 在 1/6/11 里挑最空的；noscan 关掉后台扫信道造成的周期性断流 ----
+          # ---- 2.4G：钉 1 信道 + HT20；noscan 关掉后台扫信道造成的周期性断流 ----
+          #   为什么不再用 auto：ACS 每次 wifi up/reload 都重新挑信道，挑到 12/13 时不少
+          #   非国行设备（手机、IoT、老笔记本）直接扫不到；驱动崩一次重启后信道还会变，
+          #   表现就是“用着用着 SSID 没了”。1 被邻居占了就把下面一行改成 11（其次 6）。
+          #   为什么最终钉 1：1/6/11 是 2.4G 仅有的三个互不重叠信道，本机实测（20 dBm、同一
+          #   位置、同一客户端）信道 1 = 108.3 Mbit/s、质量 70/70、-40 dBm（复测 104.7、70/70、
+          #   -38 dBm）；信道 11 = 65.0 Mbit/s、62/70、-48 dBm。11 的 HT20 占 2452-2472，紧贴国标上沿 2483.5，上方
+          #   没有邻频可借，边缘功率滚降比 1 明显，所以默认回到 1。邻居若用 6 的 HT40
+          #   （2427-2472）会盖住 11，那种环境更该留在 1。
+          #   判断依据永远是 wifi-doctor 第 3 节的占用率（按频点累计，* 为当前信道）。
           uci set wireless.radio0.disabled='0'
           uci set wireless.radio0.country='CN'
-          uci set wireless.radio0.channel='auto'
+          uci set wireless.radio0.channel='1'
           uci set wireless.radio0.htmode='HT20'
           uci set wireless.radio0.noscan='1'
+          # ---- 2.4G 发射功率：钉 20 dBm（100mW），不吃法规上限的 30 dBm ----------------
+          #   本固件的 wireless-regdb 里 CN 的 2.4G 上限是 30 dBm(1W)，而 MT7603E 这颗前端
+          #   是按 ~20 dBm 校准的。不写 txpower 时 hostapd 直接按法规上限 30 dBm 喂，功放
+          #   进非线性区 → EVM 变差、发热、高 MCS 跑不上去，体感就是“信号满格却卡、时强时弱”。
+          #   设 20 是让前端工作在标称区间；家里死角多再逐步加到 23（别超过 23）。
+          uci set wireless.radio0.txpower='20'
 
           # ---- 5G：默认落在 149 段（5.8G）。两个理由：
           #   1) CN 法规里 5.8G 的允许 EIRP 比 5.1G(36-48) 高，同样的机器穿墙更好；
@@ -1415,14 +1430,16 @@ jobs:
           # 本固件不自动升级、不自动下载固件与规则包：分流规则随 PassWall 包发布，
           # 广告清单在构建期写进镜像；PassWall 自己的规则/订阅定时任务默认也不启用
           # （tasks.sh 只在 uci 里配了 update_week_mode 时才动作，出厂没有该选项）。
-          # 下面四条全是纯本地动作，一个字节都不出网：
+          # 下面五条全是纯本地动作，一个字节都不出网：
           # 1) 每日 04:00 释放页缓存（P2P、LuCI 页面缓存都能把页缓存吃满）
           0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
           # 2) 每 10 分钟看一眼可用内存：低于总量 8% 清页缓存，低于 4% 再截断大日志（不动任何进程）
           */10 * * * * /usr/bin/memguard
           # 3) 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
           */10 * * * * pidof mosdns >/dev/null 2>&1 || /etc/init.d/mosdns restart
-          # 4) 每周日 04:30 截断超过 512KB 的运行日志（/var/log 在 tmpfs 里，实打实吃内存）
+          # 4) 每 3 分钟确认无线还在发信标：mt76 崩了会自动 wifi up，连续不行再 reload
+          */3 * * * * /usr/bin/wifi-watchdog
+          # 5) 每周日 04:30 截断超过 512KB 的运行日志（/var/log 在 tmpfs 里，实打实吃内存）
           30 4 * * 0 /usr/bin/memguard trim
           EOF
 
@@ -1701,6 +1718,18 @@ jobs:
           else
             ng "crontab 里没有本地清理任务"
           fi
+          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗已装（每 3 分钟，掉线自动 wifi up）" || ng "wifi-watchdog 缺失"
+          grep -q 'wifi-watchdog' /etc/crontabs/root 2>/dev/null && ok "crontab 里有无线看门狗" || ng "crontab 里没有无线看门狗"
+          [ "$(uci -q get wireless.radio0.txpower)" = "20" ] \
+            && ok "2.4G 发射功率钉在 20dBm（不吃法规上限 30dBm）" \
+            || ng "2.4G 发射功率没钉住：hostapd 会按法规上限 30dBm 喂前端"
+          _hw=$(dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash' | tr -d ' ')
+          [ -n "$_hw" ] || _hw=0
+          if [ "$_hw" -eq 0 ]; then
+            ok "本次开机内没有 mt76 硬件重启 / 固件崩溃"
+          else
+            printf '  ⚠️  本次开机内出现 %s 次 mt76 硬件重启 / 固件崩溃（mt76 已知问题，细节跑 wifi-doctor）\n' "$_hw"
+          fi
           _av=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
           [ -n "$_av" ] && printf '  · 可用内存 %sMB（低于总量 8%% 时 memguard 会自动清缓存）\n' "$_av"
           [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "1000" ] \
@@ -1920,6 +1949,14 @@ jobs:
           done
           [ "$_bad_ack" -eq 0 ] && ok "全部无线接口 disassoc_low_ack=0（弱信号不轻易踢）" || warn "$_bad_ack 个无线接口还开着 disassoc_low_ack（弱处容易掉线）"
           wifi status >/dev/null 2>&1 && ok "无线已启动（细节跑 wifi-doctor）" || warn "无线没起来：wifi up 后看 logread -e hostapd"
+          _hw=$(dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash' | tr -d ' ')
+          [ -n "$_hw" ] || _hw=0
+          if [ "$_hw" -eq 0 ]; then
+            ok "内核暂无 mt76 硬件重启 / 固件崩溃"
+          else
+            warn "内核已出现 $_hw 次 mt76 硬件重启 / 固件崩溃（看 wifi-doctor 第 6 节）"
+          fi
+          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗在（每 3 分钟自动恢复掉线）" || warn "wifi-watchdog 缺失"
 
           # ---------- 7. 结论 ----------
           sec "7. 结论"
@@ -1977,20 +2014,41 @@ jobs:
           fi
 
           echo
-          echo '--- 3. 信道占用率（只看 >=30% 的，>60% 就是“信号满格也卡”）---'
+          echo '  生效功率（iwinfo txpowerlist 里带 * 的那一档才是真的）：'
           for d in $IFACES; do
-              iw dev "$d" survey dump 2>/dev/null | awk -v D="$d" '
+              _tp=$(iwinfo "$d" txpowerlist 2>/dev/null | sed -n 's/^[*] *\([0-9][0-9]*\) dBm.*/\1/p' | head -n 1)
+              if [ -z "$_tp" ]; then
+                  echo "    $d  读不到（接口未启用或 iwinfo 不支持）"
+              else
+                  echo "    $d  ${_tp} dBm"
+                  if [ "$_tp" -ge 27 ]; then
+                      echo '        ⚠️ 法规上限直接喂到前端：MT7603E/MT76x2 这类芯片按 30dBm 输出会过驱动'
+                      echo '           （EVM 变差、发热、偶发不稳）。建议 uci set wireless.radio0.txpower=20 后 wifi reload'
+                  fi
+              fi
+          done
+          echo '  法规域（第三个数字是该频段的 max EIRP）：'
+          iw reg get 2>/dev/null | grep -m 1 '2400' | sed 's/^/    /'
+
+          echo '--- 3. 信道占用率（按频点累计，* = 当前信道；>60% 才真挤）---'
+          #   mt76 的 survey 是“按频点累计”的：待在某个信道上的时间会一直累加，切走以后
+          #   那一行的 active 时间不再增长但也不会消失。于是这里能一次列出机器待过的所有信道，
+          #   直接横向比较 1/6/11；旧的“只认当前信道”反而把有用的历史丢掉了。
+          for d in $IFACES; do
+              _fr=$(iw dev "$d" info 2>/dev/null | sed -n 's/.*channel [0-9][0-9]* (\([0-9][0-9]*\) MHz).*/\1/p' | head -n 1)
+              iw dev "$d" survey dump 2>/dev/null | awk -v D="$d" -v F="$_fr" '
                   /frequency:/ { f=$2 }
                   /channel active time:/ { a[f]=$4 }
                   /channel busy time:/ { b[f]=$4 }
                   END {
-                      for (k in a) if (a[k] > 0) {
+                      for (k in a) if (a[k] >= 60000) {
                           p = int(b[k]*100/a[k])
-                          if (p >= 60) printf "  %s %s MHz 占用 %d%%  <== 太挤，换信道\n", D, k, p
-                          else if (p >= 30) printf "  %s %s MHz 占用 %d%%\n", D, k, p
+                          mark = (k == F) ? "*" : " "
+                          printf "%d\t  %s %s %s MHz 占用 %d%%  (累计停留 %d 秒)\n", k, D, mark, k, p, int(a[k]/1000)
                       }
-                  }'
+                  }' | sort -n | cut -f2-
           done
+          echo '  * 是当前信道；只有一行说明这台机器还没在其他信道待够 1 分钟。'
 
           echo
           echo '--- 4. 已连客户端信号（低于 -70dBm 就是弱，-80 以下基本不可用）---'
@@ -2014,13 +2072,176 @@ jobs:
           dmesg 2>/dev/null | grep -iE 'mt76|ieee80211|hostapd|firmware' | tail -n 10 | sed 's/^/  /'
 
           echo
-          echo '--- 6. 怎么办 ---'
+          echo
+          echo '--- 6. mt76 驱动稳定性（“信号忽高忽低”的头号嫌疑）---'
+          _hw=$(dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash|mcu message' | tr -d ' ')
+          [ -n "$_hw" ] || _hw=0
+          if [ "$_hw" -eq 0 ]; then
+              echo '  ✅ 本次开机内没有 mt76 硬件重启 / 固件崩溃'
+          else
+              echo "  ✗ 本次开机内出现 ${_hw} 次 mt76 硬件重启 / 固件崩溃："
+              echo '    这是 24.10 的 mt76 已知问题（大流量、弱信号时最容易被触发），'
+              echo '    现象就是信号忽高忽低、SSID 时有时无、客户端显示连着却没流量。'
+              dmesg 2>/dev/null | grep -iE 'hardware restart|firmware crash|mcu message' | tail -n 3 | sed 's/^/     /'
+          fi
+          for d in $IFACES; do
+              _tp=$(iwinfo "$d" txpower 2>/dev/null)
+              [ -n "$_tp" ] && echo "  ${d} 当前发射功率：${_tp}"
+              _phy=$(cat "/sys/class/net/$d/phy80211/name" 2>/dev/null)
+              if [ -n "$_phy" ] && [ -r "/sys/kernel/debug/ieee80211/$_phy/mt76/rate_txpower" ]; then
+                  echo "  ${d}(${_phy}) 每速率发射功率（全是 0 = EEPROM 里没有有效功率校准）："
+                  head -n 6 "/sys/kernel/debug/ieee80211/$_phy/mt76/rate_txpower" 2>/dev/null | sed 's/^/     /'
+              fi
+          done
+          echo '--- 7. 怎么办 ---'
+          echo '  信号虚高但慢 → 第 2 节「生效功率」≥27 dBm 就是过驱动（法规 30 dBm 顶格吃满），2.4G 降到 20：'
+          echo '                uci set wireless.radio0.txpower=20；uci commit wireless；wifi reload'
           echo '  功率低      → wireless.radio0/1.country 必须是 CN（第 1 节看法规域）'
-          echo '  信道挤      → uci set wireless.radio0.channel=1（或 6/11）；wifi reload'
+          echo '  信道挤      → 第 3 节占用率 >60% 才真挤；1/6/11 里挑最低的：uci set wireless.radio0.channel=1（或 6/11）；wifi reload'
           echo '  弱处掉线    → uci set wireless.default_radio0.disassoc_low_ack=0；wifi reload'
           echo '  覆盖不够    → uci set wireless.radio1.htmode=VHT40；wifi reload'
           echo '  内存不足    → 少装插件，或把屏蔽列表从 11 万条降到 5 万条后重新构建'
+          echo '  驱动崩过    → 看 /var/log/wifi-watchdog.log（几点自动 wifi up/reload 的时间线）；'
+          echo '                频繁出现就把 5G 降到 VHT40：uci set wireless.radio1.htmode=VHT40；wifi reload'
+          echo '  2.4G 不稳   → MT7603E 出厂 EEPROM 的功率校准偏差大（刷机改不了它），先换 1 或 11 试；'
+          echo '                仍不行只能刷改过的 EEPROM（会动 MAC/校准区，有变砖风险，不建议随手做）'
           echo
+          exit 0
+          EOF
+
+          # ---------- I3. 无线看门狗（mt76 崩溃后自动恢复，不改任何配置）----------
+          cat > files/usr/bin/wifi-watchdog << 'EOF'
+          #!/bin/sh
+          # wifi-watchdog：mt76 在 24.10 上会偶发 Hardware restart was requested / 固件崩溃，
+          # 表现就是 2.4G 信号忽高忽低、SSID 时有时无、手机还显示连着但上不了网。
+          # 本脚本只做恢复与记录，绝不改配置、绝不重启整机：
+          #   1) 每 3 分钟确认 AP 接口还在发信标（iwinfo 能报出 ESSID）
+          #   2) 连续两次探测不到 -> wifi up；再连续两次还不行 -> wifi reload
+          #   3) 每小时最多恢复 5 次，超过只记日志（防止抖动把无线反复重启）
+          #   4) 内核新增无线驱动报错时记一行，方便把“几点开始变差”对上时间线
+          # 用法：wifi-watchdog（静默，给 cron 用）  wifi-watchdog status（看当前状态）
+          
+          LOG=/var/log/wifi-watchdog.log
+          TMP=/tmp
+          HW_FILE=$TMP/wifi-watchdog.hw
+          CNT_FILE=$TMP/wifi-watchdog.cnt
+          HARD=$TMP/wifi-watchdog.hard
+          MAXH=5
+          
+          log() {
+              printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+              _sz=$(wc -c < "$LOG" 2>/dev/null | tr -d " ")
+              [ -n "$_sz" ] || _sz=0
+              if [ "$_sz" -gt 65536 ]; then
+                  tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+              fi
+          }
+          
+          # 驱动报错计数：mt76 崩溃一定会在这里留痕
+          hw_count() {
+              dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash|mcu message' | tr -d ' '
+          }
+          
+          alive() {
+              if command -v iwinfo >/dev/null 2>&1; then
+                  iwinfo "$1" info 2>/dev/null | grep -q 'ESSID: "."'
+              else
+                  [ -d "/sys/class/net/$1" ]
+              fi
+          }
+          
+          recover() {
+              if [ "$CN" -ge "$MAXH" ]; then
+                  log "本小时已恢复 ${CN} 次，达到上限，本轮只记录不动作（$1）"
+                  return 0
+              fi
+              CN=$((CN + 1))
+              printf '%s %s\n' "$HOUR" "$CN" > "$CNT_FILE"
+              if [ -f "$HARD" ]; then
+                  log "第 ${CN} 次恢复：wifi up 无效，改用 wifi reload（$1）"
+                  wifi reload >/dev/null 2>&1
+                  rm -f "$HARD"
+              else
+                  log "第 ${CN} 次恢复：wifi up（$1）"
+                  : > "$HARD"
+                  wifi up >/dev/null 2>&1
+              fi
+          }
+          
+          # 刚开机那几分钟 hostapd 还没起，别把它当故障
+          UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+          if [ "$1" != "status" ] && [ -n "$UP" ] && [ "$UP" -lt 240 ]; then
+              exit 0
+          fi
+          
+          HOUR=$(date '+%Y%m%d%H')
+          CN=0
+          if [ -r "$CNT_FILE" ]; then
+              read -r _h _c < "$CNT_FILE" 2>/dev/null
+              [ "$_h" = "$HOUR" ] && CN=${_c:-0}
+          fi
+          
+          # 只盯 AP 接口：STA（中继）会自己重连，在这里重启反而把上游连接打断
+          AP_IFS=""
+          for _s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+              [ "$(uci -q get wireless.$_s.mode)" = "sta" ] && continue
+              _dev=$(uci -q get wireless.$_s.device)
+              [ -n "$_dev" ] || continue
+              [ "$(uci -q get wireless.$_dev.disabled)" = "1" ] && continue
+              [ "$(uci -q get wireless.$_s.disabled)" = "1" ] && continue
+              AP_IFS="$AP_IFS $_s"
+          done
+          
+          DEAD_LIST=""
+          for _if in $AP_IFS; do
+              _f=$TMP/wifi-watchdog.fail.$_if
+              if alive "$_if"; then
+                  rm -f "$_f"
+                  [ "$1" = "status" ] && printf '  ✅ %-9s 在发信标\n' "$_if"
+                  continue
+              fi
+              _n=0
+              [ -r "$_f" ] && _n=$(cat "$_f" 2>/dev/null)
+              _n=$((_n + 1))
+              printf '%s\n' "$_n" > "$_f"
+              if [ "$_n" -lt 2 ]; then
+                  log "$_if 探测不到信标（第 ${_n} 次），下一轮再确认"
+                  [ "$1" = "status" ] && printf '  ⚠️  %-9s 探测不到信标（第 %s 次）\n' "$_if" "$_n"
+                  continue
+              fi
+              DEAD_LIST="$DEAD_LIST $_if"
+              [ "$1" = "status" ] && printf '  ❌ %-9s 已掉（连续 %s 次探测不到）\n' "$_if" "$_n"
+          done
+          
+          if [ -n "$DEAD_LIST" ]; then
+              recover "$DEAD_LIST"
+              for _if in $DEAD_LIST; do rm -f "$TMP/wifi-watchdog.fail.$_if"; done
+          else
+              rm -f "$HARD"
+          fi
+          
+          HW=$(hw_count)
+          [ -n "$HW" ] || HW=0
+          PREV=0
+          [ -r "$HW_FILE" ] && PREV=$(cat "$HW_FILE" 2>/dev/null)
+          [ -n "$PREV" ] || PREV=0
+          if [ "$HW" -gt "$PREV" ]; then
+              _last=$(dmesg 2>/dev/null | grep -iE 'hardware restart|firmware crash|mcu message' | tail -n 1)
+              log "内核新增 $((HW - PREV)) 条无线驱动报错（累计 ${HW}）：$_last"
+          fi
+          printf '%s\n' "$HW" > "$HW_FILE"
+          
+          if [ "$1" = "status" ]; then
+              printf '\n无线看门狗状态\n'
+              printf '  AP 接口：%s\n' "${AP_IFS:-（无）}"
+              printf '  本小时已恢复 %s 次（上限 %s）\n' "$CN" "$MAXH"
+              printf '  内核无线驱动报错累计 %s 条\n' "$HW"
+              if [ -s "$LOG" ]; then
+                  printf '  最近 5 条日志：\n'
+                  tail -n 5 "$LOG" | sed 's/^/    /'
+              fi
+              printf '\n'
+          fi
           exit 0
           EOF
 
@@ -2070,7 +2291,7 @@ jobs:
             echo "::error::广告清单异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
             exit 1
           fi
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check \
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/wifi-watchdog \
                    files/etc/init.d/mosdns \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
@@ -2818,6 +3039,7 @@ jobs:
             chk dns-recover usr/bin/dns-recover
             chk fw-selftest usr/bin/fw-selftest
             chk wifi-doctor usr/bin/wifi-doctor
+          chk wifi-watchdog usr/bin/wifi-watchdog
             chk rule-refresh usr/bin/rule-refresh
             chk memguard    usr/bin/memguard
             chk quick-check usr/bin/quick-check
