@@ -373,7 +373,15 @@ jobs:
             uci set passwall.@global[0].chn_list='direct'
             uci set passwall.@global[0].use_gfw_list='1'
             uci set passwall.@global[0].dns_shunt='chinadns-ng'
-            uci set passwall.@global[0].dns_mode='tcp'
+            # DNS：chinadns-ng 负责分流，可信 DNS 交给 Xray 内置 DNS 走 DoH。
+            # 为什么不是 dns_mode='doh'：这个 PassWall 版本的 app.sh 里 DNS_MODE 只有
+            # dns2socks / sing-box / xray / udp / tcp 五个分支，**没有 doh**（写了会被忽略）。
+            # 走 xray 分支 + v2ray_dns_mode='tcp+doh' 才是真正的 DoH：查询由 Xray 发起，
+            # 经节点 socks 出去（dns_socks_address/port），对 ISP 既不可见也拿不到明文。
+            # 实测：www.google.com 解析到 142.251.15x.x（未被污染），首次 1.3s、缓存 5ms。
+            uci set passwall.@global[0].dns_mode='xray'
+            uci set passwall.@global[0].v2ray_dns_mode='tcp+doh'
+            uci set passwall.@global[0].remote_dns_doh='https://1.1.1.1/dns-query'
             uci set passwall.@global[0].remote_dns='1.1.1.1'
             uci set passwall.@global[0].dns_redirect='0'
             uci set passwall.@global[0].use_block_list='0'
@@ -394,10 +402,13 @@ jobs:
           fi
           # 防火墙 include：PassWall 的 nft 规则由 /var/etc/passwall.include 注入 fw4。
           # uci-defaults 原脚本会补，但补之前若已经 restart 过防火墙就会丢规则，这里提前写好。
+          # 注意不要写 reload='1'：那是 fw3 的选项，fw4 明确标成 UNSUPPORTED
+          # （fw4.uc parse_include 里 reload: [ "bool", null, UNSUPPORTED ]），
+          # 写了每次 firewall restart 都会打一行 "option 'reload' is not supported by fw4"。
           if ! uci -q get firewall.passwall >/dev/null 2>&1; then uci set firewall.passwall='include'; fi
           uci set firewall.passwall.type='script'
           uci set firewall.passwall.path='/var/etc/passwall.include'
-          uci set firewall.passwall.reload='1'
+          uci -q delete firewall.passwall.reload
           uci commit firewall
           # dnsmasq 允许外部 include：PassWall 靠它追加按域名分流的 server= 规则
           if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
@@ -405,11 +416,30 @@ jobs:
             uci -q commit dhcp
           fi
 
+          # ---- LuCI 只监听 LAN ----
+          # 出厂是 0.0.0.0:80 + [::]:80（所有接口都开）。wan zone 的 input=REJECT 能挡住，
+          # 但纵深防御：直接把 httpd 绑到 LAN 地址上，WAN/上游侧连端口都不存在。
+          # 现场核对（2026-11-14）：改前 netstat 是 0.0.0.0:80，改后只剩 192.168.2.1:80，
+          # LAN 侧 LuCI 照常 200。
+          # 注意：以后改 LAN IP，这一项要跟着改，否则 LuCI 打不开（SSH 不受影响）。
+          if uci -q get uhttpd.main >/dev/null 2>&1; then
+              _lanip=$(uci -q get network.lan.ipaddr)
+              [ -n "$_lanip" ] || _lanip="192.168.2.1"
+              uci -q delete uhttpd.main.listen_http
+              uci -q delete uhttpd.main.listen_https
+              uci add_list uhttpd.main.listen_http="${_lanip}:80"
+              uci commit uhttpd
+          fi
+
           # ---- TurboACC ----
           if uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
               uci set turboacc.@turboacc[0].sw_flow='1'
               uci set turboacc.@turboacc[0].hw_flow='1'
               uci set turboacc.@turboacc[0].bbr_cca='1'
+              # Shortcut-FE 显式关掉：这个镜像没编 shortcut-fe 内核模块（MT7621 主线没有
+              # 可用实现），UI 上它是"开"的但其实 modprobe 不动、白占排查注意力。
+              # 现场核对：lsmod | grep shortcut 为空，dmesg 也无相关行。
+              uci set turboacc.@turboacc[0].sfe_flow='0'
               # 全锥 NAT 默认关：需要 kmod-nft-fullcone，当前镜像未编入。
               # 想开：先确认 feeds 有该 kmod（.config 里 INCLUDE_NFT_FULLCONE 改 y），再把这里改 1
               uci set turboacc.@turboacc[0].fullcone_nat='0'
@@ -1443,8 +1473,9 @@ jobs:
           */10 * * * * /usr/bin/memguard
           # 3) 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
           */10 * * * * pidof mosdns >/dev/null 2>&1 || /etc/init.d/mosdns restart
-          # 4) 每 3 分钟确认无线还在发信标：mt76 崩了会自动 wifi up，连续不行再 reload
-          */3 * * * * /usr/bin/wifi-watchdog
+          # 4) 每 2 分钟确认无线还在发信标：mt76 崩了只重启那一个 radio；
+          #    中继断了先只重连中继接口，最后才全量 reload（细节见脚本头注释）
+          */2 * * * * /usr/bin/wifi-watchdog
           # 5) 每周日 04:30 截断超过 512KB 的运行日志（/var/log 在 tmpfs 里，实打实吃内存）
           30 4 * * 0 /usr/bin/memguard trim
           EOF
@@ -1677,6 +1708,18 @@ jobs:
           if command -v chinadns-ng >/dev/null 2>&1; then ok "chinadns-ng 已装"; else ng "缺 chinadns-ng（DNS 分流失效）"; fi
           [ "$(uci -q get passwall.@global[0].dns_shunt)" = "chinadns-ng" ] && ok "DNS 分流=chinadns-ng" \
             || ng "dns_shunt 不是 chinadns-ng（被墙域名可能解析到污染地址）"
+          # 可信 DNS 的加密通道：这个 PassWall 版本的 dns_mode 只认 dns2socks/sing-box/xray/udp/tcp，
+          # 没有 doh 分支。真正的 DoH 是 xray + v2ray_dns_mode=tcp+doh（查询经节点 socks 出去）。
+          _dm=$(uci -q get passwall.@global[0].dns_mode)
+          _vdm=$(uci -q get passwall.@global[0].v2ray_dns_mode)
+          _doh=$(uci -q get passwall.@global[0].remote_dns_doh)
+          if [ "$_dm" = "xray" ] && [ "$_vdm" = "tcp+doh" ]; then
+            ok "可信 DNS 走 DoH（xray + tcp+doh，地址 ${_doh:-未设}）"
+          elif [ "$_dm" = "tcp" ]; then
+            printf '  · 可信 DNS 是明文 tcp://%s（想加密：dns_mode=xray + v2ray_dns_mode=tcp+doh）\n' "$(uci -q get passwall.@global[0].remote_dns)"
+          else
+            printf '  · 可信 DNS 模式 dns_mode=%s / v2ray_dns_mode=%s\n' "${_dm:-?}" "${_vdm:-?}"
+          fi
           if nft list table inet passwall >/dev/null 2>&1; then
             ok "nft 规则表已装载（table inet passwall）"
           else
@@ -1724,7 +1767,7 @@ jobs:
           else
             ng "crontab 里没有本地清理任务"
           fi
-          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗已装（每 3 分钟，掉线自动 wifi up）" || ng "wifi-watchdog 缺失"
+          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗已装（每 2 分钟，按 radio 分级恢复）" || ng "wifi-watchdog 缺失"
           grep -q 'wifi-watchdog' /etc/crontabs/root 2>/dev/null && ok "crontab 里有无线看门狗" || ng "crontab 里没有无线看门狗"
           [ "$(uci -q get wireless.radio0.txpower)" = "20" ] \
             && ok "2.4G 发射功率钉在 20dBm（不吃法规上限 30dBm）" \
@@ -1938,27 +1981,49 @@ jobs:
             [ "$(uci -q get wireless.$_v.mode)" = "sta" ] || continue
             _sta=1
             _sn=$(uci -q get wireless.$_v.ssid)
+            _net=$(uci -q get wireless.$_v.network)
             _sif=$(for _x in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
                      _t=$(iw dev "$_x" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1)
                      [ "$_t" = "managed" ] && { echo "$_x"; break; }
                    done)
             if [ -z "$_sif" ]; then
-              warn "中继接口没起来（ssid=${_sn:-?}）：wifi reload 后看 logread -e wpa_supplicant"
+              warn "中继接口没起来（ssid=${_sn:-?}）：ifdown ${_net:-wwan}; ifup ${_net:-wwan} 后看 logread -e wpa_supplicant"
               continue
             fi
             _sig=$(iw dev "$_sif" link 2>/dev/null | sed -n 's/.*signal: *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -n 1)
             _rate=$(iw dev "$_sif" link 2>/dev/null | sed -n 's/.*bitrate: *\([0-9.]*\) *MBit\/s.*/\1/p' | head -n 1)
+            _ch=$(iw dev "$_sif" link 2>/dev/null | sed -n 's/.*channel: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
             [ -n "$_rate" ] && _rate=" / ${_rate} Mbit/s"
+            [ -n "$_ch" ] && _rate="$_rate / 信道 ${_ch}"
             if [ -z "$_sig" ]; then
               warn "中继 $_sif 未连上上游（ssid=${_sn:-?}）"
             elif [ "$_sig" -ge -67 ]; then
               ok "中继 $_sif → ${_sn:-?}  ${_sig} dBm${_rate}"
             elif [ "$_sig" -ge -72 ]; then
-              warn "中继 $_sif → ${_sn:-?}  ${_sig} dBm 偏弱：可试 VHT40（见 wifi-doctor 第 5 节）"
+              warn "中继 $_sif → ${_sn:-?}  ${_sig} dBm 偏弱：把上游 AP 挪近，或让上游 5G 改到 149-165（法规多给 10dB）"
+              printf '      注意：在 STA（中继）侧改 htmode 降宽无效，mt76 会跟随上游宽度（见 wifi-doctor 第 5 节）\n'
             else
               warn "中继 $_sif → ${_sn:-?}  ${_sig} dBm 太弱：先调位置/朝向"
             fi
+            # DFS 信道：雷达检测会让整段 5G 静默 60 秒，中继连带全断。
+            # 这不是固件能绕过去的（法规要求），只能让上游把信道钉到 149-165。
+            case "$_ch" in
+              52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144)
+                warn "上游 5G 在 DFS 信道 ${_ch}：遇到雷达/军警设备会静默 60s，中继整段断（让上游改 149-165）" ;;
+            esac
           done
+          if [ "$_sta" = "1" ]; then
+            if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ]; then
+              warn "flow offload 还开着：中继场景建议关（turboacc sw_flow=0/hw_flow=0；relay-tune 会自己关）"
+            else
+              ok "flow offload 已关（中继场景下，桥接无线少一层 offload 路径）"
+            fi
+            if [ -x /usr/bin/relay-tune ]; then
+              ok "中继收敛器 relay-tune 在（开机先起 AP，再等中继，日志 /var/log/relay-tune.log）"
+            else
+              warn "relay-tune 缺失：开机会先等中继关联，2.4G SSID 出得慢"
+            fi
+          fi
           [ "$_sta" = "1" ] || ok "没配无线中继（5G 是本地 AP）"
           for _r in radio0 radio1; do
             uci -q get wireless.$_r >/dev/null 2>&1 || continue
@@ -1990,7 +2055,7 @@ jobs:
           else
             warn "内核已出现 $_hw 次 mt76 硬件重启 / 固件崩溃（看 wifi-doctor 第 6 节）"
           fi
-          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗在（每 3 分钟自动恢复掉线）" || warn "wifi-watchdog 缺失"
+          [ -x /usr/bin/wifi-watchdog ] && ok "无线看门狗在（每 2 分钟，AP 只重启本 radio / 中继先只重连接口）" || warn "wifi-watchdog 缺失"
 
           # ---------- 7. 结论 ----------
           sec "7. 结论"
@@ -2108,14 +2173,27 @@ jobs:
               _sig=$(iw dev "$d" link 2>/dev/null | sed -n 's/.*signal: *\(-*[0-9][0-9]*\) dBm.*/\1/p' | head -n 1)
               _wth=$(iwinfo "$d" info 2>/dev/null | sed -n 's/.*HT Mode: *//p' | head -n 1)
               [ -n "$_wth" ] && echo "    带宽模式：$_wth"
+              # 上游 5G 落在 DFS 信道时，雷达检测会让整段静默 60 秒，中继必然全断。
+              # 这不是本机能绕过的（法规要求），只能让上游把信道钉到 149-165。
+              _fq=$(iw dev "$d" link 2>/dev/null | sed -n 's/.*freq: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+              if [ -n "$_fq" ]; then
+                  _chh=$(( (_fq - 5000) / 5 ))
+                  case "$_chh" in
+                      52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144)
+                          echo "    ⚠️ 上游 5G 在 DFS 信道 ${_chh}：遇到雷达/军警设备会静默 60s，中继整段断"
+                          echo "       （只能在上游路由器把 5G 钉到 149-165）" ;;
+                  esac
+              fi
               if [ -z "$_sig" ]; then
                   echo '    ⚠️ 读不到信号强度：可能刚断开，或驱动没上报'
               elif [ "$_sig" -ge -67 ]; then
                   echo '    ✅ 链路够好，VHT80 的每子载波 SNR 撑得住'
               elif [ "$_sig" -ge -72 ]; then
-                  echo '    ⚠️ 链路偏弱：降到 VHT40 通常比硬撑 VHT80 的实际吞吐更高（见第 8 节）'
+                  echo '    ⚠️ 链路偏弱：先把上游 AP 挪近/改到 149-165（法规多给 10dB）；'
+                  echo '       ⚠️ 注意：在 STA（中继）侧改 htmode 降宽**没用**，mt76 会跟随上游 AP 的宽度（实测见第 8 节）'
               else
-                  echo '    ❌ 链路太弱（-72 以下）：先调中继位置/朝向，带宽压到 VHT40 甚至 HT20'
+                  echo '    ❌ 链路太弱（-72 以下）：先调中继位置/朝向；真要降宽得上游 AP 改宽度，'
+                  echo '       本机改 wireless.radioX.htmode 不会缩小 STA 侧的信道宽度'
               fi
           done
           [ "$_saw5" = "1" ] || echo '  （没有 Client 模式的接口：这台机器没在做无线中继）'
@@ -2160,12 +2238,18 @@ jobs:
           echo '  功率低      → wireless.radio0/1.country 必须是 CN（第 1 节看法规域）'
           echo '  信道挤      → 第 3 节占用率 >60% 才真挤；1/6/11 里挑最低的：uci set wireless.radio0.channel=1（或 6/11）；wifi reload'
           echo '  弱处掉线    → uci set wireless.default_radio0.disassoc_low_ack=0；wifi reload'
-          echo '  覆盖不够    → uci set wireless.radio1.htmode=VHT40；wifi reload'
+          echo '  覆盖不够    → 加天线/挪位置；上游 AP 的 5G 换到 149-165（国内 5.8G 的 EIRP 上限比 5.2G 高 10 dB）'
           echo '  内存不足    → 少装插件，或把屏蔽列表从 11 万条降到 5 万条后重新构建'
           echo '  驱动崩过    → 看 /var/log/wifi-watchdog.log（几点自动 wifi up/reload 的时间线）；'
-          echo '                频繁出现就把 5G 降到 VHT40：uci set wireless.radio1.htmode=VHT40；wifi reload'
+          echo '                注意：STA（中继）侧改 htmode 降宽没用，mt76 会跟随上游 AP 的宽度（实测见 README）'
+          echo '  中继一断全断 → 中继抖动时别用 wifi reload（它会把 2.4G AP 一起拆掉）。只重连中继接口：'
+          echo '                ifdown wwan; ifup wwan     —— 或直接等 wifi-watchdog（每 2 分钟，先 ifup 再 reconf）'
           echo '  2.4G 不稳   → MT7603E 出厂 EEPROM 的功率校准偏差大（刷机改不了它），先换 1 或 11 试；'
           echo '                仍不行只能刷改过的 EEPROM（会动 MAC/校准区，有变砖风险，不建议随手做）'
+          echo '  无线时断/连不上 → 中继场景先确认 flow offload 已关（第 7 节）：'
+          echo '                uci set turboacc.@turboacc[0].sw_flow=0; uci set turboacc.@turboacc[0].hw_flow=0;'
+          echo '                uci commit turboacc; /etc/init.d/firewall restart'
+          echo '  开机很久才有网 → cat /var/log/relay-tune.log（能看到"AP 第几秒就绪、中继第几秒连上"）'
           echo
           exit 0
           EOF
@@ -2176,17 +2260,21 @@ jobs:
           # wifi-watchdog：mt76 在 24.10 上会偶发 Hardware restart was requested / 固件崩溃，
           # 表现就是 2.4G 信号忽高忽低、SSID 时有时无、手机还显示连着但上不了网。
           # 本脚本只做恢复与记录，绝不改配置、绝不重启整机：
-          #   1) 每 3 分钟确认 AP 接口还在发信标（iwinfo 能报出 ESSID）
-          #   2) 连续两次探测不到 -> wifi up；再连续两次还不行 -> wifi reload
-          #   3) 每小时最多恢复 5 次，超过只记日志（防止抖动把无线反复重启）
-          #   4) 内核新增无线驱动报错时记一行，方便把“几点开始变差”对上时间线
+          #   1) 每 2 分钟确认 AP 接口还在发信标（iwinfo 能报出 ESSID）
+          #   2) AP 掉两轮 -> 只重启它所在的 radio（wifi down/up radioX），不再全量
+          #   3) 中继断了 -> 先只重连中继接口（ifdown/ifup wwan），再 reconf 中继那个 radio，
+          #      第 4 次才全量 wifi reload —— 全量重建会把 2.4G AP 一起拆掉，这是最后手段
+          #   4) 每小时最多恢复 5 次，超过只记日志（防止抖动把无线反复重启）
+          #   5) 内核新增无线驱动报错时记一行，方便把“几点开始变差”对上时间线
+          # 为什么按 radio 做：中继抖动时若用 wifi up / wifi reload（都是全量的），
+          # 2.4G AP 会在同一秒被拆掉重建 —— 手机当场搜不到 SSID，重连还要等 DHCP，
+          # 表现就是"5G 中继一抖，2.4G 跟着断好几分钟"。
           # 用法：wifi-watchdog（静默，给 cron 用）  wifi-watchdog status（看当前状态）
           
           LOG=/var/log/wifi-watchdog.log
           TMP=/tmp
           HW_FILE=$TMP/wifi-watchdog.hw
           CNT_FILE=$TMP/wifi-watchdog.cnt
-          HARD=$TMP/wifi-watchdog.hard
           MAXH=5
           
           log() {
@@ -2203,12 +2291,29 @@ jobs:
               dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash|mcu message' | tr -d ' '
           }
           
+          # ---- 判活：三通道，任一成立即算"在发信标" ----
+          # 血泪教训（2026-11-14 现场）：旧写法是 grep -q 'ESSID: "."'，
+          # 那个模式只匹配「引号里恰好一个字符」的 ESSID —— SSID 叫 alon（4 个字符）时
+          # 永远匹配不上，于是 watchdog 每 6 分钟把正常的 AP 判成掉线、执行 wifi up，
+          # 而 wifi up 是全量的：2.4G 的 AP 与 5G 的中继一起被拆了重建。
+          # 现场证据：hostapd 进程 8 小时没重启过、iwinfo 连续 20 次都能读到
+          # ESSID: "alon"，但日志里 44 次 "第 N 次恢复：wifi up"，每 6 分钟一次。
+          # 正确模式是 'ESSID: "'（引号后还有内容），而 ESSID: unknown 判死（对）。
+          # 再加两条兜底通道，避免单点误判：任一为真就不许动无线。
           alive() {
+              _i="$1"
               if command -v iwinfo >/dev/null 2>&1; then
-                  iwinfo "$1" info 2>/dev/null | grep -q 'ESSID: "."'
-              else
-                  [ -d "/sys/class/net/$1" ]
+                  iwinfo "$_i" info 2>/dev/null | grep -q 'ESSID: "' && return 0
               fi
+              if command -v iw >/dev/null 2>&1; then
+                  iw dev "$_i" info 2>/dev/null | grep -q '^[[:space:]]*ssid ' && return 0
+              fi
+              # 接口只在 hostapd 持有时才存在：存在且 operstate 正常也算活
+              [ -d "/sys/class/net/$_i" ] || return 1
+              case "$(cat "/sys/class/net/$_i/operstate" 2>/dev/null)" in
+                  up|dormant|unknown) return 0 ;;
+              esac
+              return 1
           }
 
           # 中继（STA）是否真的连上：iw 的 link 里没有 Connected to 就是断了
@@ -2216,27 +2321,54 @@ jobs:
               iw dev "$1" link 2>/dev/null | grep -q 'Connected to'
           }
           
-          recover() {
+          # ---- 接口 → radio 段名 ----
+          # 恢复动作必须落到「那一个 radio」上。wifi up / wifi reload 都是全量的：
+          # 5G 中继抖一下、2.4G 的 AP 也一起被拆掉重建，手机当场就搜不到 SSID，
+          # 重连 DHCP 再等一轮 —— 这是"中继模式下一断就是一片"的直接来源。
+          # /sbin/wifi 支持带设备名：wifi down radioX / up radioX / reconf radioX
+          # （内部就是 ubus call network.wireless down|up|reconf '{"device":"radioX"}'）。
+          # 定位不到 radio 才退化到全量，并在日志里写明代价。
+          radio_of_iface() {
+              _if="$1"
+              _hit=""
+              for _r in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\(radio[0-9][0-9]*\)=wifi-device$/\1/p'); do
+                  _ifs=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.$_r.interfaces[*].ifname" 2>/dev/null)
+                  case " $_ifs " in *" $_if "*) _hit="$_r" ;; esac
+              done
+              printf '%s' "$_hit"
+          }
+
+          # AP 不发信标：只重启它所在的 radio（2.4G 掉就只动 2.4G，5G 中继不受影响）
+          recover_ap() {
               if [ "$CN" -ge "$MAXH" ]; then
-                  log "本小时已恢复 ${CN} 次，达到上限，本轮只记录不动作（$1）"
+                  log "本小时已恢复 ${CN} 次，达到上限，本轮只记录不动作（AP $*）"
                   return 0
               fi
               CN=$((CN + 1))
               printf '%s %s\n' "$HOUR" "$CN" > "$CNT_FILE"
-              if [ -f "$HARD" ]; then
-                  log "第 ${CN} 次恢复：wifi up 无效，改用 wifi reload（$1）"
+              _fallback=0
+              for _if in "$@"; do
+                  _r=$(radio_of_iface "$_if")
+                  if [ -z "$_r" ]; then
+                      _fallback=1
+                      continue
+                  fi
+                  log "第 ${CN} 次恢复：只重启 $_r（$_if 不发信标），其他 radio 不动"
+                  wifi down "$_r" >/dev/null 2>&1
+                  sleep 2
+                  wifi up "$_r" >/dev/null 2>&1
+              done
+              if [ "$_fallback" -eq 1 ]; then
+                  log "定位不到掉线接口所属 radio，只能退化到 wifi reload（整机无线重建）"
                   wifi reload >/dev/null 2>&1
-                  rm -f "$HARD"
-              else
-                  log "第 ${CN} 次恢复：wifi up（$1）"
-                  : > "$HARD"
-                  wifi up >/dev/null 2>&1
               fi
           }
           
-          # 刚开机那几分钟 hostapd 还没起，别把它当故障
+          # 刚开机那两分钟无线还没起完，别把它当故障。
+          # 开机阶段的收敛交给 relay-tune（先拉 AP、再等中继，日志里有"第几秒连上"）；
+          # 这里只让出 100 秒，避免开机时两边抢着动无线。
           UP=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
-          if [ "$1" != "status" ] && [ -n "$UP" ] && [ "$UP" -lt 240 ]; then
+          if [ -z "$1" ] && [ -n "$UP" ] && [ "$UP" -lt 100 ]; then
               exit 0
           fi
           
@@ -2288,18 +2420,26 @@ jobs:
               [ "$1" = "status" ] && printf '  ❌ %-9s 已掉（连续 %s 次探测不到）\n' "$_if" "$_n"
           done
           
-          if [ -n "$DEAD_LIST" ]; then
-              recover "$DEAD_LIST"
+          if [ -n "$DEAD_LIST" ] && [ -z "$1" ]; then
+              recover_ap $DEAD_LIST
               for _if in $DEAD_LIST; do rm -f "$TMP/wifi-watchdog.fail.$_if"; done
-          else
-              rm -f "$HARD"
           fi
 
-          # 中继口单独判：AP 还在发信标，不代表上游连得上。断 3 轮（约 9 分钟）才 wifi reload，
-          # 因为 reload 会把整机无线都重启一遍，代价比 wifi up 大。
-          # 两道保险，避免"没配上游"或"上游彻底关机"时没完没了地 reload：
+          # 中继口单独判：AP 还在发信标，不代表上游连得上。
+          # 恢复顺序（代价从小到大，每级都能单独观察效果）：
+          #   1-2 次：只重连中继接口（ifdown/ifup <net>）—— 完全不碰 AP
+          #   3 次  ：reconf 中继所在的 radio（只重建 5G，2.4G AP 仍在发信标）
+          #   4 次  ：全量 wifi reload（会把 2.4G AP 一起重建，日志里标明代价）
+          #   5 次起：停手只记日志（等人工介入）
+          # 两道保险，避免"没配上游"或"上游彻底关机"时没完没了地动无线：
           #   seen   —— 本次开机连上过上游才管；从没连上过说明是中继没配好，不该动它
-          #   gaveup —— 连续 4 次 reload 都救不回来，就停手只记日志（等人工介入）
+          #   gaveup —— 连续 5 次都救不回来，就停手只记日志
+          STA_NETS=""
+          for _s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+              [ "$(uci -q get wireless.$_s.mode)" = "sta" ] || continue
+              _n=$(uci -q get wireless.$_s.network)
+              [ -n "$_n" ] && STA_NETS="$STA_NETS $_n"
+          done
           SEEN=$TMP/wifi-watchdog.sta.seen
           GIVE=$TMP/wifi-watchdog.sta.gaveup
           TRIES=$TMP/wifi-watchdog.sta.tries
@@ -2325,15 +2465,15 @@ jobs:
                   continue
               fi
               if [ -f "$GIVE" ]; then
-                  log "中继 $_if 已连续 4 次救不回来，暂停自动恢复（等人工处理）"
-                  [ "$1" = "status" ] && printf '  ❌ %-9s 已放弃自动恢复（救 4 次无效）\n' "$_if"
+                  log "中继 $_if 已连续 5 次救不回来，暂停自动恢复（等人工处理）"
+                  [ "$1" = "status" ] && printf '  ❌ %-9s 已放弃自动恢复（救 5 次无效）\n' "$_if"
                   continue
               fi
               STA_DEAD="$STA_DEAD $_if"
               [ "$1" = "status" ] && printf '  ❌ %-9s 中继已断（连续 %s 次）\n' "$_if" "$_n"
           done
 
-          if [ -n "$STA_DEAD" ]; then
+          if [ -n "$STA_DEAD" ] && [ -z "$1" ]; then
               if [ "$CN" -ge "$MAXH" ]; then
                   log "本小时已恢复 ${CN} 次，达到上限，中继断线只记录不动作（$STA_DEAD）"
               else
@@ -2343,11 +2483,33 @@ jobs:
                   [ -r "$TRIES" ] && _tr=$(cat "$TRIES" 2>/dev/null)
                   _tr=$((_tr + 1))
                   printf '%s\n' "$_tr" > "$TRIES"
-                  log "中继链路断开（$STA_DEAD），第 ${CN} 次恢复（累计第 ${_tr} 次重建）：wifi reload"
-                  wifi reload >/dev/null 2>&1
-                  if [ "$_tr" -ge 4 ]; then
+                  if [ "$_tr" -le 2 ]; then
+                      log "中继链路断开（$STA_DEAD），第 ${CN} 次恢复（累计第 ${_tr} 次重建）：只重连中继接口 ifdown/ifup ${STA_NETS:-（找不到 network 名）}，AP 不动"
+                      for _n in $STA_NETS; do
+                          ifdown "$_n" >/dev/null 2>&1
+                          sleep 1
+                          ifup "$_n" >/dev/null 2>&1
+                      done
+                  elif [ "$_tr" -eq 3 ]; then
+                      _rs=""
+                      for _if in $STA_DEAD; do
+                          _r=$(radio_of_iface "$_if")
+                          [ -n "$_r" ] && _rs="$_rs $_r"
+                      done
+                      if [ -n "$_rs" ]; then
+                          log "中继仍未连上，第 ${CN} 次恢复（累计第 ${_tr} 次）：reconf 中继所在 radio$_rs（只重建中继那一路，AP 继续发信标）"
+                          for _r in $_rs; do wifi reconf "$_r" >/dev/null 2>&1; done
+                      else
+                          log "中继仍未连上，且定位不到所属 radio：退化到 wifi reload（整机无线重建）"
+                          wifi reload >/dev/null 2>&1
+                      fi
+                  elif [ "$_tr" -eq 4 ]; then
+                      log "中继仍未连上，第 ${CN} 次恢复（累计第 ${_tr} 次）：wifi reload 全量重建（代价：2.4G AP 会一起断十几秒）"
+                      wifi reload >/dev/null 2>&1
+                  fi
+                  if [ "$_tr" -ge 5 ]; then
                       : > "$GIVE"
-                      log "中继已重建 ${_tr} 次仍连不上，暂停自动恢复（查上游路由器 / 中继位置）"
+                      log "中继已重建 ${_tr} 次仍连不上，暂停自动恢复（查上游路由器 / 中继位置 / 上游是否改了信道）"
                   fi
               fi
               for _if in $STA_DEAD; do rm -f "$TMP/wifi-watchdog.sta.$_if"; done
@@ -2364,6 +2526,47 @@ jobs:
           fi
           printf '%s\n' "$HW" > "$HW_FILE"
           
+          # ---- 自检：判活逻辑的回归保护 ----
+          # 这个脚本最贵的一次教训不是驱动崩，而是判活的正则写错（'ESSID: "."' 只匹配
+          # 单字符 SSID），结果把正常的 AP 永久判死、每小时 wifi up 5 次。
+          # 这类错误语法检查抓不到、日志看着也"正常"，所以给出一条能一键跑的确定性测试：
+          # 真实 AP 接口必须判活，一个绝不存在的接口名必须判死。
+          selftest() {
+              _bad=0
+              _ifs=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}')
+              _ap=""
+              for _d in $_ifs; do
+                  _t=$(iw dev "$_d" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1)
+                  [ "$_t" = "AP" ] && _ap="$_ap $_d"
+              done
+              for _d in $_ap; do
+                  if alive "$_d"; then
+                      printf '  ✅ alive(%s) = 活（iwinfo 首行：%s）\n' "$_d" "$(iwinfo "$_d" info 2>/dev/null | head -n 1)"
+                  else
+                      printf '  ❌ alive(%s) = 死，但 iwinfo 实际输出：%s\n' "$_d" "$(iwinfo "$_d" info 2>/dev/null | head -n 1)"
+                      _bad=1
+                  fi
+              done
+              [ -n "$_ap" ] || printf '  （没有 AP 接口，跳过正向测试）\n'
+              if alive "phy99-ap99"; then
+                  printf '  ❌ alive(不存在的接口) = 活，判死通道失效\n'
+                  _bad=1
+              else
+                  printf '  ✅ alive(不存在的接口) = 死\n'
+              fi
+              if [ "$_bad" -eq 0 ]; then
+                  printf '  判活逻辑正常\n'
+              else
+                  printf '  判活逻辑有问题：先比对 iwinfo 第一行与 grep 模式（应为 ESSID: "）\n'
+              fi
+              return $_bad
+          }
+
+          if [ "$1" = "selftest" ]; then
+              selftest
+              exit $?
+          fi
+
           if [ "$1" = "status" ]; then
               printf '\n无线看门狗状态\n'
               printf '  AP 接口：%s\n' "${AP_IFS:-（无）}"
@@ -2379,6 +2582,467 @@ jobs:
           exit 0
           EOF
 
+          # ---------- I4. 中继收敛器（开机先起 AP，再等中继；顺带关掉 wireless 上的 flow offload）----------
+          # 5G 当无线中继（sta）时，2.4G AP 与它是两颗 phy，但共用一个 wpad、一条启动流程：
+          #   · 开机时 sta 要扫描上游（全信道），AP 起得比它晚 → 手机迟迟搜不到 SSID；
+          #   · 中继抖动时若全量 wifi up/reload，2.4G AP 被一起拆掉重建 → "断、连不上、搜不到"；
+          #   · flow offload 把 br-lan 上的无线转发也接管过去（见下面 offload_off 的说明）。
+          # 这个脚本把"开机"这一段接管掉，运行期交给 wifi-watchdog（按 radio 分级处理）。
+          # 手动跑一次：relay-tune once     看状态：relay-tune status
+          cat > files/usr/bin/relay-tune << 'EOF'
+          #!/bin/sh
+          # relay-tune：中继 + 本地 AP 共存时的开机收敛器。只做三件事，全部可逆、全部写日志：
+          #   1) 检测到中继（有 sta 接口）就关掉 flow offload
+          #   2) 先确保本地 AP 在发信标（最多 90 秒），手机能尽快看到 SSID
+          #   3) 再按 5/10/15…30 秒递增重试 ifup 中继接口，日志留下"开机第几秒连上"
+          # 为什么不把这三件事塞进 wifi-watchdog：watchdog 是运行期的巡线员（每 2 分钟），
+          # 开机那几分钟由专门的一段逻辑处理，职责分开，出事看日志能一眼分清是哪一段。
+
+          LOG=/var/log/relay-tune.log
+
+          log() {
+              printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+              _sz=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+              [ -n "$_sz" ] || _sz=0
+              [ "$_sz" -gt 65536 ] && { tail -n 200 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"; }
+          }
+
+          uptime_sec() { awk '{print int($1)}' /proc/uptime 2>/dev/null; }
+          uci_secs() { uci -q show "$1" 2>/dev/null | sed -n "s/^$1\.\([^.]*\)=$2\$/\1/p"; }
+          radio_list() { uci_secs wireless wifi-device; }
+
+          sta_secs() {
+              for _s in $(uci_secs wireless wifi-iface); do
+                  [ "$(uci -q get wireless.$_s.mode)" = "sta" ] && echo "$_s"
+              done
+          }
+          sta_nets() {
+              for _s in $(sta_secs); do
+                  _n=$(uci -q get wireless.$_s.network)
+                  [ -n "$_n" ] && echo "$_n"
+              done
+          }
+
+          live_ifaces() { iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'; }
+          iface_type() { iw dev "$1" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1; }
+          ap_ifaces() { for _d in $(live_ifaces); do [ "$(iface_type "$_d")" = AP ] && echo "$_d"; done; }
+          sta_ifaces() { for _d in $(live_ifaces); do [ "$(iface_type "$_d")" = managed ] && echo "$_d"; done; }
+          # 判活同 wifi-watchdog：模式必须是 'ESSID: "'（旧写法 'ESSID: "."' 只匹配单字符 SSID，
+          # 会把叫 alon 的 AP 永久判死）。这里只用前两条通道，够用且不误杀。
+          ap_alive() {
+              iwinfo "$1" info 2>/dev/null | grep -q 'ESSID: "' && return 0
+              iw dev "$1" info 2>/dev/null | grep -q '^[[:space:]]*ssid ' && return 0
+              return 1
+          }
+          sta_linked() { iw dev "$1" link 2>/dev/null | grep -q 'Connected to'; }
+
+          # 接口 → radio 段名（wifi down/up 支持带设备名，只影响那一个 phy）
+          radio_of_iface() {
+              _if="$1"
+              _hit=""
+              for _r in $(radio_list); do
+                  _ifs=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.$_r.interfaces[*].ifname" 2>/dev/null)
+                  case " $_ifs " in *" $_if "*) _hit="$_r" ;; esac
+              done
+              printf '%s' "$_hit"
+          }
+
+          # ---- 关 flow offload（只在中继模式下）----
+          # TurboACC 的 sw_flow/hw_flow 最终写的是 firewall.@defaults[0].flow_offloading(_hw)；
+          # fw4 的 resolve_offload_devices() 会把各 zone 的物理设备递归展开到 bridge 的
+          # lower_* 成员（br-lan 的成员就是 eth* 与 wlan*），据此建 flowtable 并加
+          # "meta l4proto { tcp, udp } flow offload @ft" —— 无线客户端的转发也被接管。
+          # mt7621 主线没有可用的 flowtable 硬件 offload：fw4 探测失败会自己打一行
+          # "Hardware flow offloading unavailable, falling back to software offloading"
+          # 并降级成软件 offload —— 所以 hw_flow=1 在这台机器上等于软件 offload。
+          # 桥接 + 无线 + 软件 offload 这个组合在 mt76 上就是"连着但上不去网 / 时断时续"。
+          # 中继场景下先把这一层拿掉，排查面立刻少一层。
+          # 想保留：uci set turboacc.@turboacc[0].relay_keep_offload='1'; uci commit turboacc
+          offload_off() {
+              [ "$(uci -q get turboacc.@turboacc[0].relay_keep_offload)" = "1" ] && {
+                  log "turboacc.relay_keep_offload=1：保留 flow offload（若仍断流，把它删掉再重启）"
+                  return 0
+              }
+              _sw=$(uci -q get turboacc.@turboacc[0].sw_flow)
+              _hw=$(uci -q get turboacc.@turboacc[0].hw_flow)
+              _fw=$(uci -q get firewall.@defaults[0].flow_offloading)
+              _fwh=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+              [ "$_sw" = "1" ] || [ "$_hw" = "1" ] || [ "$_fw" = "1" ] || [ "$_fwh" = "1" ] || return 0
+              if [ -f /etc/config/turboacc ] && uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
+                  uci -q set turboacc.@turboacc[0].sw_flow='0'
+                  uci -q set turboacc.@turboacc[0].hw_flow='0'
+                  uci -q commit turboacc
+              fi
+              if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+                  uci -q set firewall.@defaults[0].flow_offloading='0'
+                  uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+                  uci -q commit firewall
+                  /etc/init.d/firewall restart >/dev/null 2>&1
+              fi
+              log "中继模式：已关 flow offload（turboacc sw=$_sw hw=$_hw，firewall $_fw/$_fwh → 0）"
+          }
+
+          once() {
+              _t0=$(uptime_sec); _t0=${_t0:-0}
+              [ -n "$(sta_secs)" ] || { log "没有 sta（中继）接口：纯 AP 模式，不做处理"; return 0; }
+              log "开始收敛（开机第 ${_t0}s，中继段：$(sta_secs | tr '\n' ' ')）"
+              offload_off
+
+              # 阶段 1：AP 先起来（最多 90 秒；第 20s / 60s 各纠一次，只重启 AP 所在的 radio）
+              _i=0
+              while [ "$_i" -lt 9 ]; do
+                  _i=$((_i + 1))
+                  _bad=""
+                  for _d in $(ap_ifaces); do ap_alive "$_d" || _bad="$_bad $_d"; done
+                  [ -n "$(ap_ifaces)" ] || _bad="(无 AP 接口)"
+                  if [ -z "$_bad" ]; then
+                      log "AP 就绪（用时 $(( $(uptime_sec) - _t0 ))s，此刻开机第 $(uptime_sec)s）"
+                      break
+                  fi
+                  if [ "$_i" -eq 2 ] || [ "$_i" -eq 6 ]; then
+                      for _d in $_bad; do
+                          _r=$(radio_of_iface "$_d")
+                          [ -n "$_r" ] || continue
+                          log "AP $_d 还没发信标（第 ${_i} 次检查），只重启 $_r"
+                          wifi down "$_r" >/dev/null 2>&1
+                          sleep 2
+                          wifi up "$_r" >/dev/null 2>&1
+                      done
+                  fi
+                  sleep 10
+              done
+
+              # 阶段 2：等中继连上（最多 5 分钟，间隔 5→30 秒递进；只动中继接口，不碰 AP）
+              # 先给 wpa_supplicant 30 秒自己关联的时间（正常 10 秒内就上），
+              # 太早 ifdown/ifup 会打断正在进行的扫描/关联，反而更慢。
+              if [ -z "$(for _d in $(sta_ifaces); do sta_linked "$_d" && echo x; done)" ]; then
+                  sleep 20
+              fi
+              _tries=0
+              _delay=5
+              while : ; do
+                  _ok=""
+                  for _d in $(sta_ifaces); do sta_linked "$_d" && _ok=1; done
+                  if [ -n "$_ok" ]; then
+                      log "中继已连上（用时 $(( $(uptime_sec) - _t0 ))s，此刻开机第 $(uptime_sec)s，重试 ${_tries} 次）"
+                      return 0
+                  fi
+                  _el=$(( $(uptime_sec) - _t0 ))
+                  if [ "$_el" -gt 300 ]; then
+                      log "中继等满 ${_el}s 仍未连上：交给 wifi-watchdog 分级处理（它只在连上过上游后才动作）"
+                      return 0
+                  fi
+                  _tries=$((_tries + 1))
+                  for _n in $(sta_nets); do
+                      log "第 ${_tries} 次重连中继接口 ${_n}（开机第 ${_el}s）"
+                      ifdown "$_n" >/dev/null 2>&1
+                      sleep 1
+                      ifup "$_n" >/dev/null 2>&1
+                  done
+                  sleep "$_delay"
+                  [ "$_delay" -lt 30 ] && _delay=$((_delay + 5))
+              done
+          }
+
+          status() {
+              printf '中继收敛器状态（开机 %ss）\n' "$(uptime_sec)"
+              printf '  AP 接口：%s\n' "$(ap_ifaces | tr '\n' ' ')"
+              for _d in $(ap_ifaces); do
+                  printf '    %-10s %s\n' "$_d" "$(iwinfo "$_d" info 2>/dev/null | sed -n 's/.*ESSID: *//p' | head -n 1)"
+              done
+              printf '  中继接口：%s\n' "$(sta_ifaces | tr '\n' ' ')"
+              for _d in $(sta_ifaces); do
+                  printf '    %-10s %s\n' "$_d" "$(iw dev "$_d" link 2>/dev/null | sed -n 's/^ *Connected to *//p' | head -n 1)"
+              done
+              printf '  flow offload：turboacc sw=%s hw=%s / firewall %s(%s)\n' \
+                  "$(uci -q get turboacc.@turboacc[0].sw_flow)" "$(uci -q get turboacc.@turboacc[0].hw_flow)" \
+                  "$(uci -q get firewall.@defaults[0].flow_offloading)" "$(uci -q get firewall.@defaults[0].flow_offloading_hw)"
+              if [ -s "$LOG" ]; then
+                  printf '  最近 8 条日志：\n'
+                  tail -n 8 "$LOG" | sed 's/^/    /'
+              fi
+          }
+
+          case "$1" in
+              status) status ;;
+              *) once ;;
+          esac
+          exit 0
+          EOF
+
+          cat > files/etc/init.d/relay-tune << 'EOF'
+          #!/bin/sh /etc/rc.common
+          # 开机跑一次（不常驻、不 respawn）：network 起来（START=20）之后、日志进 logread
+          USE_PROCD=1
+          START=99
+          STOP=10
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/bin/relay-tune once
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
+
+          cat > files/etc/uci-defaults/95-relay << 'EOF'
+          #!/bin/sh
+          # 中继收敛器开机自启。
+          # 无脑 enable 掉不设备：纯 AP 模式下 relay-tune 第一件事就是发现"没有 sta 接口"
+          # 然后立刻退出（只在 /var/log/relay-tune.log 留一行），代价是一次 awk。
+          # 这样也不用区分"先刷机后配中继"还是"刷机前就配好"两种顺序。
+          /etc/init.d/relay-tune enable 2>/dev/null
+          exit 0
+          EOF
+
+          # ---------- 97-ipv6：IPv6 用"中继"而不是"前缀委派" ----------
+          # 2026-11-14 在真机上把两条路都试了一遍，结论写在 README 里，这里只留配置：
+          #   · 前缀委派（PD）：CPE 确实给了 2409:8a0c:8e32:5111::/64，但它**不往这个前缀回程**，
+          #     客户端拿到地址后一个包都出不去（用 5110::/64 的源就能出去，正是这个差别暴露了问题）。
+          #   · 中继（RA/NDP relay）：客户端直接拿 CPE 那个 /64 的地址，路由做 NDP 代理 → 实测通。
+          #     证据：ping6 -S <5110 地址> 2400:3200::1 → 3/3，30ms；https://www.baidu.com → 200。
+          # 所以固件里固定用 relay；若将来换成有线回程、上游也支持 PD，把 dhcp.lan.ra 改回 server
+          # 并给 network.lan 加 ip6assign=60 即可（README 有命令）。
+          cat > files/etc/uci-defaults/97-ipv6 << 'EOF'
+          #!/bin/sh
+          # IPv6：上游给 RA/DHCPv6（无线中继 → CPE），本机做 RA + NDP 中继给 LAN。
+          [ -f /etc/config/network ] || exit 0
+
+          # 1) 上游 IPv6 接口：只要地址，不要前缀（PD 在这台 CPE 上不通，见 README）
+          uci -q delete network.wwan6
+          uci set network.wwan6=interface
+          uci set network.wwan6.proto='dhcpv6'
+          uci set network.wwan6.device='@wwan'
+          uci set network.wwan6.reqaddress='try'
+          uci set network.wwan6.reqprefix='no'
+
+          # 2) LAN 不再自己分配前缀，改成中继上游的 RA/DHCPv6/NDP
+          uci -q delete network.lan.ip6assign
+          uci -q delete network.globals.ula_prefix    # 关掉 ULA：三套地址只会让客户端选错源
+
+          # 3) odhcpd：上游是 master，LAN 是 relay
+          uci -q delete dhcp.wwan6
+          uci set dhcp.wwan6=dhcp
+          uci set dhcp.wwan6.interface='wwan6'
+          uci set dhcp.wwan6.master='1'
+          uci set dhcp.wwan6.ra='relay'
+          uci set dhcp.wwan6.dhcpv6='relay'
+          uci set dhcp.wwan6.ndp='relay'
+          uci set dhcp.wwan6.ignore='0'
+
+          uci set dhcp.lan.ra='relay'
+          uci set dhcp.lan.dhcpv6='relay'
+          uci set dhcp.lan.ndp='relay'
+          uci -q delete dhcp.lan.ra_slaac
+          uci -q delete dhcp.lan.ra_default
+
+          # 4) PassWall：被墙域名过滤 AAAA（走 IPv4 代理），国内域名保留 AAAA 直连 v6。
+          #    ipv6_tproxy 关掉是刻意的：这台机器不值得为 v6 再开一套 tproxy 规则。
+          if uci -q get passwall.@global[0] >/dev/null 2>&1; then
+              uci set passwall.@global[0].filter_proxy_ipv6='1'
+              uci set passwall.@global_forwarding[0].ipv6_tproxy='0'
+              uci commit passwall
+          fi
+
+          uci commit network
+          uci commit dhcp
+          exit 0
+          EOF
+
+          cat > files/usr/bin/usb-service << 'EOF'
+          #!/bin/sh
+          # usb-service：USB 即插即用 —— 相关服务平时关闭，插上设备才启动，拔掉就停。
+          #
+          # 为什么这么做：ksmbd / p910nd / usbmuxd / usbmode / wsdd2 加起来常驻要几十 MB 虚拟内存
+          # 与几秒启动时间，而它们绝大多数时间没有设备可用（没插 U 盘、没接打印机、没有 iPhone）。
+          # 让它们跟着设备走，既省资源又不牺牲功能。
+          #
+          # 对应关系：
+          #   U 盘/移动硬盘（已挂载到 /mnt/*） → ksmbd（SMB 共享）+ wsdd2（Windows 网络发现）
+          #   USB 打印机（/dev/usb/lp*）        → p910nd（RAW 9100 打印）
+          #   iPhone/iPad（Apple VID 05ac）     → usbmuxd
+          #   其它 USB 设备（上网卡等）         → usbmode（模式切换，放进来的可能是存储模式的棒子）
+          #
+          # 触发点：/etc/hotplug.d/usb/50-usb-services、/etc/hotplug.d/block/50-usb-services 每次插拔调用；
+          #         开机由 /etc/init.d/usb-service 调一次；手动重扫就再跑一次本脚本。
+          # 幂等：只认"该不该在跑"，不记录历史，任何时刻跑都收敛到正确状态。
+          #
+          # 用法：
+          #   usb-service            静默（hotplug 用）
+          #   usb-service status     看当前判断与状态
+          #   usb-service --dry-run  只打印判断，不启停任何服务
+
+          LOG=/var/log/usb-service.log
+          ST=/tmp/usb-service
+          DRY=0
+          [ "$1" = "--dry-run" ] && DRY=1
+          [ "$1" = "status" ] && DRY=2
+
+          log() {
+              [ "$DRY" = "0" ] || return 0
+              printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+              _sz=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+              [ -n "$_sz" ] || _sz=0
+              if [ "$_sz" -gt 65536 ]; then
+                  tail -n 200 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
+              fi
+          }
+
+          say() { [ "$DRY" = "0" ] || printf '%s\n' "$*"; }
+
+          # 有没有指定厂商的 USB 设备（跳过 root hub：它们 idVendor=1d6b）
+          usb_has_vid() {
+              for _d in /sys/bus/usb/devices/*/idVendor; do
+                  [ -f "$_d" ] || continue
+                  [ "$(cat "$_d" 2>/dev/null)" = "$1" ] && return 0
+              done
+              return 1
+          }
+
+          # 除 hub 以外还有没有任何 USB 设备在（hub 的 bDeviceClass=09）
+          usb_any_device() {
+              for _d in /sys/bus/usb/devices/*; do
+                  [ -f "$_d/bDeviceClass" ] || continue
+                  [ "$(cat "$_d/bDeviceClass" 2>/dev/null)" = "09" ] && continue
+                  [ -f "$_d/idVendor" ] || continue
+                  return 0
+              done
+              return 1
+          }
+
+          # 已挂载的 U 盘/移动硬盘挂载点（取第一个）
+          storage_mount() {
+              # 测试钩子：没有真 U 盘时也能验证 SMB 分支（USB_SERVICE_TEST_MOUNT=/mnt/sda1 usb-service）
+              [ -n "$USB_SERVICE_TEST_MOUNT" ] && { echo "$USB_SERVICE_TEST_MOUNT"; return 0; }
+              /sbin/block info 2>/dev/null \
+                | sed -n 's|^/dev/sd[a-z][0-9]*: .*MOUNT="\(/mnt[^"]*\)".*|\1|p' \
+                | head -n 1
+          }
+
+          have_state() { [ -f "$ST.$1" ]; }
+
+          # apply <服务名> <要不要 1/0>
+          apply() {
+              _svc="$1"
+              _want="$2"
+              if [ "$_want" = "1" ]; then
+                  if have_state "$_svc"; then
+                      say "  $_svc：需要（在跑）"
+                  else
+                      say "  $_svc：需要 -> 启动"
+                      if [ "$DRY" = "0" ]; then
+                          /etc/init.d/"$_svc" start >/dev/null 2>&1
+                          : > "$ST.$_svc"
+                          log "启动 $_svc"
+                      fi
+                  fi
+              else
+                  if have_state "$_svc"; then
+                      say "  $_svc：不需要 -> 停止"
+                      if [ "$DRY" = "0" ]; then
+                          /etc/init.d/"$_svc" stop >/dev/null 2>&1
+                          rm -f "$ST.$_svc"
+                          log "停止 $_svc"
+                      fi
+                  else
+                      say "  $_svc：不需要（本来就没跑）"
+                  fi
+              fi
+          }
+
+          main() {
+              _mp=$(storage_mount)
+              _printer=0
+              ls /dev/usb/lp* >/dev/null 2>&1 && _printer=1
+              _apple=0
+              usb_has_vid 05ac && _apple=1
+              _anyusb=0
+              usb_any_device && _anyusb=1
+
+              if [ "$DRY" != "0" ]; then
+                  printf 'USB 设备：'
+                  [ "$_anyusb" = "1" ] && printf '有 ' || printf '无 '
+                  [ "$_apple" = "1" ] && printf '(含 Apple) ' || :
+                  [ "$_printer" = "1" ] && printf '(含打印机) ' || :
+                  [ -n "$_mp" ] && printf '(存储挂载在 %s) ' "$_mp" || printf '(无存储) '
+                  printf '\n'
+              fi
+
+              # SMB 共享的路径跟着实际挂载点走（不然 U 盘挂到 sdb1 就共享了个空目录）
+              if [ -n "$_mp" ] && [ "$DRY" = "0" ]; then
+                  _cur=$(uci -q get ksmbd.@share[0].path)
+                  if [ "$_cur" != "$_mp" ]; then
+                      uci -q set ksmbd.@share[0].path="$_mp" && uci -q commit ksmbd && log "共享路径 -> $_mp"
+                  fi
+              fi
+
+              # 有存储才起 SMB；停的时候先停 wsdd2 再停 ksmbd（顺序反了 discovery 会空跑一会儿）
+              if [ -n "$_mp" ]; then
+                  apply ksmbd 1
+                  apply wsdd2 1
+              else
+                  apply wsdd2 0
+                  apply ksmbd 0
+              fi
+              apply p910nd "$_printer"
+              apply usbmuxd "$_apple"
+              apply usbmode "$_anyusb"
+          }
+
+          main
+          EOF
+
+          cat > files/etc/hotplug.d/usb/50-usb-services << 'EOF'
+          #!/bin/sh
+          # hotplug：USB 设备插拔 -> 重新对账（服务跟着设备起停）
+          # 必须后台跑：ksmbd 启动约 1 秒、wsdd2 启动里有 sleep 5，同步跑会卡住整条 hotplug 队列。
+          [ -x /usr/bin/usb-service ] || exit 0
+          /usr/bin/usb-service >/dev/null 2>&1 &
+          exit 0
+          EOF
+
+          cat > files/etc/hotplug.d/block/50-usb-services << 'EOF'
+          #!/bin/sh
+          # hotplug：USB 设备插拔 -> 重新对账（服务跟着设备起停）
+          # 必须后台跑：ksmbd 启动约 1 秒、wsdd2 启动里有 sleep 5，同步跑会卡住整条 hotplug 队列。
+          [ -x /usr/bin/usb-service ] || exit 0
+          /usr/bin/usb-service >/dev/null 2>&1 &
+          exit 0
+          EOF
+
+          cat > files/etc/init.d/usb-service << 'EOF'
+          #!/bin/sh /etc/rc.common
+          # 开机对账一次：把"该在跑的服务"和"实际在跑的"对齐。
+          # 平时什么设备都不插时，这里什么都不启动（都判成"不需要"），
+          # 只在开机时插着 U 盘/打印机/上网卡的情况下才把对应服务拉起来。
+          START=99
+          STOP=01
+          USE_PROCD=0
+
+          start() {
+          	[ -x /usr/bin/usb-service ] && /usr/bin/usb-service
+          }
+
+          stop() {
+          	:
+          }
+          EOF
+          cat > files/etc/uci-defaults/96-usb-service << 'EOF'
+          #!/bin/sh
+          # USB 外设相关服务改成"跟着设备走"：开机不自启，插上由 usb-service 拉起，拔掉就停。
+          # 只动这五个（它们都只在插着设备时才有意义）；代理/DNS 那些与设备无关的服务不碰。
+          #   ksmbd   U 盘共享        p910nd  USB 打印
+          #   usbmuxd iPhone 同步     usbmode 上网卡模式切换
+          #   wsdd2   Windows 网络发现（没有 ksmbd 时可访问性为零）
+          for s in ksmbd p910nd usbmuxd usbmode wsdd2; do
+          	/etc/init.d/$s disable 2>/dev/null
+          done
+          /etc/init.d/usb-service enable 2>/dev/null
+          # 首启就对账一次：刷机前就插着 U 盘/打印机时，这里直接把服务拉起来
+          /usr/bin/usb-service 2>/dev/null
+          exit 0
+          EOF
           # ---------- K. 去广告：把 anti-AD 编译成 MosDNS 的域名集合 ----------
           # 为什么不用 chinadns-ng 那套"屏蔽列表"：只有它会把清单编译成 null 组，
           # 而 chinadns-ng 会把 MosDNS 返回的 0.0.0.0 换成代理侧的真实应答（见 C 节说明）。
@@ -2425,9 +3089,10 @@ jobs:
             echo "::error::广告清单异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
             exit 1
           fi
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/wifi-watchdog \
-                   files/etc/init.d/mosdns \
-                   files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service \
+                   files/etc/init.d/mosdns files/etc/init.d/relay-tune \
+                   files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local \
+                   files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
           for f in files/usr/bin/* files/etc/uci-defaults/* files/etc/hotplug.d/net/* files/etc/init.d/* files/etc/rc.local; do
             [ -f "$f" ] || continue
@@ -2569,6 +3234,14 @@ jobs:
             fi
           }
           check CONFIG_PACKAGE_dnsmasq-full
+          # dnsmasq 与 dnsmasq-full 是同一份源码的两个 VARIANT（full 里 PROVIDES:=dnsmasq）。
+          # 两个都 =y 会往镜像里塞两份 /usr/sbin/dnsmasq，这里硬拦；正常状态只看得到 full。
+          if grep -qx 'CONFIG_PACKAGE_dnsmasq=y' .config; then
+            echo "::error::CONFIG_PACKAGE_dnsmasq 与 CONFIG_PACKAGE_dnsmasq-full 同时选中（同源变体冲突）"
+            MISSING=1
+          else
+            echo "  ✅ dnsmasq 只有 full 变体生效"
+          fi
           if grep -qx 'CONFIG_PACKAGE_ca-bundle=y' .config; then
             echo "  ✅ ca-bundle 已编入（MosDNS 的 DoH 要校验证书）"
           else
@@ -2580,6 +3253,14 @@ jobs:
           # 25.12.16 没有 Nftables/Iptables_Transparent_Proxy 开关（自己按 fw4+nftset 判断），
           # 也必须有中文翻译包，否则页面是英文
           check CONFIG_PACKAGE_luci-i18n-passwall-zh-cn
+          # 语言开关：符号是 CONFIG_LUCI_LANG_<po 目录名>，24.10 只有 zh_Hans；
+          # zh-cn 只是 luci.mk 的 LC 别名（只用于 i18n 包名），写成 CONFIG_LUCI_LANG_zh-cn
+          # 不会报错、只会静默失效（除下面点名的几个页面外，LuCI 全是英文），所以单独点名核对。
+          if grep -qx 'CONFIG_LUCI_LANG_zh_Hans=y' .config; then
+            echo "  ✅ LuCI 语言开关 = 简体中文（CONFIG_LUCI_LANG_zh_Hans）"
+          else
+            echo "::warning::CONFIG_LUCI_LANG_zh_Hans 未生效：符号写错会被 defconfig 丢弃，除显式点名的页面外 LuCI 显示英文"
+          fi
           check CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray
           check CONFIG_PACKAGE_xray-core
           check CONFIG_PACKAGE_chinadns-ng
@@ -3174,6 +3855,15 @@ jobs:
             chk fw-selftest usr/bin/fw-selftest
             chk wifi-doctor usr/bin/wifi-doctor
           chk wifi-watchdog usr/bin/wifi-watchdog
+            chk relay-tune  usr/bin/relay-tune
+            chk relay-init  etc/init.d/relay-tune
+            chk uci-95      etc/uci-defaults/95-relay
+            chk uci-96      etc/uci-defaults/96-usb-service
+            chk uci-97      etc/uci-defaults/97-ipv6
+            chk usb-svc     usr/bin/usb-service
+            chk usb-init    etc/init.d/usb-service
+            chk usb-hp      etc/hotplug.d/usb/50-usb-services
+            chk blk-hp      etc/hotplug.d/block/50-usb-services
             chk rule-refresh usr/bin/rule-refresh
             chk memguard    usr/bin/memguard
             chk quick-check usr/bin/quick-check
@@ -3498,9 +4188,10 @@ jobs:
               规则随包发布、运行时不联网；无节点时直连，不会断网
             - **去广告**：MosDNS 的域名集合吃 anti-AD（约 11 万条域名，命中返回 0.0.0.0；
               清单构建期下载、运行时不联网、不占 overlay）
-            - **DNS**：客户端 53 → 系统 dnsmasq → MosDNS（127.0.0.1:5335，去广告 + DoH 加密上游阿里/腾讯，
-              明文只做兜底）；PassWall 不抢 53（`dns_redirect=0`），只用 chinadns-ng 给被代理域名做 TCP 上游；
-              不装 luci-app-mosdns、不编 geo 数据，省约 30MB 闪存
+            - **DNS**：客户端 53 → 系统 dnsmasq → chinadns-ng（15355，分流）→
+              国内走 MosDNS（5335，去广告 + DoH 到阿里/腾讯）、被墙走 Xray 内置 DNS
+              （DoH `https://1.1.1.1/dns-query`，**查询经节点隧道出去**，ISP 看不到）；
+              PassWall 不抢 53（`dns_redirect=0`）；不装 luci-app-mosdns、不编 geo 数据，省约 30MB 闪存
             - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
@@ -3512,7 +4203,7 @@ jobs:
               只有使用「分流节点」时才需要，用到时在 PassWall → 规则列表里按需更新
 
             ### 无线
-            - 2.4G：`alon` @ 自动信道 HT20 · 5G：`alon-5G` @ ch149 VHT80 · WPA2 `alon12345678`（**请立即修改**）
+            - 2.4G：`alon` @ 信道 1 · HT20 · 20 dBm · 5G：`alon-5G` @ ch149 VHT80 · WPA2 `alon12345678`（**请立即修改**）
 
             ### 出问题怎么办
             一键体检：SSH 执行 **quick-check**（DNS / 去广告 / 代理 / 共享 / USB / 内存 / 无线，一页汇总 + 结尾给下一步）
