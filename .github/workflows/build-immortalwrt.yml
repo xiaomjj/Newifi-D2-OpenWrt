@@ -242,7 +242,7 @@ jobs:
           # 整个构建在这一行就挂了（重定向失败，不是 chmod 的问题）。
           # 现在把清单写全，以后新增文件只需要确认目录在这张表里。
           mkdir -p files/etc/uci-defaults \
-                   files/etc/hotplug.d/net files/etc/hotplug.d/usb files/etc/hotplug.d/block \
+                   files/etc/hotplug.d/net files/etc/hotplug.d/usb files/etc/hotplug.d/block files/etc/hotplug.d/iface \
                    files/etc/config files/etc/crontabs files/etc/sysctl.conf.d \
                    files/etc/mosdns files/etc/init.d \
                    files/usr/bin files/usr/libexec \
@@ -338,6 +338,24 @@ jobs:
           uci set wireless.radio1.legacy_rates='0'
 
           # ---- SSID / 密码保持原样 ----
+          # ---- radio1 上如果已经有中继（mode=sta），就不要硬把 5G AP 打开 ----
+          # 现场教训（2026-11-15 刷机后）：用户把 radio1 当 STA 中继用，这条 uci-defaults 每次
+          # 首启都把 default_radio1.disabled 强行改成 0，于是 5G 变成 AP+STA 同频共存
+          # （phy1-ap0 与 phy1-sta0 同一信道）——空口要和自家客户端分时，中继吞吐被摊薄。
+          # 实测（-73 dBm、同一 URL、各 3 次）：AP 开 3.63 MB/s、AP 关 3.59 MB/s，差异在噪声内，
+          # 所以“共存会明显变慢”不成立；但**用户的意图必须尊重**：他要是把 5G 只当中继，
+          # 就不该被固件擅自打开一个 AP。这里只在 radio1 上没有 sta 段时才打开 AP。
+          _sta_on_r1=0
+          for _s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+              [ "$(uci -q get wireless.$_s.device)" = "radio1" ] || continue
+              [ "$(uci -q get wireless.$_s.mode)" = "sta" ] && _sta_on_r1=1
+          done
+          if [ "$_sta_on_r1" = "1" ]; then
+              echo "radio1 已被中继占用（存在 mode=sta 的段）：保留现有 AP 开关状态，不强行打开 5G AP"
+          else
+              uci set wireless.default_radio1.disabled='0'
+          fi
+
           uci set wireless.default_radio0.ssid='alon'
           uci set wireless.default_radio0.encryption='psk2'
           uci set wireless.default_radio0.key='alon12345678'
@@ -347,7 +365,7 @@ jobs:
           uci set wireless.default_radio1.ssid='alon-5G'
           uci set wireless.default_radio1.encryption='psk2'
           uci set wireless.default_radio1.key='alon12345678'
-          uci set wireless.default_radio1.disabled='0'
+          # disabled 由上面的 _sta_on_r1 分支决定，这里不再无条件打开
           uci set wireless.default_radio1.disassoc_low_ack='0'
 
           uci commit wireless
@@ -579,6 +597,17 @@ jobs:
           start_service() {
               [ -x "$PROG" ] || { logger -t mosdns "找不到 $PROG"; return 1; }
               [ -f "$CONF" ] || { logger -t mosdns "找不到 $CONF"; return 1; }
+              # MosDNS 只监听 127.0.0.1:5335。本脚本 START=18 早于 network(20)，
+              # 开机时 lo 上的 127.0.0.1 还没配上，直接起会连打两条
+              #   "listen udp 127.0.0.1:5335: bind: cannot assign requested address" FATAL
+              # （随后靠 respawn 重试才成功，日志看着像故障）。
+              # 这里先等 loopback 就绪（最多 8 秒），等不到也照样起——交给 respawn 兜底。
+              _w=0
+              while [ "$_w" -lt 16 ]; do
+                  ip -o addr show lo 2>/dev/null | grep -q '127\.0\.0\.1' && break
+                  sleep 0.5
+                  _w=$((_w + 1))
+              done
               procd_open_instance mosdns
               procd_set_param command "$PROG" start -c "$CONF" -d "$DIR"
               procd_set_param env QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
@@ -1441,6 +1470,19 @@ jobs:
           EOF
 
           # ---------- F. 内核调优（针对 MT7621 双核 / 512MB 内存）----------
+          # ---------- /etc/config/fstab：只为一个原因存在 ----------
+          # 没有这个文件时，开机 block 会连打 4 条
+          #   "block: unable to load configuration (fstab: Entry not found)"
+          # 属于纯噪声（我们不用 fstab 挂载），但会让人以为挂载坏了。给个空配置即可。
+          cat > files/etc/config/fstab << 'EOF'
+          config 'global'
+          	option	anon_mount	0
+          	option	auto_swap	1
+          	option	auto_mount	1
+          	option	delay_root	5
+          	option	check_fs	0
+          EOF
+
           cat > files/etc/sysctl.conf << 'EOF'
           # ---- 缓冲与队列：BBR 需要 fq，rmem/wmem 上限要放开否则 tcp_rmem 白设 ----
           net.core.default_qdisc = fq
@@ -1807,7 +1849,8 @@ jobs:
           fi
           [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ] && ok "BBR 生效" || ng "BBR 未生效"
           [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
-          [ -d /mnt/sda1 ] && ok "U 盘已挂载 /mnt/sda1" || ng "未检测到 U 盘（未插可忽略）"
+          # 没插 U 盘是正常状态（固件里 ksmbd 由 usb-service 按需起），不该拉低信噪比
+          [ -d /mnt/sda1 ] && ok "U 盘已挂载 /mnt/sda1" || printf '  · 未插 U 盘（需要共享时插上即可，ksmbd 会自动起）\n'
 
           echo
           printf '通过 %d 项，失败 %d 项\n' "$P" "$F"
@@ -1887,7 +1930,17 @@ jobs:
           if ifstatus wan 2>/dev/null | grep -q '"up": true'; then
             ok "WAN 已拨通：$(ifstatus wan 2>/dev/null | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -n1)"
           else
-            warn "WAN 未起来（先解决拨号，再判断代理与去广告）"
+            # 中继（无线上行）场景下 wan 本来就是 down，真正的上行是 wwan/wan6。
+            # 2026-11-15 现场：wan down、wwan up（能上网），旧逻辑误报"WAN 未起来"。
+            _up=""
+            for _i in wan wwan wan6; do
+              ifstatus "$_i" 2>/dev/null | grep -q '"up": true' && _up="$_up $_i"
+            done
+            if [ -n "$_up" ]; then
+              ok "上行已通（$_up ，其中 wan 未接线属正常）"
+            else
+              warn "没有任何上行（wan/wwan/wan6 全 down）：先解决上网，再看代理与去广告"
+            fi
           fi
           pidof dnsmasq >/dev/null 2>&1 && ok "dnsmasq 运行中" || bad "dnsmasq 没跑：执行 /etc/init.d/dnsmasq restart"
           _up=$(uci -q get dhcp.@dnsmasq[0].server)
@@ -1917,10 +1970,16 @@ jobs:
           fi
           _adt=$(head -n1 /etc/mosdns/adblock.txt 2>/dev/null)
           if [ -n "$_adt" ]; then
-            if nslookup "$_adt" 127.0.0.1 2>/dev/null | grep -q "0.0.0.0"; then
+            # 必须直接问 MosDNS(5335)：走 53 全链路时，被分到"境外"的域名根本不会经过 MosDNS，
+            # 于是"清单里有这个域名却解析出真 IP"——那是分流正常，不是拦截失效（曾误报）。
+            if nslookup -port=5335 "$_adt" 127.0.0.1 2>/dev/null | grep -q "0.0.0.0"; then
               ok "广告拦截生效（$_adt → 0.0.0.0）"
             else
-              warn "广告域名 $_adt 没被拦（清单可能刚改过，/etc/init.d/mosdns restart 后重试）"
+              if nslookup "$_adt" 127.0.0.1 2>/dev/null | grep -q "0.0.0.0"; then
+                ok "广告拦截生效（$_adt → 0.0.0.0，经 53 全链路）"
+              else
+                warn "MosDNS 没拦住 $_adt（清单可能刚改过：/etc/init.d/mosdns restart 后重试；或该域名被分流到境外解析）"
+              fi
             fi
           fi
 
@@ -1969,8 +2028,18 @@ jobs:
           fi
           # ---------- 5. 本机服务 ----------
           sec "5. 本机服务"
-          ls /etc/rc.d/S*ksmbd >/dev/null 2>&1 && ok "Ksmbd 开机自启（共享目录 /mnt/sda1）" || warn "Ksmbd 未设自启（/etc/init.d/ksmbd enable）"
-          ls /etc/rc.d/S*p910nd >/dev/null 2>&1 && ok "p910nd 开机自启（USB 打印机 /dev/usb/lp0）" || warn "p910nd 未设自启（/etc/init.d/p910nd enable）"
+          # 本固件把 ksmbd/p910nd/usbmuxd/usbmode/wsdd2 交给 usb-service 按需起停，
+          # "开机自启"本来就不该有（S 链接为空才是正确状态）。这里只在 usb-service 缺失时才告警。
+          if [ -x /usr/bin/usb-service ]; then
+            ok "Ksmbd 由 usb-service 按需管理（插 U 盘才起，不占开机时间）"
+          else
+            ls /etc/rc.d/S*ksmbd >/dev/null 2>&1 && ok "Ksmbd 开机自启" || warn "Ksmbd 未设自启且没有 usb-service（/etc/init.d/ksmbd enable）"
+          fi
+          if [ -x /usr/bin/usb-service ]; then
+            ok "p910nd 由 usb-service 按需管理（插打印机才起）"
+          else
+            ls /etc/rc.d/S*p910nd >/dev/null 2>&1 && ok "p910nd 开机自启" || warn "p910nd 未设自启且没有 usb-service（/etc/init.d/p910nd enable）"
+          fi
           [ -x /usr/bin/memguard ] && ok "内存看门狗 memguard 已装（每 10 分钟）" || warn "memguard 缺失"
           _cn2=$(grep -c "" /etc/crontabs/root 2>/dev/null)
           [ -n "$_cn2" ] || _cn2=0
@@ -2025,8 +2094,16 @@ jobs:
             esac
           done
           if [ "$_sta" = "1" ]; then
-            if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ]; then
-              warn "flow offload 还开着：中继场景建议关（turboacc sw_flow=0/hw_flow=0；relay-tune 会自己关）"
+            # 两层判读：配置位 vs 实际生效。2026-11-15 现场出现过 uci=1 但
+            # nft 里既没有 flowtable 也没有 "flow offload" 规则（内核没编 NF_FLOW_TABLE 支持），
+            # 那种"开着但不生效"不该报故障，只提示清理配置以免误导排查。
+            _fo_cfg=$(uci -q get firewall.@defaults[0].flow_offloading)
+            _fo_nft=$(nft list ruleset 2>/dev/null | grep -c 'flow offload')
+            _fo_tbl=$(nft list flowtable inet fw4 2>/dev/null | grep -c 'flowtable')
+            if [ "$_fo_cfg" = "1" ] && [ "$_fo_nft" -gt 0 ]; then
+              warn "flow offload 真的在跑：中继场景建议关（uci set turboacc.@turboacc[0].sw_flow=0 后 relay-tune once）"
+            elif [ "$_fo_cfg" = "1" ]; then
+              ok "flow offload 配置位=1 但内核没有 flowtable（实际不生效，可以不管）"
             else
               ok "flow offload 已关（中继场景下，桥接无线少一层 offload 路径）"
             fi
@@ -2862,6 +2939,29 @@ jobs:
           exit 0
           EOF
 
+          # ---------- 中继接口起来就收敛一次（覆盖"刷机后才配中继"的场景）----------
+          # 2026-11-15 现场发现的真实缺陷：开机时若还没有 sta 段（用户还没配中继，或刚刷完机），
+          # relay-tune 在 S99 只跑一次、判成"纯 AP 模式"就退出；用户随后在 LuCI 里配好中继，
+          # 结果 flow offload 一直开着、"先起 AP 再等中继"的逻辑也没生效（日志里只有一行
+          # "没有 sta（中继）接口：纯 AP 模式，不做处理"）。
+          # 这个 hotplug 让中继接口一 up 就补跑一次，之后的重连由 wifi-watchdog 接管。
+          cat > files/etc/hotplug.d/iface/90-relay-tune << 'EOF'
+          #!/bin/sh
+          # 中继（managed）接口 ifup 时补跑一次 relay-tune：关 flow offload + 记录收敛时间线。
+          [ "$ACTION" = "ifup" ] || exit 0
+          [ -x /usr/bin/relay-tune ] || exit 0
+          case "$INTERFACE" in
+              wwan|wwan6) ;;
+              *)
+                  # 网络名不是 wwan 时按设备类型兜底判断（用户可能自己改名）
+                  [ -n "$DEVICE" ] || exit 0
+                  iw dev "$DEVICE" info 2>/dev/null | grep -q 'type managed' || exit 0
+                  ;;
+          esac
+          /usr/bin/relay-tune once >/dev/null 2>&1 &
+          exit 0
+          EOF
+
           cat > files/usr/bin/usb-service << 'EOF'
           #!/bin/sh
           # usb-service：USB 即插即用 —— 相关服务平时关闭，插上设备才启动，拔掉就停。
@@ -3102,9 +3202,10 @@ jobs:
             exit 1
           fi
           chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service \
-                   files/etc/init.d/mosdns files/etc/init.d/relay-tune \
+                   files/etc/init.d/mosdns files/etc/init.d/relay-tune files/etc/init.d/usb-service \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local \
-                   files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services
+                   files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services \
+                   files/etc/hotplug.d/iface/90-relay-tune
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
           for f in files/usr/bin/* files/etc/uci-defaults/* files/etc/hotplug.d/*/* files/etc/init.d/* files/etc/rc.local; do
             [ -f "$f" ] || continue
@@ -3880,6 +3981,8 @@ jobs:
             chk memguard    usr/bin/memguard
             chk quick-check usr/bin/quick-check
             chk proxy-host  usr/share/passwall/rules/proxy_host
+            chk iface-hp    etc/hotplug.d/iface/90-relay-tune
+            chk cfg-fstab   etc/config/fstab
             chk cfg-ksmbd   etc/config/ksmbd
             chk cfg-p910nd  etc/config/p910nd
             chk sysctl      etc/sysctl.conf
