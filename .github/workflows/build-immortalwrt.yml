@@ -1565,9 +1565,12 @@ jobs:
           TOTAL=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
           [ -n "$TOTAL" ] || TOTAL=128
           WARN=$((TOTAL * 8 / 100))
-          [ "$WARN" -ge 8192 ] || WARN=8192
+          # 单位是 MB（TOTAL 上面已除过 1024）。原来的下限写成了 8192 / 4096 —— 那是 KB 口径的数值，
+          # 在 431MB 的机器上等于 WARN=8192MB、DANGER=4096MB，**永远触发**：每 10 分钟清一次页缓存、
+          # 还截日志。现场证据：memguard.log 里「危险：可用 300MB / 共 431MB」。改成 MB 口径的下限。
+          [ "$WARN" -ge 32 ] || WARN=32
           DANGER=$((TOTAL * 4 / 100))
-          [ "$DANGER" -ge 4096 ] || DANGER=4096
+          [ "$DANGER" -ge 16 ] || DANGER=16
 
           if [ "$AVAIL" -lt "$DANGER" ]; then
               sync
@@ -2427,6 +2430,18 @@ jobs:
               printf '%s' "$_hit"
           }
 
+          # 这颗 radio 上有没有 managed（中继）接口。有就绝对不能 wifi down —— 会把上行一起拆掉，
+          # 中继一断又触发 hotplug / 看门狗，mt76 在反复 down-up 里卡死时 procd 的硬件看门狗会复位整机。
+          radio_has_sta() {
+              _rhs_r="$1"
+              [ -n "$_rhs_r" ] || return 1
+              _rhs_ifs=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.$_rhs_r.interfaces[*].ifname" 2>/dev/null)
+              for _rhs_x in $_rhs_ifs; do
+                  [ "$(iw dev "$_rhs_x" info 2>/dev/null | sed -n "s/.*type //p" | head -n 1)" = "managed" ] && return 0
+              done
+              return 1
+          }
+
           # AP 不发信标：只重启它所在的 radio（2.4G 掉就只动 2.4G，5G 中继不受影响）
           recover_ap() {
               if [ "$CN" -ge "$MAXH" ]; then
@@ -2442,14 +2457,26 @@ jobs:
                       _fallback=1
                       continue
                   fi
+                  if radio_has_sta "$_r"; then
+                      log "第 ${CN} 次恢复：$_if 不发信标，但 $_r 同时承载中继，不 down（避免拆掉上行），只补 wifi up"
+                      wifi up "$_r" >/dev/null 2>&1
+                      continue
+                  fi
                   log "第 ${CN} 次恢复：只重启 $_r（$_if 不发信标），其他 radio 不动"
                   wifi down "$_r" >/dev/null 2>&1
                   sleep 2
                   wifi up "$_r" >/dev/null 2>&1
               done
               if [ "$_fallback" -eq 1 ]; then
-                  log "定位不到掉线接口所属 radio，只能退化到 wifi reload（整机无线重建）"
-                  wifi reload >/dev/null 2>&1
+                  # 全量 wifi reload 会把中继一起拆掉；有中继时宁可只做 wifi up（幂等、不拆接口），
+                  # 拆分用户的 AP 换一次"可能修好"，在这里不值得。
+                  if [ -n "$(for _d in $(live_ifaces); do [ "$(iface_type "$_d")" = managed ] && echo x; done)" ]; then
+                      log "定位不到 radio，且本机有中继：只做 wifi up（不做全量 reload，避免拆掉上行）"
+                      wifi up >/dev/null 2>&1
+                  else
+                      log "定位不到掉线接口所属 radio，退化到 wifi reload（整机无线重建）"
+                      wifi reload >/dev/null 2>&1
+                  fi
               fi
           }
           
@@ -2736,6 +2763,18 @@ jobs:
               printf '%s' "$_hit"
           }
 
+          # 这颗 radio 上有没有 managed（中继）接口。有就绝对不能 wifi down —— 会把上行一起拆掉，
+          # 中继一断又触发 hotplug / 看门狗，mt76 在反复 down-up 里卡死时 procd 的硬件看门狗会复位整机。
+          radio_has_sta() {
+              _rhs_r="$1"
+              [ -n "$_rhs_r" ] || return 1
+              _rhs_ifs=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.$_rhs_r.interfaces[*].ifname" 2>/dev/null)
+              for _rhs_x in $_rhs_ifs; do
+                  [ "$(iw dev "$_rhs_x" info 2>/dev/null | sed -n "s/.*type //p" | head -n 1)" = "managed" ] && return 0
+              done
+              return 1
+          }
+
           # ---- 关 flow offload（只在中继模式下）----
           # TurboACC 的 sw_flow/hw_flow 最终写的是 firewall.@defaults[0].flow_offloading(_hw)；
           # fw4 的 resolve_offload_devices() 会把各 zone 的物理设备递归展开到 bridge 的
@@ -2802,6 +2841,15 @@ jobs:
                       for _d in $_bad; do
                           _r=$(radio_of_iface "$_d")
                           [ -n "$_r" ] || continue
+                          # 这颗 radio 同时挂着中继（managed）接口时绝不能 down：
+                          # wifi down radioX 会把中继一起拆掉，中继一断又触发 hotplug/看门狗，
+                          # 现场表现是 mt76 在反复 down/up 里卡死，procd 的硬件看门狗（30s）直接复位整机。
+                          # 这种情况只做 wifi up（幂等），交给 wpa_supplicant 自己恢复。
+                          if radio_has_sta "$_r"; then
+                              log "AP $_d 没发信标，但 $_r 同时承载中继：不动它（避免拆掉上行），只补一次 wifi up"
+                              wifi up "$_r" >/dev/null 2>&1
+                              continue
+                          fi
                           log "AP $_d 还没发信标（第 ${_i} 次检查），只重启 $_r"
                           wifi down "$_r" >/dev/null 2>&1
                           sleep 2
