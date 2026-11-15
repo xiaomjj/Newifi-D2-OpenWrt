@@ -2774,6 +2774,16 @@ jobs:
           once() {
               _t0=$(uptime_sec); _t0=${_t0:-0}
               [ -n "$(sta_secs)" ] || { log "没有 sta（中继）接口：纯 AP 模式，不做处理"; return 0; }
+              # 幂等锁：hotplug 钩子在中继 ifup 时会补跑一次 once，而 once 自己也会 ifdown/ifup 中继，
+              # 不加锁就会自激（ifup → hotplug → once → ifup → …）。现场有一次改信道后 3 秒内跑了 4 遍。
+              # 60 秒内的重复调用直接跳过：真正的收敛由第一次跑完负责。
+              _lk=/tmp/relay-tune.lock
+              if [ -f "$_lk" ]; then
+                  _age=$(( _t0 - $(sed -n '1p' "$_lk" 2>/dev/null || echo 0) ))
+                  [ "$_age" -ge 0 ] && [ "$_age" -lt 60 ] && { log "已有一次在收敛（锁 ${_age}s），本次跳过"; return 0; }
+              fi
+              printf '%s\n' "$_t0" > "$_lk"
+              trap 'rm -f "$_lk"' EXIT INT TERM
               log "开始收敛（开机第 ${_t0}s，中继段：$(sta_secs | tr '\n' ' ')）"
               offload_off
 
@@ -2822,6 +2832,18 @@ jobs:
                       return 0
                   fi
                   _tries=$((_tries + 1))
+                  # 重连退避：每次 ifdown/ifup 都会触发 hotplug，而 15 秒内反复拆接口只会让
+                  # wpa_supplicant 每次都在扫描中途被打断、越重连越慢。这里限制最短间隔 15 秒。
+                  _now=$(uptime_sec)
+                  _prev=$(sed -n '1p' /tmp/relay-tune.lastifup 2>/dev/null || echo 0)
+                  [ -n "$_prev" ] || _prev=0
+                  if [ $((_now - _prev)) -lt 15 ]; then
+                      log "第 ${_tries} 次：距上次重连 $((_now - _prev))s（不足 15s），先等一轮不拆接口"
+                      sleep "$_delay"
+                      [ "$_delay" -lt 30 ] && _delay=$((_delay + 5))
+                      continue
+                  fi
+                  printf '%s\n' "$_now" > /tmp/relay-tune.lastifup
                   for _n in $(sta_nets); do
                       log "第 ${_tries} 次重连中继接口 ${_n}（开机第 ${_el}s）"
                       ifdown "$_n" >/dev/null 2>&1
@@ -2950,6 +2972,9 @@ jobs:
           # 中继（managed）接口 ifup 时补跑一次 relay-tune：关 flow offload + 记录收敛时间线。
           [ "$ACTION" = "ifup" ] || exit 0
           [ -x /usr/bin/relay-tune ] || exit 0
+          # 收敛进行中就别再插一脚：relay-tune 自己 ifup 中继时也会触发这个钩子，
+          # 没有这道门就会自激（3 秒内跑 4 遍）。锁由 relay-tune 自己创建/删除。
+          [ -f /tmp/relay-tune.lock ] && exit 0
           case "$INTERFACE" in
               wwan|wwan6) ;;
               *)
