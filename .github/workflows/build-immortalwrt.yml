@@ -497,7 +497,9 @@ jobs:
               uci -q set dhcp.@dnsmasq[0].noresolv="1"
               # 0.0.0.0 这类应答会被 rebind 保护拦掉，去广告就失效了
               uci -q set dhcp.@dnsmasq[0].rebind_protection="0"
-              uci -q set dhcp.@dnsmasq[0].cachesize="1000"
+              uci -q set dhcp.@dnsmasq[0].cachesize="2000"
+              # 强制缓存 10 分钟（原来 3600s：改广告清单/换 CDN IP 后最长一小时才生效）
+              uci -q set dhcp.@dnsmasq[0].min_cache_ttl="600"
               uci -q commit dhcp
           fi
 
@@ -509,6 +511,18 @@ jobs:
           
           for s in ksmbd p910nd zram cron mosdns passwall; do
               [ -x "/etc/init.d/$s" ] && /etc/init.d/$s enable
+          done
+
+          # ---- 关掉这台机器用不上的服务（软件包默认 enable，但从不运行）----
+          #   radius          —— 802.1X 认证服务器（家里没有这种需求）
+          #   microsocks      —— 独立 socks5 服务端（代理用 PassWall 就够，不需要再开一个口）
+          #   passwall_server —— PassWall 的服务端模式（本机是客户端 + 中继，不做落地）
+          # 关掉它们不会影响任何现有功能，但能省下每次开机的初始化与潜在的监听端口。
+          for s in radius microsocks passwall_server; do
+              if [ -x "/etc/init.d/$s" ]; then
+                  /etc/init.d/$s stop >/dev/null 2>&1
+                  /etc/init.d/$s disable >/dev/null 2>&1
+              fi
           done
           exit 0
           EOF
@@ -542,7 +556,9 @@ jobs:
           uci -q add_list dhcp.@dnsmasq[0].server="127.0.0.1#5335"
           uci -q set dhcp.@dnsmasq[0].noresolv="1"
           uci -q set dhcp.@dnsmasq[0].rebind_protection="0"
-          uci -q set dhcp.@dnsmasq[0].cachesize="1000"
+          uci -q set dhcp.@dnsmasq[0].cachesize="2000"
+              # 强制缓存 10 分钟（原来 3600s：改广告清单/换 CDN IP 后最长一小时才生效）
+              uci -q set dhcp.@dnsmasq[0].min_cache_ttl="600"
           # PassWall 用 addnmount 把 /tmp/etc/passwall/acl/default/dnsmasq.d 挂进 dnsmasq
           # 的 conf-dir 来做分流。它异常退出时这条会残留，目录已删 → dnsmasq 起不来。
           # 所以这里把带 passwall 字样的挂载点全摘掉（它启动时会自己重新加）。
@@ -853,10 +869,15 @@ jobs:
             _run=0; _up=0; _rss=0
             if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
               _run=1
+              # /proc/<pid>/stat 第 22 个字段是 starttime，单位是**时钟滴答**（USER_HZ=100），
+              # 不是秒。早先直接拿它和 /proc/uptime（秒）相减，于是状态里显示负的运行时长
+              # （现场：uptime_s = -11323553）。这里先除以 CLK_TCK 再相减，并夹到 0 以上。
               _nowt=$(awk 'NR==1{print $1}' /proc/uptime 2>/dev/null)
               _st=$(awk '{print $22}' "/proc/$_pid/stat" 2>/dev/null)
+              _hz=$(getconf CLK_TCK 2>/dev/null) || _hz=100
+              case "$_hz" in ''|*[!0-9]*) _hz=100 ;; esac
               if [ -n "$_st" ] && [ -n "$_nowt" ]; then
-                _up=$(awk -v a="$_nowt" -v b="$_st" 'BEGIN{printf "%d", a-b}')
+                _up=$(awk -v a="$_nowt" -v b="$_st" -v h="$_hz" 'BEGIN{v=a-b/h; if (v<0) v=0; printf "%d", v}')
               fi
               _rss=$(awk '/VmRSS/{print $2}' "/proc/$_pid/status" 2>/dev/null)
             else
@@ -905,6 +926,17 @@ jobs:
             printf '"config_ok":%d,"upstreams":[%s]}\n' "$_cfgok" "$_ups"
           }
 
+          # 改完名单/上游必须清 dnsmasq 缓存：它会把 0.0.0.0 与"未拦截"的答案一起缓存
+          # （本固件 min-cache-ttl=3600），不清的话客户端最长 1 小时仍在用旧结果。
+          # 现场实测：清单换了、MosDNS 也重启了，但 taboola.com 仍解析出真 IP，
+          # 直到 dnsmasq restart 才变成 0.0.0.0。
+          flush_dns_cache() {
+            if pidof dnsmasq >/dev/null 2>&1; then
+              /etc/init.d/dnsmasq restart >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null || true
+              sleep 1
+            fi
+          }
+
           do_apply() {
             [ -f "$UP" ] || printf 'https://223.5.5.5/dns-query\nhttps://1.12.12.12/dns-query\n223.5.5.5\n' > "$UP"
             render_to /tmp/mosdns-new.yaml || { printf '{"ok":0,"message":"渲染失败"}\n'; return 1; }
@@ -922,7 +954,8 @@ jobs:
               printf '{"ok":0,"message":"重启后进程未起来，已回滚上一份配置"}\n'
               return 1
             fi
-            printf '{"ok":1,"message":"已应用并重启","pid":%s}\n' "$_pid"
+            flush_dns_cache
+            printf '{"ok":1,"message":"已应用并重启（已清 DNS 缓存）","pid":%s}\n' "$_pid"
           }
 
           do_render() {
@@ -1484,8 +1517,15 @@ jobs:
           EOF
 
           cat > files/etc/sysctl.conf << 'EOF'
-          # ---- 缓冲与队列：BBR 需要 fq，rmem/wmem 上限要放开否则 tcp_rmem 白设 ----
-          net.core.default_qdisc = fq
+          # ---- 内核参数。注意：不要在这里写任何"本内核不存在"的键 ----
+          # 教训（2026-11-16，真机）：busybox 的 `sysctl -e -p` 遇到**第一个写失败的键就整体中断**，
+          # 加 -e 也一样。原来第一行是 `net.core.default_qdisc = fq`，而本内核没编 sch_fq
+          # （/lib/modules/*/sch_fq.ko 不存在），写它直接 ENOENT →
+          # **整份文件一行都没生效**（实测运行时 rmem_max 还是 180224、fastopen=1、swappiness=60、
+          # mtu_probing=0），只有 sysctl.d/12-tcp-bbr.conf 里的 BBR 碰巧生效。
+          # 现在：① 不写 default_qdisc（没有 sch_fq，BBR + fq_codel 完全够用）；
+          #       ② 另有 /usr/bin/sysctl-apply 逐键兜底（单键失败不影响其余），由 rc.local 调用；
+          #       ③ 审计步骤会核对 rmem_max/tcp_fastopen 是否真的生效，不生效就报红。
           net.core.somaxconn = 1024
           net.core.rmem_max = 8388608
           net.core.wmem_max = 8388608
@@ -1512,18 +1552,50 @@ jobs:
           # 表现是"连接建立但没有任何数据"。路由器场景下宽松校验没有安全代价。
           net.ipv4.conf.all.rp_filter = 0
           net.ipv4.conf.default.rp_filter = 0
-          # ---- 内核 panic 后 10 秒自动重启，避免软路由挂着 ----
-          kernel.panic = 10
+          # kernel.panic 由 sysctl.d/10-default.conf 定为 3 秒（oops 后尽快切回可用状态），
+          # 这里不再覆盖——两份文件里写不同值只会让人困惑。
+          EOF
+
+          # ---------- 逐键应用器：绕开 busybox sysctl -p 的"首错全断" ----------
+          cat > files/usr/bin/sysctl-apply << 'EOF'
+          #!/bin/sh
+          # sysctl-apply：逐键应用 /etc/sysctl.conf（单键失败不影响其余）。
+          #
+          # 为什么需要它：busybox 的 `sysctl -e -p FILE` 在遇到第一个写失败的键时**直接中断**，
+          # 后面所有键都不生效（实测：文件第一行 default_qdisc 写失败 → 整份文件白写）。
+          # 这个脚本一行一行来，坏键只记一条日志，其余照常写入。
+          # 由 /etc/rc.local 在开机末尾调用一次（那时模块与网络都已就绪）。
+
+          CONF="${1:-/etc/sysctl.conf}"
+          [ -f "$CONF" ] || exit 0
+
+          _ok=0; _bad=0
+          while IFS= read -r _l; do
+              case "$_l" in ''|'#'*) continue ;; esac
+              _k=${_l%%=*}; _v=${_l#*=}
+              _k=$(printf '%s' "$_k" | tr -d ' \t')
+              _v=$(printf '%s' "$_v" | sed 's/^[ \t]*//; s/[ \t]*$//')
+              [ -n "$_k" ] || continue
+              if sysctl -q -w "${_k}=${_v}" 2>/dev/null; then
+                  _ok=$((_ok + 1))
+              else
+                  _bad=$((_bad + 1))
+                  logger -t sysctl-apply "跳过无效项：${_k}=${_v}"
+              fi
+          done < "$CONF"
+
+          [ -t 0 ] && printf '已应用 %d 项，跳过 %d 项\n' "$_ok" "$_bad"
+          exit 0
           EOF
 
           cat > files/etc/crontabs/root << 'EOF'
           # 本固件不自动升级、不自动下载固件与规则包：分流规则随 PassWall 包发布，
           # 广告清单在构建期写进镜像；PassWall 自己的规则/订阅定时任务默认也不启用
           # （tasks.sh 只在 uci 里配了 update_week_mode 时才动作，出厂没有该选项）。
-          # 下面五条全是纯本地动作，一个字节都不出网：
-          # 1) 每日 04:00 释放页缓存（P2P、LuCI 页面缓存都能把页缓存吃满）
-          0 4 * * * sync; echo 3 > /proc/sys/vm/drop_caches
-          # 2) 每 10 分钟看一眼可用内存：低于总量 8% 清页缓存，低于 4% 再截断大日志（不动任何进程）
+          # 下面四条全是纯本地动作，一个字节都不出网：
+          # （原来还有一条"每天 04:00 drop_caches"，2026-11-16 删掉：页缓存丢了下一次读盘
+          #   立刻又长回来，定时清只会让第二天首次访问变慢；真缺内存时 memguard 会处理）
+          # 1) 每 10 分钟看一眼可用内存：低于总量 8% 清页缓存，低于 4% 再截断大日志（不动任何进程）
           */10 * * * * /usr/bin/memguard
           # 3) 每 10 分钟确认 MosDNS 还活着：procd 会拉起，这是第二道保险
           */10 * * * * pidof mosdns >/dev/null 2>&1 || /etc/init.d/mosdns restart
@@ -1595,6 +1667,13 @@ jobs:
           # ---------- G. 开机后调优（必须在模块加载之后，故放在 rc.local）----------
           cat > files/etc/rc.local << 'EOF'
           #!/bin/sh
+          # ---- 内核参数逐键兜底应用 ----
+          # /etc/init.d/sysctl（S11）用 busybox `sysctl -p` 应用 /etc/sysctl.conf，
+          # 而它遇到第一个写失败的键就整体中断（详见 files/etc/sysctl.conf 顶部注释）。
+          # 这里再逐键跑一遍：以后谁往那个文件里加了一个本内核不存在的键，也不至于让
+          # 其余参数全部失效（代价是一次 fork/键，约 50ms）。
+          [ -x /usr/bin/sysctl-apply ] && /usr/bin/sysctl-apply >/dev/null 2>&1
+
           # conntrack 上限：32K 是性价比最高的档位（默认 16K，P2P + 多设备会把表打满）
           if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
               echo 32768 > /proc/sys/net/netfilter/nf_conntrack_max
@@ -1838,7 +1917,7 @@ jobs:
           fi
           _av=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
           [ -n "$_av" ] && printf '  · 可用内存 %sMB（低于总量 8%% 时 memguard 会自动清缓存）\n' "$_av"
-          [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "1000" ] \
+          [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "2000" ] \
               && ok "dnsmasq 缓存 1000 条" || ng "dnsmasq 缓存未调到 1000"
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
               ok "dnsmasq 只走 MosDNS（noresolv=1）"
@@ -1945,6 +2024,17 @@ jobs:
               warn "没有任何上行（wan/wwan/wan6 全 down）：先解决上网，再看代理与去广告"
             fi
           fi
+          # 内核参数是否真的生效：busybox `sysctl -p` 遇到第一个坏键会整体中断，
+          # 曾经整份 /etc/sysctl.conf 白写（rmem_max 还是 180224）。这里只挑两个最能说明问题的键。
+          _rm=$(cat /proc/sys/net/core/rmem_max 2>/dev/null)
+          if [ "${_rm:-0}" -ge 8388608 ]; then
+            ok "内核缓冲上限已生效（rmem_max=$_rm）"
+          else
+            bad "rmem_max=$_rm（应为 8388608）：/etc/sysctl.conf 没生效，执行 sysctl-apply 看哪个键写失败"
+          fi
+          _fo=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null)
+          [ "${_fo:-0}" -eq 3 ] && ok "TCP Fast Open 已开（client+server）" || warn "tcp_fastopen=$_fo（应为 3）"
+
           pidof dnsmasq >/dev/null 2>&1 && ok "dnsmasq 运行中" || bad "dnsmasq 没跑：执行 /etc/init.d/dnsmasq restart"
           _up=$(uci -q get dhcp.@dnsmasq[0].server)
           case "$_up" in
@@ -1959,12 +2049,16 @@ jobs:
           fi
           _adn=0
           [ -s /etc/mosdns/adblock.txt ] && _adn=$(wc -l < /etc/mosdns/adblock.txt | tr -d " ")
-          if [ "${_adn:-0}" -ge 50000 ]; then
+          # 三源（anti-AD + oisd small + AdGuard DNS）合并后正常约 22.7 万条；
+          # 低于 15 万说明构建时有源没拉全，但不影响已经生效的那部分
+          if [ "${_adn:-0}" -ge 150000 ]; then
             ok "去广告清单 $_adn 条"
+          elif [ "${_adn:-0}" -ge 50000 ]; then
+            warn "去广告清单只有 $_adn 条（预期约 22.7 万：构建时可能只有一个源成功）"
           elif [ "${_adn:-0}" -gt 0 ]; then
-            warn "去广告清单只有 $_adn 条（构建时上游没拉到，功能偏弱）"
+            warn "去广告清单只有 $_adn 条（构建时上游基本没拉到，功能偏弱）"
           else
-            bad "去广告清单是空的：本次构建没拉到 anti-AD，重新构建即可"
+            bad "去广告清单是空的：重新构建，或看构建日志 K 节哪个源失败"
           fi
           if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
             ok "域名解析正常（www.baidu.com 走完整链路）"
@@ -2331,7 +2425,7 @@ jobs:
           echo '  信道挤      → 第 3 节占用率 >60% 才真挤；1/6/11 里挑最低的：uci set wireless.radio0.channel=1（或 6/11）；wifi reload'
           echo '  弱处掉线    → uci set wireless.default_radio0.disassoc_low_ack=0；wifi reload'
           echo '  覆盖不够    → 加天线/挪位置；上游 AP 的 5G 换到 149-165（国内 5.8G 的 EIRP 上限比 5.2G 高 10 dB）'
-          echo '  内存不足    → 少装插件，或把屏蔽列表从 11 万条降到 5 万条后重新构建'
+          echo '  内存不足    → 少装插件，或把屏蔽列表从 22.7 万条降到 10 万条后重新构建（K 节改源）'
           echo '  驱动崩过    → 看 /var/log/wifi-watchdog.log（几点自动 wifi up/reload 的时间线）；'
           echo '                注意：STA（中继）侧改 htmode 降宽没用，mt76 会跟随上游 AP 的宽度（实测见 README）'
           echo '  中继一断全断 → 中继抖动时别用 wifi reload（它会把 2.4G AP 一起拆掉）。只重连中继接口：'
@@ -3228,53 +3322,175 @@ jobs:
           /usr/bin/usb-service 2>/dev/null
           exit 0
           EOF
-          # ---------- K. 去广告：把 anti-AD 编译成 MosDNS 的域名集合 ----------
+          # ---------- K. 去广告：多源合并成 MosDNS 的域名集合 ----------
           # 为什么不用 chinadns-ng 那套"屏蔽列表"：只有它会把清单编译成 null 组，
           # 而 chinadns-ng 会把 MosDNS 返回的 0.0.0.0 换成代理侧的真实应答（见 C 节说明）。
           # 现在统一由 MosDNS 的 domain_set 吃纯域名清单：命中直接返回 0.0.0.0，
           # 进程内哈希匹配，运行时不联网、不写闪存。
-          mkdir -p files/etc/mosdns
+          #
+          # 2026-11-16 改成"多源合并"：单一 anti-AD 只覆盖国内移动端广告，
+          # 加了两个互补源（实测两两重叠率：anti-AD ∩ AdGuard 69% 是子集关系，
+          # oisd ∩ 其它都是 0%，1Hosts Lite 与 AdGuard 重叠仅 20%）：
+          #   · anti-AD      11.0 万条，国内广告/统计（含 App 内嵌 SDK）
+          #   · oisd small    6.3 万条，官方标语 "Block. Don't break."，最保守、误伤最低
+          #   · AdGuard DNS  19.0 万条，全球广告/跟踪器，覆盖面最广
+          # 合并去重后 22.8 万条 / 4.5 MB（文本），squashfs 压缩后约 +1.5 MB，
+          # MosDNS 常驻内存估算 +7 MB（431MB 的机器没有压力）。
+          # 故意不加 1Hosts Lite / StevenBlack：前者过于激进（易误伤 App 内正常接口），
+          # 后者 93% 与上面三个重合，只换来体积。
+          mkdir -p files/etc/mosdns /tmp/adlist
           BLOCK=files/etc/mosdns/adblock.txt
-          RAW=/tmp/ad-raw.txt
-          : > "$RAW"
-          for u in \
+          LIST=/tmp/adlist/all.raw
+          : > "$LIST"
+
+          # fetch <名字> <镜像1> [镜像2 ...]：逐个镜像试，第一个成功的并入 LIST
+          fetch() {
+              _name="$1"; shift
+              for _u in "$@"; do
+                  if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 -m 300 "$_u" -o "/tmp/adlist/$_name.raw" \
+                     && [ "$(wc -c < "/tmp/adlist/$_name.raw")" -gt 20000 ]; then
+                      _b=$(wc -c < "/tmp/adlist/$_name.raw")
+                      _l=$(wc -l < "/tmp/adlist/$_name.raw")
+                      echo "  ✓ $_name  $_b 字节 / $_l 行  ←  $_u"
+                      cat "/tmp/adlist/$_name.raw" >> "$LIST"
+                      return 0
+                  fi
+                  echo "  ✗ $_name 这个镜像不可用：$_u"
+              done
+              echo "::warning::$_name 所有镜像都失败，本次缺这一源（其余源仍然生效）"
+              return 1
+          }
+
+          fetch anti-ad \
             "https://fastly.jsdelivr.net/gh/privacy-protection-tools/anti-AD@master/anti-ad-domains.txt" \
             "https://cdn.jsdelivr.net/gh/privacy-protection-tools/anti-AD@master/anti-ad-domains.txt" \
             "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt" \
-            "https://gitee.com/privacy-protection-tools/anti-AD/raw/master/anti-ad-domains.txt" \
-            "https://small.oisd.nl/domainswild"; do
-            echo "下载广告域名清单: $u"
-            if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 -m 240 "$u" -o "$RAW"; then
-              [ "$(wc -c < "$RAW")" -gt 400000 ] && break
-              echo "::warning::内容过小，换下一个源"
-            fi
-            : > "$RAW"
-          done
+            "https://gitee.com/privacy-protection-tools/anti-AD/raw/master/anti-ad-domains.txt"
+          fetch oisd \
+            "https://small.oisd.nl/domainswild" \
+            "https://hosts.oisd.nl/domainswild"
+          fetch adguard \
+            "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt" \
+            "https://raw.githubusercontent.com/AdguardTeam/AdGuardSDNSFilter/master/Filters/filter.txt" \
+            "https://filters.adtidy.org/extension/ublock/filters/2_without_easylist.txt"
 
-          if [ -s "$RAW" ]; then
-            # 只保留合法域名：去 CR/空白、去注释与空行、去 *. 前缀、统一小写、去重排序
-            sed -e 's/\r$//' "$RAW" \
-              | awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 ~ /^#/ || length($0) == 0) next; sub(/^\*\./, ""); sub(/^\./, ""); print tolower($0) }' \
-              | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
-              | LC_ALL=C sort -u > "$BLOCK" || true
+          # 归一化：去 CR、去注释/空行、拆 hosts 前缀（0.0.0.0 x / 127.0.0.1 x）、
+          # 拆 ABP 的 ||x^、去 *. 与前导点、小写、只留合法域名、去重排序
+          if [ -s "$LIST" ]; then
+              sed -e 's/\r$//' "$LIST" \
+                | awk '
+                    {
+                      gsub(/^[ \t]+|[ \t]+$/, "")
+                      if ($0 == "" || substr($0,1,1) == "#" || substr($0,1,1) == "!") next
+                      if ($0 ~ /^0\.0\.0\.0[ \t]+/ || $0 ~ /^127\.0\.0\.1[ \t]+/) { sub(/^[^ \t]+[ \t]+/, "") }
+                      else if (substr($0,1,2) == "||") { sub(/^\|\|/, ""); sub(/\^.*$/, "") }
+                      else if ($0 ~ /^[|\/]/) next
+                      if ($0 ~ /[ \t]/) next
+                      while (substr($0,1,2) == "*.") sub(/^\*\./, "", $0)
+                      while (substr($0,1,1) == ".")  sub(/^\./, "", $0)
+                      sub(/\.+$/, "")
+                      # 纯 IP（A/AAAA 字面量）对 qname 匹配没有意义，白占体积，直接丢
+                      if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+                      if ($0 ~ /:/) next
+                      print tolower($0)
+                    }' \
+                | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
+                | grep -Ev '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+                | LC_ALL=C sort -u > "$BLOCK"
           else
-            echo "::warning::所有广告清单源都下载失败，本次固件不含去广告规则"
-            : > "$BLOCK"
+              echo "::error::三个广告源全部下载失败，本次构建没有去广告规则"
+              exit 1
           fi
+
+          # ---- 保护名单：这些域名（及其子域）绝不能被拦 ----
+          # 只做"精确行删除"：只要 qq.com 这一行不在，qq.com 的所有子域也就不会被后缀匹配到。
+          cat > /tmp/adlist/guard.txt << 'GUARD'
+          qq.com
+          weixin.qq.com
+          wechat.com
+          tencent.com
+          myapp.com
+          taobao.com
+          tmall.com
+          alipay.com
+          alipayobjects.com
+          alicdn.com
+          aliyuncs.com
+          baidu.com
+          bdstatic.com
+          bilibili.com
+          hdslb.com
+          iqiyi.com
+          youku.com
+          jd.com
+          360buyimg.com
+          pinduoduo.com
+          meituan.com
+          didiglobal.com
+          bytedance.com
+          douyin.com
+          byteimg.com
+          xiaomi.com
+          mi.com
+          huawei.com
+          hicloud.com
+          apple.com
+          icloud.com
+          mzstatic.com
+          microsoft.com
+          windowsupdate.com
+          msftconnecttest.com
+          msftncsi.com
+          live.com
+          office.com
+          googleapis.com
+          gstatic.com
+          github.com
+          githubusercontent.com
+          cloudflare.com
+          10086.cn
+          chinamobile.com
+          steampowered.com
+          steamcommunity.com
+          epicgames.com
+          GUARD
+          _before=$(wc -l < "$BLOCK" | tr -d " ")
+          grep -Fvx -f /tmp/adlist/guard.txt "$BLOCK" > "$BLOCK.tmp" || true
+          mv "$BLOCK.tmp" "$BLOCK"
+          _after=$(wc -l < "$BLOCK" | tr -d " ")
+          _drop=$((_before - _after))
+          [ "$_drop" -gt 0 ] && echo "::warning::保护名单从清单里删掉了 $_drop 条（原本会误拦关键服务）"
 
           BLOCK_N=$(wc -l < "$BLOCK" | tr -d " ")
           BLOCK_B=$(wc -c < "$BLOCK" | tr -d " ")
           [ -n "$BLOCK_N" ] || BLOCK_N=0
           [ -n "$BLOCK_B" ] || BLOCK_B=0
           echo "广告域名清单: $BLOCK_N 条 / $BLOCK_B 字节（squashfs 压缩后约 +$((BLOCK_B / 3 / 1024)) KB）"
-          if [ "$BLOCK_N" -lt 50000 ]; then
-            echo "::warning::广告清单只有 $BLOCK_N 条（预期 >=50000），去广告效果会很差；上游格式可能变了"
+          for _f in anti-ad oisd adguard; do
+            [ -s "/tmp/adlist/$_f.raw" ] && echo "  源 $_f：$(wc -l < "/tmp/adlist/$_f.raw" | tr -d " ") 行"
+          done
+          # 下限：三源合并后正常在 20 万条以上；低于 15 万说明有源挂了或格式变了
+          if [ "$BLOCK_N" -lt 150000 ]; then
+            echo "::warning::广告清单只有 $BLOCK_N 条（三源正常 >=200000）：看上面哪个源的下载/解析出了问题"
           fi
-          if [ "$BLOCK_N" -gt 250000 ] || [ "$BLOCK_B" -gt 5000000 ]; then
+          # 上限：超过 35 万条 / 8MB 说明源异常膨胀（或格式变化导致把 IP/路径当成域名），拒绝塞爆 32MB 闪存
+          if [ "$BLOCK_N" -gt 350000 ] || [ "$BLOCK_B" -gt 8000000 ]; then
             echo "::error::广告清单异常膨胀（$BLOCK_N 条 / $BLOCK_B 字节），拒绝塞爆 32MB 闪存"
             exit 1
           fi
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service \
+          # 关键域名必须在、广告域名必须被拦：两条硬断言（防止源变了却静默失效）
+          for _d in qq.com taobao.com apple.com windowsupdate.com; do
+            if grep -Fxq "$_d" "$BLOCK"; then
+              echo "::error::保护名单失效：$_d 出现在拦截清单里"; exit 1
+            fi
+          done
+          for _d in doubleclick.net googlesyndication.com adservice.google.com; do
+            if ! grep -Fxq "$_d" "$BLOCK"; then
+              echo "::warning::$_d 不在清单里（该源可能只给了子域或格式变了）"
+            fi
+          done
+
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/sysctl-apply files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service \
                    files/etc/init.d/mosdns files/etc/init.d/relay-tune files/etc/init.d/usb-service \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local \
                    files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services \
@@ -4046,6 +4262,7 @@ jobs:
             chk uci-95      etc/uci-defaults/95-relay
             chk uci-96      etc/uci-defaults/96-usb-service
             chk uci-97      etc/uci-defaults/97-ipv6
+            chk sysctl-apply usr/bin/sysctl-apply
             chk usb-svc     usr/bin/usb-service
             chk usb-init    etc/init.d/usb-service
             chk usb-hp      etc/hotplug.d/usb/50-usb-services
@@ -4374,8 +4591,9 @@ jobs:
               UDP 代理默认关闭（浏览器自动回落 TCP，避免 QUIC 乱序与额外开销）
             - **分流**：绕过大陆（`chn_list=direct` + 包自带 gfwlist/chnroute + 构建期补充的 proxy_host 高频域名），
               规则随包发布、运行时不联网；无节点时直连，不会断网
-            - **去广告**：MosDNS 的域名集合吃 anti-AD（约 11 万条域名，命中返回 0.0.0.0；
-              清单构建期下载、运行时不联网、不占 overlay）
+            - **去广告**：MosDNS 的域名集合由三源合并（anti-AD + oisd small + AdGuard DNS，
+              去重后约 22.7 万条域名 / 4.5 MB，命中返回 0.0.0.0）；含一份"绝不拦截"保护名单
+              （qq/taobao/apple/windowsupdate 等 48 个），构建期下载、运行时不联网
             - **DNS**：客户端 53 → 系统 dnsmasq → chinadns-ng（15355，分流）→
               国内走 MosDNS（5335，去广告 + DoH 到阿里/腾讯）、被墙走 Xray 内置 DNS
               （DoH `https://1.1.1.1/dns-query`，**查询经节点隧道出去**，ISP 看不到）；
