@@ -1,13 +1,13 @@
 # ============================================================
-#  ImmortalWrt 24.10 (openwrt-24.10) — newifi-d2 构建（仅手动触发）
+#  ImmortalWrt 25.12 (openwrt-25.12 / 内核 6.12) — newifi-d2 构建（仅手动触发）
 #  设计原则：
 #   1. 依赖一律走官方 feeds，不再手工克隆任何代理面板（避免同名包重复定义）
-#   2. 第三方源码只保留 TurboACC（不编 geo 数据；代理 = PassWall + Xray，DNS = MosDNS 去广告/DoH）
+#   2. 不克隆任何第三方源码（TurboACC 已移除；代理 = PassWall + Xray，DNS = MosDNS 去广告/DoH）
 #   3. defconfig 之后做"硬校验"，缺包直接失败，拒绝产出残缺固件
 #   4. 代理面就是 PassWall 自己的 LuCI 页面（服务 → PassWall），不再自研前端
 #   5. 全流程日志落盘 build.log，失败必留日志
 # ============================================================
-name: Build ImmortalWrt 24.10 for Newifi-D2
+name: Build ImmortalWrt 25.12 for Newifi-D2
 
 on:
   workflow_dispatch:
@@ -17,17 +17,13 @@ on:
         type: boolean
         default: false
       go_version:
-        description: "Go 工具链版本（auto = 跟随 feeds 默认；24.10 的 golang 是单包、无 GO_DEFAULT_VERSION，此项会被忽略并告警）"
+        description: "Go 工具链版本（auto = 跟随 feeds 默认 1.26；25.12 有 GO_DEFAULT_VERSION，可填 1.27 等强制指定）"
         type: choice
         options:
           - auto
           - "1.26"
           - "1.27"
         default: auto
-      with_turboacc:
-        description: "是否编入 TurboACC（若它编译失败，设为 false 重跑即可；加速不依赖它）"
-        type: boolean
-        default: true
 
   # ---- 只保留手动触发：已按要求关闭每周六定时构建 ----
   # 想出新固件：Actions → 本工作流 → Run workflow（改过依赖就勾 clean_build）。
@@ -42,10 +38,15 @@ concurrency:
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  # 24.10 是 LTS 维护分支（内核 6.6），不是"旧版"：它是目前 mt7621 上最稳的线。
-  # 为何不用 25.12：ramips/mt7621 有 MT7530 FDB 失步回归（openwrt#25305），
-  # Wi-Fi 漫游后 DNS/ping 正常但 TCP 断流；24.10 无此问题。
-  REPO_BRANCH: openwrt-24.10
+  # ============ 分支说明（2026-11-22 变更：内核升级实验）============
+  # 本轮按用户要求从 openwrt-24.10（内核 6.6）切到 openwrt-25.12（内核 6.12）。
+  # 动机：24.10 的内核没编 CONFIG_NET_CLS，导致 cake / sch_ingress 这类模块虽然能装、
+  #       却因缺 tcf_block_get 等符号而**加载不了**，双向整形（SQM/cake）无法使用。
+  # 已知风险（openwrt#25305，状态 open，2026-09-21 创建）：
+  #   ramips/mt7621 的 MT7530 在 25.12 上会出现 FDB 失步 —— Wi-Fi 漫游后 DNS/ping 正常
+  #   但 TCP 断流；报告称 24.10.8 正常。刷机后按构建摘要里的「内核 6.12 必测项」自测。
+  # 回滚：把 REPO_BRANCH 改回 openwrt-24.10、feeds 那三行改回 ;openwrt-24.10，重新构建即可。
+  REPO_BRANCH: openwrt-25.12
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   # d-team_newifi-d2 的 firmware 分区 = 0x1FB0000 = 33226752 字节
@@ -100,7 +101,7 @@ jobs:
           df -h / /workdir
 
       # ---------------------------------------------------------------
-      - name: 3. 克隆 ImmortalWrt 24.10
+      - name: 3. 克隆 ImmortalWrt 25.12
         working-directory: /workdir
         run: |
           git clone --depth=1 -b "$REPO_BRANCH" "$REPO_URL" immortalwrt
@@ -109,15 +110,15 @@ jobs:
           git log -1 --format='分支 %D | %h %s'
 
       # ---------------------------------------------------------------
-      - name: 4. 安装官方 feeds 并植入第三方源码（TurboACC / PassWall）
+      - name: 4. 安装官方 feeds（PassWall / MosDNS / xray 全部来自 feeds）
         run: |
           cd immortalwrt
 
           # --- 官方 feeds（luci-app-passwall / xray-core / MosDNS / dnsmasq 全部由 feeds 提供）---
           cat > feeds.conf.default << 'EOF'
-          src-git packages https://github.com/immortalwrt/packages.git;openwrt-24.10
-          src-git luci https://github.com/immortalwrt/luci.git;openwrt-24.10
-          src-git routing https://github.com/openwrt/routing.git;openwrt-24.10
+          src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
+          src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
+          src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
           EOF
 
           ./scripts/feeds update -a
@@ -174,19 +175,14 @@ jobs:
           # GeoData：本固件【也不包含】。不克隆 sbwml/v2ray-geodata，也就不产
           # v2ray-geoip(135KB) / v2ray-geosite(10.9MB)；分流转而只靠第 9 步的文本规则。
 
-          # TurboACC：24.10 的 luci feed 同样没有 luci-app-turboacc，只能从上游克隆。
-          # 它是纯 LuCI + 脚本（不依赖内核补丁），lua / luci-compat 由 luci feed 带入。
-          # 克隆失败不终止构建：打标记，第 7 步自动跳过这个包（加速不依赖它）。
-          git clone --depth=1 https://github.com/chenmozhijin/turboacc.git package/turboacc || true
-          if [ ! -f package/turboacc/luci-app-turboacc/Makefile ]; then
-            echo "::warning::TurboACC 源码不可用，本次构建跳过它（offload/BBR 不受影响）"
-            touch /workdir/no-turboacc-src
-          fi
+          # TurboACC 已移除（2026-11-22）：它只是 LuCI 界面，本机真正用到的 BBR 与全锥 NAT
+          # 分别由 kmod-tcp-bbr 和 kmod-nft-fullcone + fw4 直接提供，不再克隆第三方源码，
+          # 因此这里也没有"源码缺失 → 自动降级"的分支了。
 
           # --- 代理核心版本确认（都由 feeds 提供，不做替换、不克隆第三方源）---
-          # 选型理由：luci-app-passwall 25.12.x + xray-core 25.x 是 24.10 官方源里成对发布的组合。
-          # 上游新组织（Openwrt-Passwall/openwrt-passwall main，26.11.11）的 xray-core 26.11.9
-          # 要求 golang >= 1.27，而 24.10 的 feeds 只有 1.23.12，直接编不出来 —— 所以固定用官方源这一对。
+          # 选型理由：luci-app-passwall 26.10.29 + xray-core 26.10.21 是 25.12 官方源里成对发布
+          # 的组合，直接用 feeds 版本即可。不要换成上游 main 分支的即时版本：那边要求更高的
+          # golang（>= 1.27），feeds 里没有，会直接编不出来。
           PV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile 2>/dev/null)
           XV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/xray-core/Makefile 2>/dev/null)
           if [ -z "$PV" ]; then
@@ -221,13 +217,6 @@ jobs:
               MISSING_SRC=1
             fi
           done
-          # TurboACC 是可选件：源码缺失只告警，第 7 步会自动跳过它
-          if [ -f package/turboacc/luci-app-turboacc/Makefile ]; then
-            echo "  ✅ package/turboacc/luci-app-turboacc"
-          else
-            echo "::warning::TurboACC 源码缺失，本次构建不含它（offload/BBR 不受影响）"
-            touch /workdir/no-turboacc-src
-          fi
           [ "$MISSING_SRC" -eq 0 ] || exit 1
           echo "✅ feeds 与第三方源码全部就绪"
 
@@ -299,74 +288,94 @@ jobs:
           [ -f /etc/config/wireless ] || exit 0
           uci -q get wireless.radio0 >/dev/null 2>&1 || exit 0
 
-          # ---- 2.4G：钉 1 信道 + HT20；noscan 关掉后台扫信道造成的周期性断流 ----
-          #   为什么不再用 auto：ACS 每次 wifi up/reload 都重新挑信道，挑到 12/13 时不少
-          #   非国行设备（手机、IoT、老笔记本）直接扫不到；驱动崩一次重启后信道还会变，
-          #   表现就是“用着用着 SSID 没了”。1 被邻居占了就把下面一行改成 11（其次 6）。
-          #   为什么最终钉 1：1/6/11 是 2.4G 仅有的三个互不重叠信道，本机实测（20 dBm、同一
-          #   位置、同一客户端）信道 1 = 108.3 Mbit/s、质量 70/70、-40 dBm（复测 104.7、70/70、
-          #   -38 dBm）；信道 11 = 65.0 Mbit/s、62/70、-48 dBm。11 的 HT20 占 2452-2472，紧贴国标上沿 2483.5，上方
-          #   没有邻频可借，边缘功率滚降比 1 明显，所以默认回到 1。邻居若用 6 的 HT40
-          #   （2427-2472）会盖住 11，那种环境更该留在 1。
-          #   判断依据永远是 wifi-doctor 第 3 节的占用率（按频点累计，* 为当前信道）。
+          # ---- 2.4G：钉 13 信道 + HT20；noscan 关掉后台扫信道造成的周期性断流 ----
+          #   2026-11-22 现场实测（20 dBm、同一客户端、同一镜像、同一位置）：
+          #     ch1  → 邻区 22 个 AP，最强 -55 dBm
+          #     ch11 → 邻区 14 个 AP，最强 -42 dBm（紧贴 2452-2472 上沿）
+          #     ch13 → 邻区只有 2 个，最强 -77 dBm
+          #   换到 13 之后：同一客户端下载 2.9 MB/s → 5.5 MB/s，网关 ping 由 1~10 ms 收敛到 1 ms。
+          #   代价：12/13 是非国行设备最容易"扫不到"的两个信道。家里若有美版/日版老设备或
+          #   IoT 搜不到 SSID，就把下面一行改成 1（其次 11、6）。判断依据永远是 wifi-doctor
+          #   第 3 节的按频点占用率，不要凭感觉换。
+          #   为什么不用 auto：ACS 每次 wifi up/reload 都重挑信道，挑到 12/13 时老设备直接
+          #   扫不到；驱动崩一次重启后信道还会变，表现就是"用着用着 SSID 没了"。
           uci set wireless.radio0.disabled='0'
           uci set wireless.radio0.country='CN'
-          uci set wireless.radio0.channel='1'
+          # 2.4G 信道：默认钉 13（本机实测最干净），但只在"没人指定过"时才写——
+          # 换环境、换上游之后你手改的值不会被下次刷机覆盖。
+          _ch24=$(uci -q get wireless.radio0.channel)
+          case "$_ch24" in
+              ''|auto|1) uci set wireless.radio0.channel='13' ;;
+              *) echo "保留已有 2.4G 信道：$_ch24" ;;
+          esac
           uci set wireless.radio0.htmode='HT20'
           uci set wireless.radio0.noscan='1'
           # ---- 2.4G 发射功率：钉 20 dBm（100mW），不吃法规上限的 30 dBm ----------------
           #   本固件的 wireless-regdb 里 CN 的 2.4G 上限是 30 dBm(1W)，而 MT7603E 这颗前端
           #   是按 ~20 dBm 校准的。不写 txpower 时 hostapd 直接按法规上限 30 dBm 喂，功放
-          #   进非线性区 → EVM 变差、发热、高 MCS 跑不上去，体感就是“信号满格却卡、时强时弱”。
+          #   进非线性区 → EVM 变差、发热、高 MCS 跑不上去，体感就是"信号满格却卡、时强时弱"。
           #   设 20 是让前端工作在标称区间；家里死角多再逐步加到 23（别超过 23）。
           uci set wireless.radio0.txpower='20'
 
-          # ---- 5G：默认落在 149 段（5.8G）。两个理由：
-          #   1) CN 法规里 5.8G 的允许 EIRP 比 5.1G(36-48) 高，同样的机器穿墙更好；
-          #   2) 149-165 不是 DFS 信道，不会被雷达检测强制静默 60 秒（“突然没信号”的常见元凶）。
-          #   个别老设备不认 5.8G 的话，把下面两行改成 channel='36' 即可。
-          uci set wireless.radio1.disabled='0'
-          uci set wireless.radio1.country='CN'
-          uci set wireless.radio1.channel='149'
-          uci set wireless.radio1.htmode='VHT80'
-          uci set wireless.radio1.noscan='1'
-          # ---- 5G 两点说明（跟 2.4G 不是同一套问题）----
-          #   · 上面 channel='149' 只在 5G 当 AP 时有意义。若把 radio1 改成中继（mode=sta），
-          #     驱动会忽略它、跟着上游 AP 的信道跑（很常见，不是配置没生效）。
-          #   · legacy_rates='0'：关掉 802.11a/b/g 老速率。老设备本来也上不了 5G，留着只会让
-          #     个别慢设备用 6Mbps 占满空口；2.4G 不能这么干（老 IoT 会直接连不上）。
-          uci set wireless.radio1.legacy_rates='0'
-
-          # ---- SSID / 密码保持原样 ----
-          # ---- radio1 上如果已经有中继（mode=sta），就不要硬把 5G AP 打开 ----
-          # 现场教训（2026-11-15 刷机后）：用户把 radio1 当 STA 中继用，这条 uci-defaults 每次
-          # 首启都把 default_radio1.disabled 强行改成 0，于是 5G 变成 AP+STA 同频共存
-          # （phy1-ap0 与 phy1-sta0 同一信道）——空口要和自家客户端分时，中继吞吐被摊薄。
-          # 实测（-73 dBm、同一 URL、各 3 次）：AP 开 3.63 MB/s、AP 关 3.59 MB/s，差异在噪声内，
-          # 所以“共存会明显变慢”不成立；但**用户的意图必须尊重**：他要是把 5G 只当中继，
-          # 就不该被固件擅自打开一个 AP。这里只在 radio1 上没有 sta 段时才打开 AP。
+          # ---- radio1 是否已被中继占用（存在 mode=sta 的段）？这决定下面三项怎么写 ----
+          # 现场教训（2026-11-15）：这条 uci-defaults 曾经无条件打开 5G AP，把"5G 只当中继"
+          # 的用户意图改掉了。现在每一步都先看有没有 sta 段再决定。
           _sta_on_r1=0
           for _s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
               [ "$(uci -q get wireless.$_s.device)" = "radio1" ] || continue
               [ "$(uci -q get wireless.$_s.mode)" = "sta" ] && _sta_on_r1=1
           done
+
+          # ---- 5G：信道/带宽必须区分"只当 AP"和"AP+STA 中继"两种形态 ----
+          #   · 只当 AP：钉 149 + VHT80。5.8G 允许 EIRP 比 5.1G(36-48) 高；149-165 不是 DFS
+          #     信道，不会被雷达检测强制静默 60 秒（"突然没信号"的常见元凶）。
+          #   · AP+STA 中继：**必须 channel='auto'**。mt76 的硬约束是同一 phy 的所有 vif 只能
+          #     同信道；AP 写死另一个信道时 hostapd 不会报错退出，而是**完全不发信标**——
+          #     扫描里看不到 SSID，日志只有 ACS->ENABLED / AP-ENABLED，极难排查。
+          #     2026-11-22 现场踩到：AP 写死 ch36、上行在 ch149，PC 扫描里根本没有 alon-5G。
+          #   · 中继形态带宽钉 VHT40（不是 VHT80）。同一条上行、同一客户端（-74 dBm、各 3 次）：
+          #     AP@40MHz：单流中位 7.4 MB/s、三流合计 8.4 MB/s、ping 0~1 ms
+          #     AP@80MHz：单流中位 4.9 MB/s、三流合计 4.2 MB/s、ping 均值 5 ms / 峰值 44 ms
+          uci set wireless.radio1.disabled='0'
+          uci set wireless.radio1.country='CN'
+          uci set wireless.radio1.noscan='1'
           if [ "$_sta_on_r1" = "1" ]; then
-              echo "radio1 已被中继占用（存在 mode=sta 的段）：保留现有 AP 开关状态，不强行打开 5G AP"
+              # 中继形态：信道必须 auto —— 它会跟着上游走，换光猫/换信道后自动适配，不需要改固件。
+              uci set wireless.radio1.channel='auto'
+              # 带宽默认 VHT40（实测更稳）。若你已经明确设成别的（VHT20/VHT80）就保留，不覆盖。
+              case "$(uci -q get wireless.radio1.htmode)" in
+                  ''|VHT80) uci set wireless.radio1.htmode='VHT40' ;;
+                  *) echo "保留已有 5G 带宽：$(uci -q get wireless.radio1.htmode)" ;;
+              esac
+              echo "radio1 上存在中继段：AP 跟随 STA 信道(auto)"
           else
-              uci set wireless.default_radio1.disabled='0'
+              uci set wireless.radio1.channel='149'
+              uci set wireless.radio1.htmode='VHT80'
+              echo "radio1 仅作 AP：钉 149 信道、VHT80"
           fi
 
           uci set wireless.default_radio0.ssid='alon'
           uci set wireless.default_radio0.encryption='psk2'
-          uci set wireless.default_radio0.key='alon12345678'
           uci set wireless.default_radio0.disabled='0'
-          # 弱信号时不要因为连续 ack 失败就踢客户端（默认会踢，表现是“时不时掉线又自己回来”）
+          # ---- WiFi 口令不写进仓库（避免明文外泄）：由你自己设置 ----
+          #   刷完用网线接 LAN 口打开 LuCI（网络 → 无线）给 alon / alon-5G 设口令，或命令行：
+          #     uci set wireless.default_radio0.key='你的口令'
+          #     uci set wireless.default_radio1.key='你的口令'
+          #     uci commit wireless; wifi reload
+          #   重要：encryption='psk2' 而没有 key 时 hostapd 起不来，2.4G/5G 都不会发信标——
+          #   不是"开放网络"，而是"没有信号"。所以刷完必须先用网线配置，别指望无线能连。
+          # 弱信号时不要因为连续 ack 失败就踢客户端（默认会踢，表现是"时不时掉线又自己回来"）
           uci set wireless.default_radio0.disassoc_low_ack='0'
           uci set wireless.default_radio1.ssid='alon-5G'
           uci set wireless.default_radio1.encryption='psk2'
-          uci set wireless.default_radio1.key='alon12345678'
-          # disabled 由上面的 _sta_on_r1 分支决定，这里不再无条件打开
           uci set wireless.default_radio1.disassoc_low_ack='0'
+          # ---- 5G AP 开不开：两种形态都打开。实测开/关的吞吐差在噪声内，开着能让近端设备
+          #   走 5G（客户端是 1x1 网卡时 2.4G 只有 72 Mbps，5G 40MHz 有 200 Mbps）。
+          #   只在段存在时设置，避免 uci set 出一个残缺的 wifi-iface。
+          #   不想开：uci set wireless.default_radio1.disabled='1'; uci commit wireless; wifi reload
+          if uci -q get wireless.default_radio1 >/dev/null 2>&1; then
+              uci set wireless.default_radio1.disabled='0'
+          fi
 
           uci commit wireless
           exit 0
@@ -461,30 +470,17 @@ jobs:
               uci commit uhttpd
           fi
 
-          # ---- TurboACC ----
-          if uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
-              uci set turboacc.@turboacc[0].sw_flow='1'
-              uci set turboacc.@turboacc[0].hw_flow='1'
-              uci set turboacc.@turboacc[0].bbr_cca='1'
-              # Shortcut-FE 显式关掉：这个镜像没编 shortcut-fe 内核模块（MT7621 主线没有
-              # 可用实现），UI 上它是"开"的但其实 modprobe 不动、白占排查注意力。
-              # 现场核对：lsmod | grep shortcut 为空，dmesg 也无相关行。
-              uci set turboacc.@turboacc[0].sfe_flow='0'
-              # 全锥 NAT 默认关：需要 kmod-nft-fullcone，当前镜像未编入。
-              # 想开：先确认 feeds 有该 kmod（.config 里 INCLUDE_NFT_FULLCONE 改 y），再把这里改 1
-              uci set turboacc.@turboacc[0].fullcone_nat='0'
-              uci commit turboacc
-          fi
-
-          # 与透明代理的兼容性（别轻易关掉，也理解它为什么不会打断代理）：
-          #   直连流量走 forward → 进 flowtable 分载，提速；
-          #   被代理的流量在 prerouting 就被 redirect/tproxy 抓成本地连接，根本走不到
-          #   forward，所以分载和透明代理不冲突。真遇到"代理通、网页卡"再依次关
-          #   hw_flow → sw_flow 排查。
-          # ---- 防火墙流量分载：不依赖 TurboACC，装了/没装都生效 ----
-          # TurboACC 只是 UI + 额外选项；核心加速走 firewall4 原生 offload。
+          # ---- 流量分载 / 全锥 NAT ----
+          # 结论（2026-11-22 实测定案）：**中继拓扑下不开 flow offload**。
+          #   · /usr/bin/relay-tune 每次开机都会把 firewall 的 flow_offloading 归零，理由写在它
+          #     自己的注释里：bridge + 无线 + 软件 offload 在 mt76 上会出现"连着但上不去网 / 时断时续"。
+          #   · 这台机器 WAN 约 90 Mbps，MT7621 不开 offload 时 NAT 转发也够用（空载 0.3），收益本来就小。
+          #   · TurboACC 已移除，开关到此为止只剩 firewall 这两行。
+          # 全锥 NAT 默认打开：kmod-nft-fullcone 本镜像有（实测两条规则、重启后仍在、代理正常），
+          # 双层 NAT 下对 BT/游戏/P2P 的 NAT 类型有明显改善。
           if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
-              uci set firewall.@defaults[0].flow_offloading='1'
+              uci set firewall.@defaults[0].flow_offloading='0'
+              uci set firewall.@defaults[0].fullcone='1'
               uci commit firewall
           fi
 
@@ -596,7 +592,7 @@ jobs:
           # geosite.dat 拉回来）。服务脚本和配置都由这里覆盖进镜像：
           #   /etc/init.d/mosdns       —— 覆盖软件包自带的那份（绝对路径 + procd 守护）
           #   /etc/mosdns/config.yaml  —— 去广告 + DoH
-          #   /etc/mosdns/adblock.txt  —— 构建期下载的广告域名（见 K 节）
+          #   /etc/mosdns/adblock.txt  —— 构建期下载的广告域名（见 K 节）；运行时由 init 拷到 /tmp/mosdns/
           mkdir -p files/etc/mosdns files/etc/init.d
           cat > files/etc/init.d/mosdns << "EOF"
           #!/bin/sh /etc/rc.common
@@ -615,6 +611,23 @@ jobs:
               [ -f "$CONF" ] || { logger -t mosdns "找不到 $CONF"; return 1; }
               # MosDNS 只监听 127.0.0.1:5335。本脚本 START=18 早于 network(20)，
               # 开机时 lo 上的 127.0.0.1 还没配上，直接起会连打两条
+              # ---- 广告清单落到 /tmp（不占 overlay）----
+              # 镜像里那份在 squashfs（约 2MB，本来就不占 overlay），但 LuCI 里"更新清单"
+              # 会写回 /etc/mosdns → 一次吃掉几 MB overlay（现场见过 4.6MB）。这里每次启动
+              # 统一落到 /tmp/mosdns/adblock.txt，config.yaml 与 mosdns-ctl 都指向那里。
+              # 优先级：/etc/mosdns 里已有的（用户手工更新过）> 镜像 /rom 里那份。
+              # 代价：重启后清单回到镜像版本；需要长期保留就自己 cp 回 /etc/mosdns。
+              mkdir -p /tmp/mosdns
+              if [ ! -s /tmp/mosdns/adblock.txt ]; then
+                  if [ -s /etc/mosdns/adblock.txt ]; then
+                      cp -f /etc/mosdns/adblock.txt /tmp/mosdns/adblock.txt
+                  elif [ -s /rom/etc/mosdns/adblock.txt ]; then
+                      cp -f /rom/etc/mosdns/adblock.txt /tmp/mosdns/adblock.txt
+                  fi
+              fi
+              # 兜底：清单实在拿不到就给个空文件。绝不能让 mosdns 因为缺 domain_set 起不来
+              # —— mosdns 挂了 = 53 断 = 全家断网，比少拦几个广告严重得多。
+              [ -s /tmp/mosdns/adblock.txt ] || : > /tmp/mosdns/adblock.txt
               #   "listen udp 127.0.0.1:5335: bind: cannot assign requested address" FATAL
               # （随后靠 respawn 重试才成功，日志看着像故障）。
               # 这里先等 loopback 就绪（最多 8 秒），等不到也照样起——交给 respawn 兜底。
@@ -643,7 +656,7 @@ jobs:
           cat > files/etc/mosdns/config.yaml << "EOF"
           # MosDNS 5.x 配置 —— 只干两件事：去广告、把上游换成 DoH（加密）
           # 链路：客户端 / 系统 dnsmasq → 127.0.0.1:5335
-          #         广告域名 → 返回 0.0.0.0（集合来自 /etc/mosdns/adblock.txt）
+          #         广告域名 → 返回 0.0.0.0（集合来自 /tmp/mosdns/adblock.txt）
           #         其他     → DoH（阿里 / 腾讯）+ 进程内缓存
           # 只监听回环地址：局域网和外网都碰不到它，53 由系统 dnsmasq 持有并转发到这里。
           log:
@@ -654,7 +667,7 @@ jobs:
               type: domain_set
               args:
                 files:
-                  - /etc/mosdns/adblock.txt
+                  - /tmp/mosdns/adblock.txt
 
             # 缓存只放内存（不写 dump 文件）：32MB 闪存经不起频繁写
             - tag: cache
@@ -748,7 +761,9 @@ jobs:
           SET=$BASE/settings.conf
           BL=$BASE/custom_blacklist.txt
           WL=$BASE/custom_whitelist.txt
-          AD=$BASE/adblock.txt
+          # 广告清单的运行时位置：放 /tmp（tmpfs），不再往 overlay 写几 MB。
+          # 镜像里的原版在 /rom/etc/mosdns/adblock.txt，由 /etc/init.d/mosdns 每次启动拷过去。
+          AD=/tmp/mosdns/adblock.txt
           INIT=/etc/init.d/mosdns
           DPORT=5335
 
@@ -1502,6 +1517,56 @@ jobs:
               option bidirectional '0'
           EOF
 
+          # ---------- SQM 预置（默认关闭；刷完跑一次 sqm-setup 即开启）----------
+          # 为什么预置而不直接开：整形上限必须按实测带宽定（×0.88），先给 0 = 不整形。
+          cat > files/etc/config/sqm << 'EOF'
+          config queue 'relay'
+              option enabled '0'
+              option interface 'phy1-sta0'
+              option debug_logging '0'
+              option verbosity '5'
+              option qdisc 'cake'
+              option script 'piece_of_cake.qos'
+              option qdisc_advanced '0'
+              option ingress_ecn 'ECN'
+              option egress_ecn 'NOECN'
+              option linklayer 'ethernet'
+              option squash_dscp '0'
+              option squash_ingress '0'
+              option download '0'
+              option upload '0'
+          EOF
+
+          # sqm-setup：拿实测带宽自动按 88% 配好，省得手算和设错方向
+          cat > files/usr/bin/sqm-setup << 'EOF'
+          #!/bin/sh
+          # sqm-setup —— 按实测上下行带宽配置 SQM（cake + piece_of_cake）
+          # 用法：sqm-setup <下行Mbps> <上行Mbps> [接口，默认 phy1-sta0]
+          #   例：sqm-setup 92 40   → 实际整形到 80 / 35 Mbit
+          # 为什么 ×0.88：整形器必须略低于线路速率才有排队余量；设满等于没设。
+          [ -n "$1" ] && [ -n "$2" ] || { echo "用法: sqm-setup <下行Mbps> <上行Mbps> [接口]"; exit 1; }
+          SEC=relay
+          IF=${3:-phy1-sta0}
+          command -v tc >/dev/null 2>&1 || { echo "缺少 tc（本镜像应已内置；否则 apk add tc-tiny）"; exit 1; }
+          modprobe sch_cake 2>/dev/null
+          [ -d /sys/module/sch_cake ] || { echo "内核没有 sch_cake（缺 NET_CLS/CAKE），SQM 用不了"; exit 1; }
+          DOWN=$(( $1 * 88 / 100 ))
+          UP=$(( $2 * 88 / 100 ))
+          uci -q get sqm.$SEC >/dev/null 2>&1 || uci set sqm.$SEC=queue
+          uci set sqm.$SEC.interface="$IF"
+          uci set sqm.$SEC.enabled='1'
+          uci set sqm.$SEC.download="$DOWN"
+          uci set sqm.$SEC.upload="$UP"
+          uci set sqm.$SEC.script='piece_of_cake.qos'
+          uci set sqm.$SEC.qdisc='cake'
+          uci set sqm.$SEC.linklayer='ethernet'
+          uci commit sqm
+          /etc/init.d/sqm restart >/dev/null 2>&1
+          echo "SQM 已启用：下行 ${DOWN} Mbit / 上行 ${UP} Mbit（实测 ${1}/${2} 的 88%，接口 $IF）"
+          echo "查看：tc -s qdisc show dev $IF | head -20"
+          echo "关闭：uci set sqm.$SEC.enabled='0'; uci commit sqm; /etc/init.d/sqm restart"
+          EOF
+
           # ---------- F. 内核调优（针对 MT7621 双核 / 512MB 内存）----------
           # ---------- /etc/config/fstab：只为一个原因存在 ----------
           # 没有这个文件时，开机 block 会连打 4 条
@@ -1592,7 +1657,7 @@ jobs:
           # 本固件不自动升级、不自动下载固件与规则包：分流规则随 PassWall 包发布，
           # 广告清单在构建期写进镜像；PassWall 自己的规则/订阅定时任务默认也不启用
           # （tasks.sh 只在 uci 里配了 update_week_mode 时才动作，出厂没有该选项）。
-          # 下面四条全是纯本地动作，一个字节都不出网：
+          # 下面七条全是纯本地动作，一个字节都不出网：
           # （原来还有一条"每天 04:00 drop_caches"，2026-11-16 删掉：页缓存丢了下一次读盘
           #   立刻又长回来，定时清只会让第二天首次访问变慢；真缺内存时 memguard 会处理）
           # 1) 每 10 分钟看一眼可用内存：低于总量 8% 清页缓存，低于 4% 再截断大日志（不动任何进程）
@@ -1602,8 +1667,14 @@ jobs:
           # 4) 每 2 分钟确认无线还在发信标：mt76 崩了只重启那一个 radio；
           #    中继断了先只重连中继接口，最后才全量 reload（细节见脚本头注释）
           */2 * * * * /usr/bin/wifi-watchdog
-          # 5) 每周日 04:30 截断超过 512KB 的运行日志（/var/log 在 tmpfs 里，实打实吃内存）
+          # 5) 每 5 分钟做一次 TCP 连通探测：连续 3 次失败才重连中继 radio（#25305 用）
+          */5 * * * * /usr/bin/net-watchdog
+          # 6) 每 30 分钟把超过 1MB 的日志裁到最近 200 行；每周日 04:30 再全量扫一次兜底
+          */30 * * * * /usr/bin/memguard trim
           30 4 * * 0 /usr/bin/memguard trim
+          # 7) 每天 04:00 清空运行日志（/var/log 在 tmpfs 里）。net-watchdog.log 例外：
+          #    只保留最近 200 行，因为它记录了漫游后的 TCP 断流证据
+          0 4 * * * /usr/bin/memguard purge
           EOF
 
           # ---------- F2. 内存看门狗（必要自动化：只清缓存，不动进程）----------
@@ -1621,14 +1692,34 @@ jobs:
           [ -n "$AVAIL" ] || exit 0
 
           trim_logs() {
-              find /var/log -type f -size +512k 2>/dev/null | while read -r f; do
-                  : > "$f"
-                  echo "$(date '+%F %T') 截断日志 $f" >> "$LOG"
+              # 每个日志上限 1MB：超了就只留最近 200 行（保留现场，不要直接清空）
+              find /var/log -type f -size +1M 2>/dev/null | while read -r f; do
+                  tail -n 200 "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+                  echo "$(date '+%F %T') 裁剪日志 $f（保留最近 200 行）" >> "$LOG"
               done
           }
 
           if [ "$1" = "trim" ]; then
               trim_logs
+              exit 0
+          fi
+
+          purge_logs() {
+              # 每天清空运行日志（用户要求"日志每天会清空"）。
+              # 唯一的例外：net-watchdog.log 只裁到最近 200 行、不清空 ——
+              # 它是漫游/TCP 断流（#25305）的唯一证据，清掉就等于白测。
+              for f in /var/log/*.log; do
+                  [ -f "$f" ] || continue
+                  case "$f" in
+                      */net-watchdog.log) tail -n 200 "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" ;;
+                      *) : > "$f" ;;
+                  esac
+              done
+              echo "$(date '+%F %T') 已按计划清空 /var/log（net-watchdog.log 保留最近 200 行）" >> "$LOG"
+          }
+
+          if [ "$1" = "purge" ]; then
+              purge_logs
               exit 0
           fi
 
@@ -1874,7 +1965,7 @@ jobs:
               netstat -lnu 2>/dev/null | grep -q ":5335" && _p5335=1
           fi
           [ "$_p5335" = "1" ] && ok "MosDNS 监听 5335/UDP" || ng "5335 没有监听"
-          AD_N=$(wc -l < /etc/mosdns/adblock.txt 2>/dev/null | tr -d " ")
+          AD_N=$(wc -l < /tmp/mosdns/adblock.txt 2>/dev/null | tr -d " ")
           [ -n "$AD_N" ] || AD_N=0
           [ "$AD_N" -ge 50000 ] && ok "广告域名 $AD_N 条" || ng "广告域名清单异常（$AD_N 条）"
           [ -x /usr/libexec/mosdns-ctl ] && ok "MosDNS 管理脚本已装（LuCI 页面同一入口）" || ng "mosdns-ctl 缺失"
@@ -1918,7 +2009,7 @@ jobs:
           _av=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
           [ -n "$_av" ] && printf '  · 可用内存 %sMB（低于总量 8%% 时 memguard 会自动清缓存）\n' "$_av"
           [ "$(uci -q get dhcp.@dnsmasq[0].cachesize)" = "2000" ] \
-              && ok "dnsmasq 缓存 1000 条" || ng "dnsmasq 缓存未调到 1000"
+              && ok "dnsmasq 缓存 2000 条" || ng "dnsmasq 缓存未调到 2000"
           if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
               ok "dnsmasq 只走 MosDNS（noresolv=1）"
           else
@@ -1932,6 +2023,31 @@ jobs:
           [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ] && ok "BBR 生效" || ng "BBR 未生效"
           [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
           # 没插 U 盘是正常状态（固件里 ksmbd 由 usb-service 按需起），不该拉低信噪比
+
+          # ---------- 整形能力 / SQM / TCP 看门狗（升级内核后第一件要看的事）----------
+          if command -v tc >/dev/null 2>&1; then
+              ok "tc 已安装"
+              modprobe sch_cake 2>/dev/null
+              if [ -d /sys/module/sch_cake ]; then
+                  ok "sch_cake 可加载（cake / 双向整形可用）"
+              else
+                  ng "sch_cake 加载失败（内核缺 NET_CLS / NET_SCH_CAKE → SQM 用不了）"
+              fi
+          else
+              ng "缺少 tc（SQM 装不上）"
+          fi
+          if [ "$(uci -q get sqm.relay.enabled 2>/dev/null)" = "1" ]; then
+              ok "SQM 已启用（下行 $(uci -q get sqm.relay.download)/上行 $(uci -q get sqm.relay.upload) kbit）"
+          else
+              printf '  · SQM 未启用：测速后执行 sqm-setup <下行Mbps> <上行Mbps>\n'
+          fi
+          if grep -q 'net-watchdog' /etc/crontabs/root 2>/dev/null; then
+              ok "net-watchdog 已排程（每 5 分钟探测 TCP）"
+          else
+              ng "net-watchdog 未排程（#25305 的断流将无法自动留证）"
+          fi
+          _nw=$(wc -l < /var/log/net-watchdog.log 2>/dev/null | tr -d ' ')
+          printf '  · net-watchdog 日志 %s 行（/var/log/net-watchdog.log）\n' "${_nw:-0}"
           [ -d /mnt/sda1 ] && ok "U 盘已挂载 /mnt/sda1" || printf '  · 未插 U 盘（需要共享时插上即可，ksmbd 会自动起）\n'
 
           echo
@@ -1968,8 +2084,8 @@ jobs:
           printf "  内核 : %s\n" "$(uname -r)"
           printf "  运行 : %s\n" "$(uptime | sed 's/^ *//')"
           case "$DISTRIB_RELEASE" in
-            24.10*) ok "系统分支 24.10（PassWall + Xray 主线，内核 6.6）" ;;
-            *)      warn "系统分支是 $DISTRIB_RELEASE，不是预期的 24.10" ;;
+            25.12*) ok "系统分支 25.12（内核 6.12，apk 包管理器）" ;;
+            *)      warn "系统分支是 $DISTRIB_RELEASE，不是预期的 25.12" ;;
           esac
 
           # ---------- 2. 闪存与内存 ----------
@@ -2048,7 +2164,7 @@ jobs:
             bad "5335 没有监听：MosDNS 没起来或配置被改坏"
           fi
           _adn=0
-          [ -s /etc/mosdns/adblock.txt ] && _adn=$(wc -l < /etc/mosdns/adblock.txt | tr -d " ")
+          [ -s /tmp/mosdns/adblock.txt ] && _adn=$(wc -l < /tmp/mosdns/adblock.txt | tr -d " ")
           # 三源（anti-AD + oisd small + AdGuard DNS）合并后正常约 22.7 万条；
           # 低于 15 万说明构建时有源没拉全，但不影响已经生效的那部分
           if [ "${_adn:-0}" -ge 150000 ]; then
@@ -2065,7 +2181,7 @@ jobs:
           else
             bad "解析失败：优先执行 dns-recover 恢复直连，再排查 MosDNS"
           fi
-          _adt=$(head -n1 /etc/mosdns/adblock.txt 2>/dev/null)
+          _adt=$(head -n1 /tmp/mosdns/adblock.txt 2>/dev/null)
           if [ -n "$_adt" ]; then
             # 必须直接问 MosDNS(5335)：走 53 全链路时，被分到"境外"的域名根本不会经过 MosDNS，
             # 于是"清单里有这个域名却解析出真 IP"——那是分流正常，不是拦截失效（曾误报）。
@@ -2198,7 +2314,7 @@ jobs:
             _fo_nft=$(nft list ruleset 2>/dev/null | grep -c 'flow offload')
             _fo_tbl=$(nft list flowtable inet fw4 2>/dev/null | grep -c 'flowtable')
             if [ "$_fo_cfg" = "1" ] && [ "$_fo_nft" -gt 0 ]; then
-              warn "flow offload 真的在跑：中继场景建议关（uci set turboacc.@turboacc[0].sw_flow=0 后 relay-tune once）"
+              warn "flow offload 真的在跑：中继场景建议关（uci set firewall.@defaults[0].flow_offloading=0 后 /etc/init.d/firewall restart）"
             elif [ "$_fo_cfg" = "1" ]; then
               ok "flow offload 配置位=1 但内核没有 flowtable（实际不生效，可以不管）"
             else
@@ -2268,7 +2384,7 @@ jobs:
           # wifi-doctor：判断“信号弱 / 时有时无”到底是信道拥挤、法规限功率、内存被吃光，
           # 还是驱动报错。只读脚本，不改任何配置。用法：SSH 登录后执行  wifi-doctor
 
-          command -v iw >/dev/null 2>&1 || { echo '缺少 iw（opkg install iw 后重试）'; exit 1; }
+          command -v iw >/dev/null 2>&1 || { echo '缺少 iw（apk add iw 后重试）'; exit 1; }
           printf '\n===== Newifi-D2 无线诊断 =====\n\n'
 
           echo '--- 1. 法规域（决定允许的最大发射功率）---'
@@ -2405,7 +2521,7 @@ jobs:
               echo '  ✅ 本次开机内没有 mt76 硬件重启 / 固件崩溃'
           else
               echo "  ✗ 本次开机内出现 ${_hw} 次 mt76 硬件重启 / 固件崩溃："
-              echo '    这是 24.10 的 mt76 已知问题（大流量、弱信号时最容易被触发），'
+              echo '    这是 mt76 的已知问题（大流量、弱信号时最容易被触发），'
               echo '    现象就是信号忽高忽低、SSID 时有时无、客户端显示连着却没流量。'
               dmesg 2>/dev/null | grep -iE 'hardware restart|firmware crash|mcu message' | tail -n 3 | sed 's/^/     /'
           fi
@@ -2433,8 +2549,8 @@ jobs:
           echo '  2.4G 不稳   → MT7603E 出厂 EEPROM 的功率校准偏差大（刷机改不了它），先换 1 或 11 试；'
           echo '                仍不行只能刷改过的 EEPROM（会动 MAC/校准区，有变砖风险，不建议随手做）'
           echo '  无线时断/连不上 → 中继场景先确认 flow offload 已关（第 7 节）：'
-          echo '                uci set turboacc.@turboacc[0].sw_flow=0; uci set turboacc.@turboacc[0].hw_flow=0;'
-          echo '                uci commit turboacc; /etc/init.d/firewall restart'
+          echo '                uci set firewall.@defaults[0].flow_offloading=0'
+          echo '                uci commit firewall; /etc/init.d/firewall restart'
           echo '  开机很久才有网 → cat /var/log/relay-tune.log（能看到"AP 第几秒就绪、中继第几秒连上"）'
           echo
           exit 0
@@ -2443,7 +2559,7 @@ jobs:
           # ---------- I3. 无线看门狗（mt76 崩溃后自动恢复，不改任何配置）----------
           cat > files/usr/bin/wifi-watchdog << 'EOF'
           #!/bin/sh
-          # wifi-watchdog：mt76 在 24.10 上会偶发 Hardware restart was requested / 固件崩溃，
+          # wifi-watchdog：mt76 在 6.6/6.12 内核上都会偶发 Hardware restart was requested / 固件崩溃，
           # 表现就是 2.4G 信号忽高忽低、SSID 时有时无、手机还显示连着但上不了网。
           # 本脚本只做恢复与记录，绝不改配置、绝不重启整机：
           #   1) 每 2 分钟确认 AP 接口还在发信标（iwinfo 能报出 ESSID）
@@ -2792,6 +2908,84 @@ jobs:
           exit 0
           EOF
 
+          # ---------- F3. TCP 断流检测（openwrt#25305 专用）----------
+          # 25.12（内核 6.12）在 mt7621 上有 MT7530 FDB 失步回归：漫游后 ICMP 正常、TCP 卡死。
+          # 人工盯不住，所以每 5 分钟做一次真实 HTTP 探测，连续 3 次失败才动手（只重连中继 radio）。
+          cat > files/usr/bin/net-watchdog << 'EOF'
+          #!/bin/sh
+          # net-watchdog —— "ICMP 通、TCP 卡死" 检测器（openwrt#25305 的典型症状）
+          #
+          # 判定与动作（宁可少动，不要乱动）：
+          #   1) 单次失败不动手（可能是对端抖动，或客户端正在漫游）
+          #   2) 连续 3 次失败（约 15 分钟）→ 记一份现场快照，再只重连中继那个 radio
+          #   3) 绝不 wifi reload：那会把 2.4G/5G 的 AP 一起拆掉，反而制造二次中断
+          #   4) 快照写进日志，事后能判断到底是不是 #25305
+          #
+          # 日志：/var/log/net-watchdog.log（>1MB 时由 memguard trim 裁到最近 200 行）
+          LOG=/var/log/net-watchdog.log
+          ST=/tmp/net-watchdog.fail
+          URL204='http://connect.rom.miui.com/generate_204'
+          URL2='https://mirrors.aliyun.com/ubuntu/ls-lR.gz'
+
+          log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+          probe() {
+              _c=$(curl -s -o /dev/null -m 8 -w '%{http_code}' "$URL204" 2>/dev/null)
+              case "$_c" in 200|204) return 0 ;; esac
+              curl -s -o /dev/null -m 10 -r 0-1023 "$URL2" 2>/dev/null && return 0
+              return 1
+          }
+
+          snapshot() {
+              log "---- 快照 ----"
+              log "  uptime : $(uptime | sed 's/^ *//')"
+              log "  wan-ip : $(ip -4 addr show phy1-sta0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p')"
+              log "  sta    : $(iw dev phy1-sta0 link 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+              log "  fdb    : $(bridge fdb show br br-lan 2>/dev/null | wc -l) 条"
+              log "  connt  : $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)/$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+              for _a in phy0-ap0 phy1-ap0; do
+                  [ -e "/sys/class/net/$_a" ] || continue
+                  log "  $_a : tx $(cat /sys/class/net/$_a/statistics/tx_packets 2>/dev/null) / rx $(cat /sys/class/net/$_a/statistics/rx_packets 2>/dev/null)"
+              done
+          }
+
+          if probe; then
+              _old=$(cat "$ST" 2>/dev/null || echo 0)
+              [ "$_old" -gt 0 ] 2>/dev/null && log "TCP 恢复（此前连续失败 $_old 次），计数清零"
+              rm -f "$ST"
+              exit 0
+          fi
+
+          _n=$(cat "$ST" 2>/dev/null || echo 0)
+          _n=$((_n + 1))
+          echo "$_n" > "$ST"
+          log "TCP 探测失败（连续第 $_n 次）"
+
+          [ "$_n" -ge 3 ] || exit 0
+
+          # 动作前排掉两件"不是 #25305"的情况，避免上游真的断了却反复重启无线：
+          #   1) STA 没关联上游 → 那是 relay-tune / wifi-watchdog 的活，这里不动手
+          #   2) 30 分钟冷却，同一时段不重复重启
+          if ! iw dev phy1-sta0 link 2>/dev/null | grep -q 'Connected to'; then
+              log "STA 未关联上游：交给 relay-tune / wifi-watchdog，本次不动手"
+              rm -f "$ST"
+              exit 0
+          fi
+          _last=$(cat /tmp/net-watchdog.last 2>/dev/null || echo 0)
+          _now=$(date +%s)
+          if [ "$((_now - _last))" -lt 1800 ] 2>/dev/null; then
+              log "距上次恢复不足 30 分钟（$(((_now - _last) / 60)) 分钟），只记录不动手"
+              exit 0
+          fi
+          date +%s > /tmp/net-watchdog.last
+          log "连续 3 次 TCP 不通且 STA 仍关联 → 记快照，然后只重连中继 radio1"
+          snapshot
+          rm -f "$ST"
+          /sbin/wifi up radio1 >/dev/null 2>&1 || log "wifi up radio1 返回失败"
+          log "已执行 wifi up radio1（若仍不通，看 wifi-doctor 第 5 节）"
+          exit 0
+          EOF
+
           # ---------- I4. 中继收敛器（开机先起 AP，再等中继；顺带关掉 wireless 上的 flow offload）----------
           # 5G 当无线中继（sta）时，2.4G AP 与它是两颗 phy，但共用一个 wpad、一条启动流程：
           #   · 开机时 sta 要扫描上游（全信道），AP 起得比它晚 → 手机迟迟搜不到 SSID；
@@ -2879,29 +3073,22 @@ jobs:
           # 并降级成软件 offload —— 所以 hw_flow=1 在这台机器上等于软件 offload。
           # 桥接 + 无线 + 软件 offload 这个组合在 mt76 上就是"连着但上不去网 / 时断时续"。
           # 中继场景下先把这一层拿掉，排查面立刻少一层。
-          # 想保留：uci set turboacc.@turboacc[0].relay_keep_offload='1'; uci commit turboacc
+          # 想保留：touch /etc/relay-keep-offload（文件开关，不依赖任何软件包）
           offload_off() {
-              [ "$(uci -q get turboacc.@turboacc[0].relay_keep_offload)" = "1" ] && {
-                  log "turboacc.relay_keep_offload=1：保留 flow offload（若仍断流，把它删掉再重启）"
+              if [ -f /etc/relay-keep-offload ]; then
+                  log "存在 /etc/relay-keep-offload：保留 flow offload（若仍断流，删掉它再重启）"
                   return 0
-              }
-              _sw=$(uci -q get turboacc.@turboacc[0].sw_flow)
-              _hw=$(uci -q get turboacc.@turboacc[0].hw_flow)
+              fi
               _fw=$(uci -q get firewall.@defaults[0].flow_offloading)
               _fwh=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
-              [ "$_sw" = "1" ] || [ "$_hw" = "1" ] || [ "$_fw" = "1" ] || [ "$_fwh" = "1" ] || return 0
-              if [ -f /etc/config/turboacc ] && uci -q get turboacc.@turboacc[0] >/dev/null 2>&1; then
-                  uci -q set turboacc.@turboacc[0].sw_flow='0'
-                  uci -q set turboacc.@turboacc[0].hw_flow='0'
-                  uci -q commit turboacc
-              fi
+              [ "$_fw" = "1" ] || [ "$_fwh" = "1" ] || return 0
               if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
                   uci -q set firewall.@defaults[0].flow_offloading='0'
                   uci -q set firewall.@defaults[0].flow_offloading_hw='0'
                   uci -q commit firewall
                   /etc/init.d/firewall restart >/dev/null 2>&1
               fi
-              log "中继模式：已关 flow offload（turboacc sw=$_sw hw=$_hw，firewall $_fw/$_fwh → 0）"
+              log "中继模式：已关 flow offload（firewall $_fw/$_fwh → 0）"
           }
 
           once() {
@@ -3007,9 +3194,10 @@ jobs:
               for _d in $(sta_ifaces); do
                   printf '    %-10s %s\n' "$_d" "$(iw dev "$_d" link 2>/dev/null | sed -n 's/^ *Connected to *//p' | head -n 1)"
               done
-              printf '  flow offload：turboacc sw=%s hw=%s / firewall %s(%s)\n' \
-                  "$(uci -q get turboacc.@turboacc[0].sw_flow)" "$(uci -q get turboacc.@turboacc[0].hw_flow)" \
-                  "$(uci -q get firewall.@defaults[0].flow_offloading)" "$(uci -q get firewall.@defaults[0].flow_offloading_hw)"
+              printf '  flow offload(firewall)：%s(hw %s)  fullcone：%s\n' \
+                  "$(uci -q get firewall.@defaults[0].flow_offloading)" \
+                  "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" \
+                  "$(uci -q get firewall.@defaults[0].fullcone)"
               if [ -s "$LOG" ]; then
                   printf '  最近 8 条日志：\n'
                   tail -n 8 "$LOG" | sed 's/^/    /'
@@ -3374,6 +3562,58 @@ jobs:
             "https://raw.githubusercontent.com/AdguardTeam/AdGuardSDNSFilter/master/Filters/filter.txt" \
             "https://filters.adtidy.org/extension/ublock/filters/2_without_easylist.txt"
 
+
+          # ---------- K1. 手工补充清单（三门源常漏的广告/追踪域名）----------
+          # 2026-11-22 用 70 条 benchmark 实测：三门源合并后命中 61/70，缺的 9 条在这里补齐。
+          # 其中 simba.taobao.com / ads.iqiyi.com / stat.youku.com 是被"保护名单"连带删掉的
+          # （guard 只删主域那一行，所以广告子域必须显式加回来）。
+          # 想再补：直接往这个文件里加纯域名（每行一个，# 开头是注释），下次构建自动并入。
+          # 这个文件也会随镜像发布，刷机后可直接改，然后重编。
+          cat > files/etc/mosdns/adblock-extra.txt << 'EXTRA'
+          # ===== 国内：广告投放 / 埋点 / 归因 =====
+          # 阿里妈妈 TanX 展示广告
+          tanx.com
+          # 淘宝客推广追踪（taobao.com 在保护名单里，这里只补广告子域）
+          simba.taobao.com
+          # 爱奇艺贴片广告（同理只补子域）
+          ads.iqiyi.com
+          # 优酷播放统计
+          stat.youku.com
+          iostat.youku.com
+          # 新浪埋点
+          log.sina.com.cn
+          # 汇量科技移动广告 SDK
+          mobvista.com
+          # 常见国内埋点/归因
+          sensorsdata.cn
+          growingio.com
+          domob.cn
+          youmi.net
+          adsmogo.com
+          adview.cn
+          # ===== 海外（故意不拦 graph.facebook.com：那是 FB App 登录必需）=====
+          # 字节系海外广告（2026-11-22 实测：三门源都漏了 ads.tiktok.com）
+          ads.tiktok.com
+          ads.facebook.com
+          analytics.facebook.com
+          an.facebook.com
+          appsflyer.com
+          adjust.com
+          branch.io
+          kochava.com
+          singular.net
+          gumgum.com
+          33across.com
+          sharethrough.com
+          teads.tv
+          spotxchange.com
+          springserve.com
+          innovid.com
+          undertone.com
+          tremorhub.com
+          EXTRA
+          cat files/etc/mosdns/adblock-extra.txt >> "$LIST"
+          echo "  手工补充清单已并入待归一化：$(grep -v '^#' files/etc/mosdns/adblock-extra.txt | grep -c '[a-z]' | tr -d ' ') 条"
           # 归一化：去 CR、去注释/空行、拆 hosts 前缀（0.0.0.0 x / 127.0.0.1 x）、
           # 拆 ABP 的 ||x^、去 *. 与前导点、小写、只留合法域名、去重排序
           if [ -s "$LIST" ]; then
@@ -3484,13 +3724,16 @@ jobs:
               echo "::error::保护名单失效：$_d 出现在拦截清单里"; exit 1
             fi
           done
-          for _d in doubleclick.net googlesyndication.com adservice.google.com; do
+          # ---- 手工补充清单必须真进最终清单（防止被归一化或保护名单吃掉）----
+          for _d in tanx.com mobvista.com ads.iqiyi.com stat.youku.com simba.taobao.com log.sina.com.cn; do
             if ! grep -Fxq "$_d" "$BLOCK"; then
-              echo "::warning::$_d 不在清单里（该源可能只给了子域或格式变了）"
+              echo "::error::手工补充清单未生效：$_d 不在最终清单里（查 K1 节的 extra 文件与 guard 顺序）"
+              exit 1
             fi
           done
+          echo "  ✅ 手工补充清单已并入（tanx/mobvista/ads.iqiyi/stat.youku/simba.taobao/log.sina 均在）"
 
-          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/sysctl-apply files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service \
+          chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/sysctl-apply files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service files/usr/bin/net-watchdog files/usr/bin/sqm-setup \
                    files/etc/init.d/mosdns files/etc/init.d/relay-tune files/etc/init.d/usb-service \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local \
                    files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services \
@@ -3533,9 +3776,9 @@ jobs:
 
           # ---------- Go 工具链版本 ----------
           # feeds 的 GO_DEFAULT_VERSION 决定 Go 组件用哪个 Go 编译。
-          # 24.10 的 xray-core 是预编译二进制包（不需要 Go），MosDNS 用 feeds 默认 Go 即可。
+          # 25.12 的 xray-core 是预编译二进制包（不需要 Go），MosDNS 用 feeds 默认 Go 即可。
           # 若日志出现 "go.mod requires go >= 1.XX"，把 go_version 输入改成 1.XX 重跑
-          # （24.10 的 golang 是单包、没有 GO_DEFAULT_VERSION，此时该输入会被忽略并告警）。
+          # （25.12 的 golang 带 GO_DEFAULT_VERSION，这项输入会真正生效）。
           GO_VER="${{ inputs.go_version }}"
           if [ -n "$GO_VER" ] && [ "$GO_VER" != "auto" ]; then
             if grep -q '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk; then
@@ -3569,27 +3812,11 @@ jobs:
 
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
 
-          # ---------- 可选：关闭 TurboACC ----------
-          # 它是第三方 v1.4；万一与 24.10 的 LuCI 不兼容导致编译失败，
-          # 用 with_turboacc=false 重跑即可，加速能力不受影响
-          #（flow offload 走 firewall4，BBR 走 sysctl + kmod-tcp-bbr）
-          EFF_TURBO="true"
-          # inputs.* 在触发时可能全是空串，这里统一回落到默认值 true，
-          # 免得把 TurboACC 当成“用户要求关闭”而悄悄漏掉。
-          TURBO="${{ inputs.with_turboacc }}"
-          [ -z "$TURBO" ] && TURBO="true"
-          # 第 4 步若没拿到 TurboACC 源码（克隆失败/上游改结构），这里自动降级，
-          # 否则下面的 check CONFIG_PACKAGE_luci-app-turboacc 会误报缺失并中断构建。
-          if [ -e /workdir/no-turboacc-src ]; then
-            TURBO="false"
-            echo "⏭  第 4 步未取得 TurboACC 源码，本次构建跳过它"
-          fi
-          if [ "$TURBO" != "true" ]; then
-            sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
-            EFF_TURBO="false"
-            echo "⏭  已按输入关闭 TurboACC"
-          fi
-          # 记录"实际生效状态"：第 11 步可能自动降级把它关掉，第 12 步审计要读这个文件
+          # ---------- TurboACC 已移除（2026-11-22 定案）----------
+          # 它只是 LuCI 界面：sw_flow/hw_flow 在中继模式下被 relay-tune 强制关闭；sfe/hw 加速
+          # 本镜像没有对应内核模块。真正用到的 BBR 来自 kmod-tcp-bbr + sysctl，全锥 NAT 来自
+          # kmod-nft-fullcone + fw4 的 fullcone 选项。删掉它 = 少一个第三方源码、少一个失败点。
+          EFF_TURBO="false"
           echo "$EFF_TURBO" > /workdir/state-turboacc
 
           # GitHub 的默认 shell 带 -e -o pipefail：make defconfig 只要因上游 Kconfig
@@ -3655,7 +3882,7 @@ jobs:
           # 25.12.16 没有 Nftables/Iptables_Transparent_Proxy 开关（自己按 fw4+nftset 判断），
           # 也必须有中文翻译包，否则页面是英文
           check CONFIG_PACKAGE_luci-i18n-passwall-zh-cn
-          # 语言开关：符号是 CONFIG_LUCI_LANG_<po 目录名>，24.10 只有 zh_Hans；
+          # 语言开关：符号是 CONFIG_LUCI_LANG_<po 目录名>；25.12 的 LuCI 也只带 zh_Hans / zh_Hant。
           # zh-cn 只是 luci.mk 的 LC 别名（只用于 i18n 包名），写成 CONFIG_LUCI_LANG_zh-cn
           # 不会报错、只会静默失效（除下面点名的几个页面外，LuCI 全是英文），所以单独点名核对。
           if grep -qx 'CONFIG_LUCI_LANG_zh_Hans=y' .config; then
@@ -3693,11 +3920,7 @@ jobs:
           else
             echo "  ✅ geo 数据未编入（省约 3MB 闪存）"
           fi
-          if [ "$TURBO" = "true" ]; then
-            check CONFIG_PACKAGE_luci-app-turboacc
-          else
-            echo "  ⏭  TurboACC 按要求跳过（不影响 offload / BBR）"
-          fi
+          echo "  ⏭  TurboACC 已移除：BBR 由 kmod-tcp-bbr + sysctl 提供，全锥 NAT 由 kmod-nft-fullcone + fw4 提供"
           check CONFIG_PACKAGE_zram-swap
           check CONFIG_PACKAGE_luci-app-ksmbd
           check CONFIG_PACKAGE_ksmbd-server
@@ -3706,6 +3929,16 @@ jobs:
           check CONFIG_PACKAGE_p910nd
           check CONFIG_PACKAGE_kmod-usb-net-rndis
           check CONFIG_PACKAGE_kmod-usb-net-cdc-ncm
+          # SQM（治 bufferbloat）：这几个是 sqm-scripts 的硬依赖，缺一个就装不起来。
+          # 它们必须编进镜像——SNAPSHOT 源把 kmod 裁到只剩 111 个，缺 sched-core/cake/ifb，
+          # tc 连依赖都满足不了，现场再 opkg install 是装不上的。
+          for s in CONFIG_PACKAGE_kmod-sched-core CONFIG_PACKAGE_kmod-sched-cake \
+                   CONFIG_PACKAGE_kmod-ifb CONFIG_PACKAGE_tc-full \
+                   CONFIG_PACKAGE_iptables-nft CONFIG_PACKAGE_iptables-mod-ipopt \
+                   CONFIG_PACKAGE_sqm-scripts CONFIG_PACKAGE_luci-app-sqm; do
+            check "$s"
+          done
+          check CONFIG_PACKAGE_kmod-nft-fullcone
 
           if [ "$MISSING" -ne 0 ]; then
             echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
@@ -3726,7 +3959,7 @@ jobs:
             echo "### 📦 参与构建的关键包"
             echo ""
             echo '```'
-          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-passwall_INCLUDE_Xray|xray-core|chinadns-ng|dns2socks|mosdns|luci-app-turboacc|dnsmasq-full|luci-app-ksmbd|zram-swap)=' .config | sort
+          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-passwall_INCLUDE_Xray|xray-core|chinadns-ng|dns2socks|mosdns|dnsmasq-full|luci-app-ksmbd|zram-swap|sqm-scripts|kmod-sched-cake)=' .config | sort
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -4089,15 +4322,6 @@ jobs:
               fi
             fi
 
-            if [ "$FIXED" -eq 0 ] && grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
-              if grep -q "^CONFIG_PACKAGE_luci-app-turboacc=y" .config; then
-                echo "  · TurboACC 编译失败，自动移出本次构建（加速由 firewall4 分载 + BBR 承担）"
-                sed -i -E 's/^(CONFIG_PACKAGE_luci-app-turboacc.*)$/# \1/' .config
-                echo "false" > /workdir/state-turboacc
-                make defconfig >/dev/null 2>&1 || true
-                FIXED=1
-              fi
-            fi
 
             # 阶段 3：Go 主版本已对上但仍报 requires go（说明要的是补丁版本，
             # 例如 1.27.3 而 feeds 只提供 1.27.1）→ 允许 Go 在构建时自动取工具链
@@ -4130,8 +4354,6 @@ jobs:
           echo "::endgroup::"
           if grep -q "requires go >=" build.log; then
             echo "::error::编译失败：Go 版本仍不满足（自动切换已尝试），请手动把 go_version 设为日志要求的版本"
-          elif grep -qE "package/turboacc/[^ ]* failed to build" build.log; then
-            echo "::error::编译失败：TurboACC 编译错误（自动移除已尝试），请用 with_turboacc=false 重跑"
           elif grep -q "No space left on device" build.log; then
             echo "::error::编译失败：磁盘不足，重跑（缓存复用）或改用 larger runner"
           else
@@ -4173,8 +4395,29 @@ jobs:
             fi
           fi
 
-          MUST="luci-app-passwall xray-core mosdns dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat"
-          [ "$1" = "true" ] && MUST="$MUST luci-app-turboacc"
+          # ---- 内核必须编入整形所需符号，否则 cake/SQM 装上也无法加载 ----
+          # 现场教训（2026-11-22）：当前这套固件的内核没编 CONFIG_NET_CLS，把镜像里的
+          # sch_cake.ko 拿出来 insmod 会报 Unknown symbol tcf_block_get / tcf_classify；
+          # 连 cls_u32、sch_ingress 也加载不了，等于任何双向整形都做不了。
+          # 这几个符号由 kmod-sched-core 的 KCONFIG 带出来，所以要确认它们真的进了内核。
+          _KCFG=$(ls -1 ../../../../build_dir/target-*/linux-ramips_mt7621/linux-*/.config 2>/dev/null | head -n1)
+          if [ -n "$_KCFG" ]; then
+            _mk=""
+            for _s in CONFIG_NET_CLS CONFIG_NET_CLS_ACT CONFIG_NET_SCH_INGRESS CONFIG_NET_SCH_TBF CONFIG_NET_SCH_CAKE CONFIG_NET_ACT_MIRRED; do
+              grep -q "^${_s}=y" "$_KCFG" || _mk="$_mk $_s"
+            done
+            if [ -n "$_mk" ]; then
+              printf '::error::内核缺少整形符号：%s（cake/SQM 装上也用不了）\n' "$_mk"
+              LOST=$((LOST + 1))
+            else
+              printf '  ✅ 内核已编入 NET_CLS/CAKE/INGRESS/MIRRED（SQM 可直接用）\n'
+            fi
+          else
+            printf '::warning::未找到内核 .config，跳过整形能力校验\n'
+          fi
+
+          MUST="luci-app-passwall xray-core mosdns dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat \
+                kmod-sched-core kmod-sched-cake kmod-ifb tc-full sqm-scripts luci-app-sqm"
 
           echo "---- 软件包 ----"
           for p in $MUST; do
@@ -4507,7 +4750,7 @@ jobs:
             echo "| 固件内包数 | ${PKG_COUNT} |"
             echo "| 关键包/文件缺失 | 0 |"
             echo "| 自动补齐轮次 | ${round} |"
-            echo "| TurboACC | ${EFF_TURBO} |"
+            echo "| TurboACC | 已移除（BBR 走 kmod-tcp-bbr，全锥 NAT 走 kmod-nft-fullcone + fw4） |"
             echo ""
             echo "<details><summary>本次构建的组件版本</summary>"
             echo ""
@@ -4601,15 +4844,45 @@ jobs:
             - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
-            - 性能调优：BBR + `fq` + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
-              + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 1000 条
+            - 性能调优：BBR + `fq_codel`（本内核没编 sch_fq，写 `fq` 会让整份 sysctl 一行都不生效）+ `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
+              + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 2000 条（最小 TTL 600s）
             - **必要的本地自动化**（全部不联网）：每日释放页缓存、每 10 分钟的内存看门狗 `memguard`、
               MosDNS 存活检查、每周截断超期日志；`/var/log/memguard.log` 可查它做过什么
             - **不预置 geo 数据**：`geoip.dat` / `geosite.dat` 约 25MB，32MB 闪存装不下；
               只有使用「分流节点」时才需要，用到时在 PassWall → 规则列表里按需更新
 
             ### 无线
-            - 2.4G：`alon` @ 信道 1 · HT20 · 20 dBm · 5G：`alon-5G` @ ch149 VHT80 · WPA2 `alon12345678`（**请立即修改**）
+            - 2.4G：`alon` @ 信道 13 · HT20 · 20 dBm（只在没有自定义信道时生效）· 5G：`alon-5G`
+              中继形态跟随上行 `auto` + VHT40，纯 AP 形态 149 + VHT80 · WPA2（**口令不在固件里，刷完请自行设置**）
+
+            ### 开启 SQM（治 bufferbloat）
+            固件已内置 cake / tc / sqm-scripts，配置预置为**关闭**（整形上限必须按实测带宽定）。
+            刷完先测一次真实上下行，再按实测值开启：
+
+            ```sh
+            sqm-setup 92 40        # 参数 = 实测 下行/上行 Mbps，脚本自动按 88% 整形并启用
+            tc -s qdisc show dev phy1-sta0 | head -20    # 确认整形器挂上
+            ```
+
+            判据：满载下载时 `ping 223.5.5.5` 从 300+ ms 降到 30 ms 以内。
+            关闭：`uci set sqm.relay.enabled='0'; uci commit sqm; /etc/init.d/sqm restart`
+
+            ### ⚠️ 内核升到 6.12 后必测（openwrt#25305：MT7530 FDB 失步）
+            24.10（内核 6.6）无此问题，25.12（内核 6.12）有此报告。判据是 **ICMP 正常、TCP 断流**。
+
+            ```sh
+            # 1) 先在路由器上记一次基线
+            bridge fdb show br br-lan | head -20
+            iw dev phy1-sta0 link | grep -E 'SSID|signal|bitrate'
+
+            # 2) 客户端在 alon(2.4G) 与 alon-5G 之间来回切 3~5 次，每次切完立刻执行：
+            ping -c 5 223.5.5.5
+            curl -s -o /dev/null -w 'http=%{http_code} speed=%{speed_download}\n' https://mirrors.aliyun.com/ubuntu/ls-lR.gz
+
+            # 3) 判定：切换后出现「ping 通但 curl 卡住/极慢」= 命中 #25305
+            #    处置 A：workflow 的 REPO_BRANCH 与 feeds 三行改回 openwrt-24.10 重新构建
+            #    处置 B：临时规避——把客户都固定在一个频段（关掉 alon 或 alon-5G 之一）
+            ```
 
             ### 出问题怎么办
             一键体检：SSH 执行 **quick-check**（DNS / 去广告 / 代理 / 共享 / USB / 内存 / 无线，一页汇总 + 结尾给下一步）
@@ -4619,7 +4892,7 @@ jobs:
             | --- | --- |
             | 能 ping 通 IP、但网页打不开 | SSH 执行 **`dns-recover`** |
             | 某个 App / 网站突然不通 | SSH 执行 `dns-recover`，或到「PassWall → 规则列表」检查规则 |
-            | 广告还在（没被拦） | SSH 执行 **fw-selftest** 看「广告域名 N 条」；清单在 `/etc/mosdns/adblock.txt` |
+            | 广告还在（没被拦） | SSH 执行 **fw-selftest** 看「广告域名 N 条」；运行时清单在 `/tmp/mosdns/adblock.txt`，镜像内原版在 `/rom/etc/mosdns/adblock.txt` |
             | 改了广告清单不生效 | SSH 执行 **/etc/init.d/mosdns restart**（域名集合只在启动时读） |
             | 代理域名下的广告拦不到 | 正常现象：gfwlist 域名走隧道解析，不经过 MosDNS |
             | 科学上网时快时慢 | TurboACC 里把硬件分载 `hw_flow` 关掉再试 |
