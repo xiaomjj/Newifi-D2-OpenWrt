@@ -17,19 +17,6 @@ on:
         description: "丢弃 ccache / dl 缓存（改依赖后建议勾选）"
         type: boolean
         default: false
-      go_version:
-        description: "Go 工具链版本（auto = 跟随 feeds 默认；24.10 的 golang 是单包、无 GO_DEFAULT_VERSION，此项会被忽略并告警）"
-        type: choice
-        options:
-          - auto
-          - "1.26"
-          - "1.27"
-        default: auto
-      with_new_pkgs:
-        description: "定点把 sqm-scripts 升到 openwrt-25.12 版本（纯用户态，不动内核与库）"
-        type: boolean
-        default: true
-
   # ---- 只保留手动触发：已按要求关闭每周六定时构建 ----
   # 想出新固件：Actions → 本工作流 → Run workflow（改过依赖就勾 clean_build）。
   # 刷进路由器之后，固件不会联网自动下载/自动升级任何东西（规则与广告清单都在构建期写入镜像）。
@@ -131,34 +118,13 @@ jobs:
           # 关键：必须是 -a。原脚本的 "-d default" 什么都没装
           ./scripts/feeds install -a
 
-          # ---------- 定点升级：只把 sqm-scripts 换成 openwrt-25.12 的版本 ----------
-          # 版本对照（2026-11-22 实测）：sqm-scripts 24.10 = 1.6.0 → 25.12 = 1.7.2
-          # 为什么只换它：纯 shell + 无库依赖，换掉不会把用户态拖进新分支。
-          # PassWall / xray-core 已从固件移除（代理由自研面板 + sing-box 承担），
-          # 因此这里既不定点升级它们，也不再需要跨分支搬 Go 工具链。
-          NEW_PKGS="${{ inputs.with_new_pkgs }}"
-          [ -z "$NEW_PKGS" ] && NEW_PKGS="true"
-          if [ "$NEW_PKGS" = "true" ]; then
-            git clone --depth=1 -b openwrt-25.12 https://github.com/immortalwrt/packages.git /tmp/f25p >/dev/null 2>&1 || true
-            git clone --depth=1 -b openwrt-25.12 https://github.com/immortalwrt/luci.git /tmp/f25l >/dev/null 2>&1 || true
-            _ov() {
-              _name="$1"; _dst_root="$2"; _src_root="$3"
-              _dst=$(find "$_dst_root" -maxdepth 3 -type d -name "$_name" 2>/dev/null | head -1)
-              _src=$(find "$_src_root" -maxdepth 3 -type d -name "$_name" 2>/dev/null | head -1)
-              if [ -n "$_dst" ] && [ -n "$_src" ]; then
-                _old=$(sed -n 's/^PKG_VERSION:=//p' "$_dst/Makefile" 2>/dev/null | head -1)
-                rm -rf "$_dst" && cp -r "$_src" "$_dst"
-                _new=$(sed -n 's/^PKG_VERSION:=//p' "$_dst/Makefile" 2>/dev/null | head -1)
-                echo "  ↑ 定点升级 $_name: ${_old:-?} → ${_new:-?}"
-              else
-                echo "::warning::$_name 定点升级失败，保持 24.10 原版（dst=$_dst src=$_src）"
-              fi
-            }
-            _ov sqm-scripts feeds/packages /tmp/f25p
-            rm -rf /tmp/f25p
-          else
-            echo "  ⏭  已按输入跳过定点升级（sqm-scripts 用 24.10 版本）"
-          fi
+          # ---------- 不再跨分支搬包 ----------
+          # 以前会把 openwrt-25.12 的 sqm-scripts（1.7.2）整目录覆盖到 24.10 的 1.6.0 上。
+          # 2026-11-23 核对两个分支的 Makefile：唯一差异是 25.12 版多一个 `+ip` 依赖（我们的
+          # ip-full 已满足），其余（PKGARCH:=all、纯 shell、不碰内核与库）完全一致；1.7.x 相对
+          # 1.6.0 只有 linklayer 自动检测 / IFB 清理这类边界改进，cake 核心能力 1.6.0 全有。
+          # 跨分支搬包会让"同版本号、不同内容"，回滚对比不可复现，且 25.12 未来一旦改依赖或
+          # 改目录就变成隐式构建失败点 —— 因此取消，全部用 24.10 自带 feeds。
 
           # 规避 Kconfig 递归依赖（weechat 三件套互相 select，defconfig 会报
           # recursive dependency detected）。这两个包我们永远不用，直接摘掉。
@@ -256,10 +222,22 @@ jobs:
           mkdir -p files/etc/uci-defaults \
                    files/etc/hotplug.d/net files/etc/hotplug.d/usb files/etc/hotplug.d/block files/etc/hotplug.d/iface \
                    files/etc/config files/etc/crontabs files/etc/sysctl.conf.d \
-                   files/etc/mosdns files/etc/init.d \
+                   files/etc/mosdns files/etc/init.d files/etc/singbox files/etc/singbox-lite \
                    files/usr/bin files/usr/libexec \
                    files/usr/share/luci/menu.d files/usr/share/rpcd/acl.d \
-                   files/www/luci-static/resources/view/mosdns
+                   files/www/luci-static/resources/view/mosdns \
+                   files/www/luci-static/resources/view/singbox
+          # 兜底：从本次运行的脚本正文里抓出所有 `cat > files/...` 的目标目录再建一遍。
+          # 历史教训：漏过 files/etc/hotplug.d/usb（2026-11-14）与
+          # files/www/luci-static/resources/view/singbox（2026-11-23），
+          # 两次都是重定向失败把整个构建挂在这一步。上面的显式清单保留可读性，这几行保证不再漏。
+          if [ -f "$0" ]; then
+              grep -oE 'cat > files/[^ ]+' "$0" 2>/dev/null |
+                  sed -e 's|^cat > ||' -e 's|/[^/]*$||' | sort -u |
+                  while read -r _d; do
+                      [ -n "$_d" ] && [ "$_d" != "files" ] && mkdir -p "$_d"
+                  done
+          fi
 
           # ---------- A. 系统 / LuCI 默认语言 / 主机名 / NTP ----------
           # ⚠️ 铁律：首次启动脚本【只改已存在的配置段】，绝不新建
@@ -5413,21 +5391,10 @@ jobs:
         run: |
           cd immortalwrt
 
-          # ---------- Go 工具链版本 ----------
-          # feeds 的 GO_DEFAULT_VERSION 决定 Go 组件用哪个 Go 编译。
-          # MosDNS 是唯一需要 Go 工具链的运行时组件（代理内核 sing-box 用预编译二进制）。
-          # 若日志出现 "go.mod requires go >= 1.XX"，把 go_version 输入改成 1.XX 重跑
-          # （25.12 的 golang 带 GO_DEFAULT_VERSION，这项输入会真正生效）。
-          GO_VER="${{ inputs.go_version }}"
-          if [ -n "$GO_VER" ] && [ "$GO_VER" != "auto" ]; then
-            if grep -q '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk; then
-              sed -i "s/^GO_DEFAULT_VERSION:=.*/GO_DEFAULT_VERSION:=$GO_VER/" \
-                feeds/packages/lang/golang/golang-values.mk
-              echo "🔧 已强制 Go 版本为 $GO_VER"
-            else
-              echo "::warning::本分支 golang 没有 GO_DEFAULT_VERSION，忽略 go_version=$GO_VER（用 feeds 默认）"
-            fi
-          fi
+          # ---------- Go 工具链 ----------
+          # MosDNS 是唯一需要 Go 工具链的运行时组件（sing-box 内核走构建期交叉编译，不用 feeds 的 Go）。
+          # 24.10 的 feeds 里 golang 是「单包 + 固定版本」，没有 GO_DEFAULT_VERSION 可调 ——
+          # 所以原来那个 go_version 输入在本分支纯属空转（只会打一条 warning），已删除。
           echo "---- 当前 Go 工具链 ----"
           grep -n '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk \
             || echo "  （本分支无 GO_DEFAULT_VERSION，使用 golang 包自带版本）"
@@ -5583,7 +5550,7 @@ jobs:
             echo "排查建议："
             echo "  1) 缺哪个包，就把对应源码加进第 4 步（或改成 feeds 里已有的等价包）"
             echo "  2) 看本步骤上方 make defconfig 的告警，通常会点出缺失的依赖"
-            echo "  3) 若是编译期报 'go.mod requires go >= 1.XX'，把 go_version 输入改成 1.XX 重跑"
+            echo "  3) 若是编译期报 'go.mod requires go >= 1.XX'，改 feeds/packages/lang/golang 的版本后重跑"
             exit 1
           fi
           echo "🎉 全部组件校验通过"
