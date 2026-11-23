@@ -5356,6 +5356,11 @@ jobs:
           # ---- 生成物语法自检：构建机是 dash，bashism 会在这里被抓出来 ----
           for f in files/usr/bin/* files/etc/uci-defaults/* files/etc/hotplug.d/*/* files/etc/init.d/* files/etc/rc.local; do
             [ -f "$f" ] || continue
+            # ⚠️ 必须跳过二进制内核：files/usr/bin/sing-box 是 40+MB 的 ELF，sh -n 会把它当脚本
+            #    解析，报 'Syntax error: "(" unexpected' 直接把构建挂在这一步（2026-11-23 实际踩到）。
+            #    再按体积兜一层：我们写的 shell 脚本不可能超过 200KB。
+            case "$f" in */sing-box) continue ;; esac
+            if [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -gt 200000 ]; then continue; fi
             sh -n "$f" || { echo "::error::脚本语法错误：$f"; exit 1; }
           done
           chmod +x files/usr/libexec/mosdns-ctl files/usr/libexec/singbox-ctl
