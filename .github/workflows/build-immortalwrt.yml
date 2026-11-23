@@ -1,13 +1,14 @@
 # ============================================================
-#  ImmortalWrt 25.12 (openwrt-25.12 / 内核 6.12) — newifi-d2 构建（仅手动触发）
+#  ImmortalWrt 24.10 (openwrt-24.10 / 内核 6.6) — newifi-d2 构建（仅手动触发）
 #  设计原则：
 #   1. 依赖一律走官方 feeds，不再手工克隆任何代理面板（避免同名包重复定义）
-#   2. 不克隆任何第三方源码（TurboACC 已移除；代理 = PassWall + Xray，DNS = MosDNS 去广告/DoH）
+#   2. 不克隆任何第三方源码（代理内核 = 构建期下载的 sing-box，DNS = MosDNS 去广告/DoH；
+#      PassWall + xray-core 已于 2026-11-22 整体移除，feeds 不再拉取，第 7 步有反向硬拦）
 #   3. defconfig 之后做"硬校验"，缺包直接失败，拒绝产出残缺固件
-#   4. 代理面就是 PassWall 自己的 LuCI 页面（服务 → PassWall），不再自研前端
+#   4. 代理面是自研 LuCI 面板（服务 → sing-box），后端 /usr/libexec/singbox-ctl（沿用旧包名，零迁移成本）
 #   5. 全流程日志落盘 build.log，失败必留日志
 # ============================================================
-name: Build ImmortalWrt 25.12 for Newifi-D2
+name: Build ImmortalWrt 24.10 for Newifi-D2
 
 on:
   workflow_dispatch:
@@ -17,13 +18,17 @@ on:
         type: boolean
         default: false
       go_version:
-        description: "Go 工具链版本（auto = 跟随 feeds 默认 1.26；25.12 有 GO_DEFAULT_VERSION，可填 1.27 等强制指定）"
+        description: "Go 工具链版本（auto = 跟随 feeds 默认；24.10 的 golang 是单包、无 GO_DEFAULT_VERSION，此项会被忽略并告警）"
         type: choice
         options:
           - auto
           - "1.26"
           - "1.27"
         default: auto
+      with_new_pkgs:
+        description: "定点把 sqm-scripts 升到 openwrt-25.12 版本（纯用户态，不动内核与库）"
+        type: boolean
+        default: true
 
   # ---- 只保留手动触发：已按要求关闭每周六定时构建 ----
   # 想出新固件：Actions → 本工作流 → Run workflow（改过依赖就勾 clean_build）。
@@ -38,15 +43,16 @@ concurrency:
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  # ============ 分支说明（2026-11-22 变更：内核升级实验）============
-  # 本轮按用户要求从 openwrt-24.10（内核 6.6）切到 openwrt-25.12（内核 6.12）。
-  # 动机：24.10 的内核没编 CONFIG_NET_CLS，导致 cake / sch_ingress 这类模块虽然能装、
-  #       却因缺 tcf_block_get 等符号而**加载不了**，双向整形（SQM/cake）无法使用。
-  # 已知风险（openwrt#25305，状态 open，2026-09-21 创建）：
-  #   ramips/mt7621 的 MT7530 在 25.12 上会出现 FDB 失步 —— Wi-Fi 漫游后 DNS/ping 正常
-  #   但 TCP 断流；报告称 24.10.8 正常。刷机后按构建摘要里的「内核 6.12 必测项」自测。
-  # 回滚：把 REPO_BRANCH 改回 openwrt-24.10、feeds 那三行改回 ;openwrt-24.10，重新构建即可。
-  REPO_BRANCH: openwrt-25.12
+  # ============ 分支说明（2026-11-22 第二次变更：回到 24.10）============
+  # 经历：先按要求升到 25.12（内核 6.12）验证 cake/SQM。结论：
+  #   · cake 确实可用（sch_cake/ifb 能加载）——但**不需要**靠升内核拿到；
+  #   · mt7603 的 2.4G AP 在 6.12 上**不发信标**：hostapd 报 AP-ENABLED、tx_packets 却近乎 0，
+  #     客户端完全扫不到，只有整机重初始化后才偶尔恢复。与上游 mt76 的 stuck-beacon 类问题
+  #     （openwrt/mt76 #809 / #874 / #1188）吻合，配置层面无法规避。
+  # 因此回退 openwrt-24.10（内核 6.6，2.4G 长期验证正常）。
+  # 关键：cake 不依赖内核版本 —— kmod-sched-core 的 KCONFIG 会带出 CONFIG_NET_CLS=y，
+  #       只要 .config 里保留 SQM 那套包，24.10 的内核同样能编入 NET_CLS，SQM 照样可用。
+  REPO_BRANCH: openwrt-24.10
   CONFIG_FILE: newifi-d2.config
   TZ: Asia/Shanghai
   # d-team_newifi-d2 的 firmware 分区 = 0x1FB0000 = 33226752 字节
@@ -101,7 +107,7 @@ jobs:
           df -h / /workdir
 
       # ---------------------------------------------------------------
-      - name: 3. 克隆 ImmortalWrt 25.12
+      - name: 3. 克隆 ImmortalWrt 24.10
         working-directory: /workdir
         run: |
           git clone --depth=1 -b "$REPO_BRANCH" "$REPO_URL" immortalwrt
@@ -110,20 +116,49 @@ jobs:
           git log -1 --format='分支 %D | %h %s'
 
       # ---------------------------------------------------------------
-      - name: 4. 安装官方 feeds（PassWall / MosDNS / xray 全部来自 feeds）
+      - name: 4. 安装官方 feeds（MosDNS / dnsmasq / SQM 来自 feeds，代理内核不再来自 feeds）
         run: |
           cd immortalwrt
 
-          # --- 官方 feeds（luci-app-passwall / xray-core / MosDNS / dnsmasq 全部由 feeds 提供）---
+          # --- 官方 feeds（MosDNS / dnsmasq / SQM 全部由 feeds 提供）---
           cat > feeds.conf.default << 'EOF'
-          src-git packages https://github.com/immortalwrt/packages.git;openwrt-25.12
-          src-git luci https://github.com/immortalwrt/luci.git;openwrt-25.12
-          src-git routing https://github.com/openwrt/routing.git;openwrt-25.12
+          src-git packages https://github.com/immortalwrt/packages.git;openwrt-24.10
+          src-git luci https://github.com/immortalwrt/luci.git;openwrt-24.10
+          src-git routing https://github.com/openwrt/routing.git;openwrt-24.10
           EOF
 
           ./scripts/feeds update -a
           # 关键：必须是 -a。原脚本的 "-d default" 什么都没装
           ./scripts/feeds install -a
+
+          # ---------- 定点升级：只把 sqm-scripts 换成 openwrt-25.12 的版本 ----------
+          # 版本对照（2026-11-22 实测）：sqm-scripts 24.10 = 1.6.0 → 25.12 = 1.7.2
+          # 为什么只换它：纯 shell + 无库依赖，换掉不会把用户态拖进新分支。
+          # PassWall / xray-core 已从固件移除（代理由自研面板 + sing-box 承担），
+          # 因此这里既不定点升级它们，也不再需要跨分支搬 Go 工具链。
+          NEW_PKGS="${{ inputs.with_new_pkgs }}"
+          [ -z "$NEW_PKGS" ] && NEW_PKGS="true"
+          if [ "$NEW_PKGS" = "true" ]; then
+            git clone --depth=1 -b openwrt-25.12 https://github.com/immortalwrt/packages.git /tmp/f25p >/dev/null 2>&1 || true
+            git clone --depth=1 -b openwrt-25.12 https://github.com/immortalwrt/luci.git /tmp/f25l >/dev/null 2>&1 || true
+            _ov() {
+              _name="$1"; _dst_root="$2"; _src_root="$3"
+              _dst=$(find "$_dst_root" -maxdepth 3 -type d -name "$_name" 2>/dev/null | head -1)
+              _src=$(find "$_src_root" -maxdepth 3 -type d -name "$_name" 2>/dev/null | head -1)
+              if [ -n "$_dst" ] && [ -n "$_src" ]; then
+                _old=$(sed -n 's/^PKG_VERSION:=//p' "$_dst/Makefile" 2>/dev/null | head -1)
+                rm -rf "$_dst" && cp -r "$_src" "$_dst"
+                _new=$(sed -n 's/^PKG_VERSION:=//p' "$_dst/Makefile" 2>/dev/null | head -1)
+                echo "  ↑ 定点升级 $_name: ${_old:-?} → ${_new:-?}"
+              else
+                echo "::warning::$_name 定点升级失败，保持 24.10 原版（dst=$_dst src=$_src）"
+              fi
+            }
+            _ov sqm-scripts feeds/packages /tmp/f25p
+            rm -rf /tmp/f25p
+          else
+            echo "  ⏭  已按输入跳过定点升级（sqm-scripts 用 24.10 版本）"
+          fi
 
           # 规避 Kconfig 递归依赖（weechat 三件套互相 select，defconfig 会报
           # recursive dependency detected）。这两个包我们永远不用，直接摘掉。
@@ -143,14 +178,12 @@ jobs:
             fi
           done
 
-          # --- 代理栈依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
-          echo "---- PassWall / Xray 依赖预检 ----"
+          # --- 运行时依赖预检（1 分钟内就能知道缺不缺，不用等编译）---
+          echo "---- MosDNS / nft / sing-box 依赖预检 ----"
           DEP_MISS=0
-          # luci-app-passwall 25.12 的 LUCI_DEPENDS：curl + chinadns-ng + dns2socks + ip-full +
-          # lua + luci-compat + luci-lib-jsonc + microsocks + resolveip + tcping + coreutils*
-          for p in luci-app-passwall xray-core chinadns-ng dns2socks microsocks \
-                   luci-compat luci-lib-jsonc mosdns \
-                   nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat; do
+          # sing-box 的 tproxy/redirect 依赖 nftables 的 tproxy/socket 内核模块
+          for p in mosdns nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat \
+                   kmod-tun kmod-inet-diag kmod-sched-cake; do
             if [ -d "package/feeds/packages/$p" ] || [ -d "package/feeds/luci/$p" ] \
                || [ -d "package/$p" ] || [ -d "package/feeds/base/$p" ]; then
               printf '  ✅ %s\n' "$p"
@@ -179,22 +212,13 @@ jobs:
           # 分别由 kmod-tcp-bbr 和 kmod-nft-fullcone + fw4 直接提供，不再克隆第三方源码，
           # 因此这里也没有"源码缺失 → 自动降级"的分支了。
 
-          # --- 代理核心版本确认（都由 feeds 提供，不做替换、不克隆第三方源）---
-          # 选型理由：luci-app-passwall 26.10.29 + xray-core 26.10.21 是 25.12 官方源里成对发布
-          # 的组合，直接用 feeds 版本即可。不要换成上游 main 分支的即时版本：那边要求更高的
-          # golang（>= 1.27），feeds 里没有，会直接编不出来。
-          PV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile 2>/dev/null)
-          XV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/xray-core/Makefile 2>/dev/null)
-          if [ -z "$PV" ]; then
-            echo "::error::feeds 里找不到 luci-app-passwall 源码，构建中止"
+          # --- 核心组件确认（代理内核 sing-box 由构建期下载，不在 feeds 里）---
+          DV=$(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/mosdns/Makefile 2>/dev/null)
+          if [ -z "$DV" ]; then
+            echo "::error::feeds 里找不到 mosdns 源码，构建中止"
             exit 1
           fi
-          if [ -z "$XV" ]; then
-            echo "::error::feeds 里找不到 xray-core 源码，构建中止"
-            exit 1
-          fi
-          echo "  · luci-app-passwall : $PV"
-          echo "  · xray-core         : $XV（geoip/geosite 不装，普通节点不需要）"
+          echo "  · mosdns           : $DV（DNS 分流 + 去广告）"
 
           # --- 同名包去重：一律以本地源码为准 ---
           rm -rf package/feeds/luci/luci-app-turboacc
@@ -206,10 +230,9 @@ jobs:
           rm -rf package/feeds/luci/luci-app-mosdns \
                  package/feeds/packages/geo2txt
 
-          # --- 源码完整性硬校验（MosDNS / PassWall / Xray 绝不放过）---
+          # --- 源码完整性硬校验（MosDNS / SQM 绝不放过）---
           MISSING_SRC=0
-          for m in package/feeds/packages/mosdns package/feeds/luci/luci-app-passwall \
-                   package/feeds/packages/xray-core; do
+          for m in package/feeds/packages/mosdns package/feeds/packages/sqm-scripts; do
             if [ -f "$m/Makefile" ]; then
               echo "  ✅ $m"
             else
@@ -236,7 +259,6 @@ jobs:
                    files/etc/mosdns files/etc/init.d \
                    files/usr/bin files/usr/libexec \
                    files/usr/share/luci/menu.d files/usr/share/rpcd/acl.d \
-                   files/usr/share/passwall/rules \
                    files/www/luci-static/resources/view/mosdns
 
           # ---------- A. 系统 / LuCI 默认语言 / 主机名 / NTP ----------
@@ -305,7 +327,7 @@ jobs:
           # 换环境、换上游之后你手改的值不会被下次刷机覆盖。
           _ch24=$(uci -q get wireless.radio0.channel)
           case "$_ch24" in
-              ''|auto|1) uci set wireless.radio0.channel='13' ;;
+              ''|auto) uci set wireless.radio0.channel='13' ;;
               *) echo "保留已有 2.4G 信道：$_ch24" ;;
           esac
           uci set wireless.radio0.htmode='HT20'
@@ -336,6 +358,9 @@ jobs:
           #   · 中继形态带宽钉 VHT40（不是 VHT80）。同一条上行、同一客户端（-74 dBm、各 3 次）：
           #     AP@40MHz：单流中位 7.4 MB/s、三流合计 8.4 MB/s、ping 0~1 ms
           #     AP@80MHz：单流中位 4.9 MB/s、三流合计 4.2 MB/s、ping 均值 5 ms / 峰值 44 ms
+          # radio1 不存在（单频机型/段名被改）时就别硬写：否则会凭空造出一个只有
+          # disabled/country/noscan 的残缺 wifi-device 段，wifi reload 直接报错
+          uci -q get wireless.radio1 >/dev/null 2>&1 || { uci -q commit wireless; exit 0; }
           uci set wireless.radio1.disabled='0'
           uci set wireless.radio1.country='CN'
           uci set wireless.radio1.noscan='1'
@@ -381,75 +406,18 @@ jobs:
           exit 0
           EOF
 
-          # ---------- C. PassWall 默认参数（DNS = MosDNS，代理 = PassWall + Xray TProxy）----------
+          # ---------- C. 代理侧出厂参数（DNS = MosDNS；代理 = sing-box TPROXY）----------
           cat > files/etc/uci-defaults/92-services << "EOF"
           #!/bin/sh
           # ---- DNS 架构（两段，各管一件事，别再混）----
           #   客户端 :53 → 系统 dnsmasq → 127.0.0.1#5335 MosDNS
           #   路由器自身 :53 → 系统 dnsmasq → 127.0.0.1#5335 MosDNS
-          #   MosDNS(5335)：命中广告集合 → 0.0.0.0 / ::；未命中 → DoH 上游（阿里/腾讯）+ 进程内缓存
-          # ---- 为什么 dns_redirect 必须是 0 ----
-          #   dns_redirect=1 时 PassWall 会在 11400 起一份副本 dnsmasq，并把客户端 53 端口
-          #   劫持过去 —— 那条路完全绕开 MosDNS，去广告立刻失效。设 0 后它只用系统 dnsmasq
-          #   的 conf-dir 追加自己那几条按域名分流的 server= 规则，不改我们的上游。
-          # ---- 代理模式：绕过大陆 ----
-          #   tcp_proxy_mode=proxy + chn_list=direct + use_gfw_list=1：命中 chnroute 的 IP 在
-          #   nftset @passwall_chn 上直接 return（直连），其余走 Xray。
-          #   udp_proxy_mode=disable：UDP 不代理；配合 global_forwarding 默认的
-          #   udp_proxy_drop_ports='443' 禁掉 QUIC，浏览器自动回落 TCP，少一层 NAT 和回环。
-          # ---- 规则文件：随包自带，不需要 geoip.dat ----
-          #   /usr/share/passwall/rules/{chnroute,chnlist,gfwlist,...} 约 1.5MB，安装即生效。
-          #   global_rules 里那四个 *_update 全关：开着会在启动时联网拉规则，
-          #   而本固件不出网自更新（规则随固件发布）。
-          # ---- 配置骨架：包里的 0_default_config 是首启模板，先落一份 ----
-          if [ ! -f /etc/config/passwall ] && [ -f /usr/share/passwall/0_default_config ]; then
-            cp -f /usr/share/passwall/0_default_config /etc/config/passwall
-          fi
-          if uci -q get passwall.@global[0] >/dev/null 2>&1; then
-            uci set passwall.@global[0].enabled='1'
-            uci set passwall.@global[0].tcp_proxy_mode='proxy'
-            uci set passwall.@global[0].udp_proxy_mode='disable'
-            uci set passwall.@global[0].chn_list='direct'
-            uci set passwall.@global[0].use_gfw_list='1'
-            uci set passwall.@global[0].dns_shunt='chinadns-ng'
-            # DNS：chinadns-ng 负责分流，可信 DNS 交给 Xray 内置 DNS 走 DoH。
-            # 为什么不是 dns_mode='doh'：这个 PassWall 版本的 app.sh 里 DNS_MODE 只有
-            # dns2socks / sing-box / xray / udp / tcp 五个分支，**没有 doh**（写了会被忽略）。
-            # 走 xray 分支 + v2ray_dns_mode='tcp+doh' 才是真正的 DoH：查询由 Xray 发起，
-            # 经节点 socks 出去（dns_socks_address/port），对 ISP 既不可见也拿不到明文。
-            # 实测：www.google.com 解析到 142.251.15x.x（未被污染），首次 1.3s、缓存 5ms。
-            uci set passwall.@global[0].dns_mode='xray'
-            uci set passwall.@global[0].v2ray_dns_mode='tcp+doh'
-            uci set passwall.@global[0].remote_dns_doh='https://1.1.1.1/dns-query'
-            uci set passwall.@global[0].remote_dns='1.1.1.1'
-            uci set passwall.@global[0].dns_redirect='0'
-            uci set passwall.@global[0].use_block_list='0'
-            uci set passwall.@global[0].localhost_proxy='1'
-            uci set passwall.@global[0].client_proxy='1'
-            # tcp_proxy_way 与 use_nft 属于 global_forwarding 段（app.sh:2207/2075 从这里读），
-            # 写到 global[0] 上等于没写：不存在的选项不报错也不生效，查都查不出来。
-            uci -q set passwall.@global_forwarding[0].tcp_proxy_way='redirect'
-            # use_nft=1 直接走 nftables；=0 时它先试 iptables+ipset（本固件没有 ipset），
-            # 每次启动都会先打一行「无法使用iptables+ipset」再自动切 nftables。
-            uci -q set passwall.@global_forwarding[0].use_nft='1'
-            for _r in chnlist_update chnroute_update chnroute6_update gfwlist_update; do
-              uci -q set "passwall.@global_rules[0].$_r=0"
-            done
-            uci -q set passwall.@global_rules[0].geoip_update='0'
-            uci -q set passwall.@global_rules[0].geosite_update='0'
-            uci commit passwall
-          fi
-          # 防火墙 include：PassWall 的 nft 规则由 /var/etc/passwall.include 注入 fw4。
-          # uci-defaults 原脚本会补，但补之前若已经 restart 过防火墙就会丢规则，这里提前写好。
-          # 注意不要写 reload='1'：那是 fw3 的选项，fw4 明确标成 UNSUPPORTED
-          # （fw4.uc parse_include 里 reload: [ "bool", null, UNSUPPORTED ]），
-          # 写了每次 firewall restart 都会打一行 "option 'reload' is not supported by fw4"。
-          if ! uci -q get firewall.passwall >/dev/null 2>&1; then uci set firewall.passwall='include'; fi
-          uci set firewall.passwall.type='script'
-          uci set firewall.passwall.path='/var/etc/passwall.include'
-          uci -q delete firewall.passwall.reload
-          uci commit firewall
-          # dnsmasq 允许外部 include：PassWall 靠它追加按域名分流的 server= 规则
+          #   MosDNS(5335)：命中广告集合 → 0.0.0.0 / ::；未命中 → DoH 上游（腾讯，不用阿里，实测阿里投毒）+ 缓存
+          # ---- 代理侧不再有自己的 DNS ----
+          # PassWall / xray-core 已于 2026-11-22 整体移除：透明代理由自研面板 + sing-box 承担。
+          # 它不再往 dnsmasq 的 conf-dir 塞 server= 规则、也不再生成 fw4 include，
+          # 全机只有一条解析路径（dnsmasq → MosDNS 5335），排查时不会有第二套分流来搅局。
+          # dnsmasq 只做本地缓存与下发，上游加密与分流交给 MosDNS
           if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
             uci -q set dhcp.@dnsmasq[0].localuse='1'
             uci -q commit dhcp
@@ -464,12 +432,17 @@ jobs:
           if uci -q get uhttpd.main >/dev/null 2>&1; then
               _lanip=$(uci -q get network.lan.ipaddr)
               [ -n "$_lanip" ] || _lanip="192.168.2.1"
+              # 25.12 起 config_generate 把 LAN 写成 CIDR（ipaddr='192.168.2.1/24'、netmask 留空）；
+              # 24.10 是裸 IP。uhttpd 只认裸 IP，这里统一去掉 /掩码 前缀，两个分支都安全。
+              # uhttpd 只认裸 IP：拼出 "192.168.2.1/24:80" 会导致**一个端口都不监听，而且不报错**。
+              # 2026-11-22 首刷就踩到：LAN 通、SSH 通、DHCP 正常，唯独 80 是关的，后台打不开。
+              _lanip=${_lanip%%/*}
               uci -q delete uhttpd.main.listen_http
               uci -q delete uhttpd.main.listen_https
               uci add_list uhttpd.main.listen_http="${_lanip}:80"
               uci commit uhttpd
+              echo "uhttpd 监听地址固定为 ${_lanip}:80"
           fi
-
           # ---- 流量分载 / 全锥 NAT ----
           # 结论（2026-11-22 实测定案）：**中继拓扑下不开 flow offload**。
           #   · /usr/bin/relay-tune 每次开机都会把 firewall 的 flow_offloading 归零，理由写在它
@@ -486,7 +459,7 @@ jobs:
 
           # ---- 系统 dnsmasq：上游固定指向 MosDNS ----
           #   只留一条 server=：全机唯一的解析路径就是 dnsmasq → MosDNS#5335，
-          #   客户端查询与路由器自身查询都走它。PassWall 不抢 53（dns_redirect=0，只做 TPROXY）。
+          #   客户端查询与路由器自身查询都走它；代理侧不抢 53（透明代理只用 TPROXY 转发）。
           if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
               uci -q delete dhcp.@dnsmasq[0].server
               uci -q add_list dhcp.@dnsmasq[0].server="127.0.0.1#5335"
@@ -504,17 +477,16 @@ jobs:
           if [ -x /usr/libexec/mosdns-ctl ]; then
               /usr/libexec/mosdns-ctl render >/dev/null 2>&1 || true
           fi
-          
-          for s in ksmbd p910nd zram cron mosdns passwall; do
+
+          for s in ksmbd p910nd zram cron mosdns singbox-lite; do
               [ -x "/etc/init.d/$s" ] && /etc/init.d/$s enable
           done
 
           # ---- 关掉这台机器用不上的服务（软件包默认 enable，但从不运行）----
           #   radius          —— 802.1X 认证服务器（家里没有这种需求）
-          #   microsocks      —— 独立 socks5 服务端（代理用 PassWall 就够，不需要再开一个口）
-          #   passwall_server —— PassWall 的服务端模式（本机是客户端 + 中继，不做落地）
+          #   microsocks      —— 独立 socks5 服务端（代理面板自带 socks 口，不需要再开一个）
           # 关掉它们不会影响任何现有功能，但能省下每次开机的初始化与潜在的监听端口。
-          for s in radius microsocks passwall_server; do
+          for s in radius microsocks; do
               if [ -x "/etc/init.d/$s" ]; then
                   /etc/init.d/$s stop >/dev/null 2>&1
                   /etc/init.d/$s disable >/dev/null 2>&1
@@ -525,17 +497,56 @@ jobs:
 
           # ---------- C2. DNS 应急回滚：一条命令把 DNS 拉回可用状态 ----------
           # 网页打不开但能 ping 通 IP 时，SSH 执行 dns-recover
+          cat > files/etc/uci-defaults/93-singbox-migrate << 'MIG_EOF'
+          #!/bin/sh
+          # 旧命名 → 新命名的迁移（2026-11-23 把 xray-lite 全套改成 singbox-lite）。
+          # 刷机保留配置时，旧文件还在 overlay 上：这里搬一次，之后自删。
+          # 只在"新配置里还没有任何节点"时才搬，避免把用户在新面板里新改的配置盖掉。
+          _old=/etc/config/xray-lite
+          _new=/etc/config/singbox-lite
+          if [ -f "$_old" ]; then
+              if ! uci -q show singbox-lite 2>/dev/null | grep -q '=node$'; then
+                  cp -f "$_old" "$_new"
+                  # section 类型同步改名，否则 uci 里会出现没人认的 config xray
+                  sed -i 's/^config xray /config singbox /' "$_new" 2>/dev/null
+                  uci -q commit singbox-lite 2>/dev/null
+                  logger -t singbox-lite "已把旧 xray-lite 配置迁移到 singbox-lite"
+              fi
+              rm -f "$_old"
+          fi
+          # 分流名单/版本文件也搬一次
+          mkdir -p /etc/singbox
+          for _f in chnroute.txt proxy-domains.txt direct-domains.txt; do
+              if [ ! -s "/etc/singbox/$_f" ] && [ -s "/etc/xray/$_f" ]; then
+                  cp -f "/etc/xray/$_f" "/etc/singbox/$_f"
+              fi
+          done
+          [ -d /etc/singbox-lite ] || mkdir -p /etc/singbox-lite
+          if [ ! -s /etc/singbox-lite/version ] && [ -s /etc/xray-lite/version ]; then
+              cp -f /etc/xray-lite/version /etc/singbox-lite/version
+          fi
+          rm -rf /etc/xray /etc/xray-lite 2>/dev/null
+          # 老测试镜像（25.12）里还带了一个叫 xray 的服务：它会抢 12345 / 1080 端口，
+          # 一旦起来本固件的 sing-box 就 bind 不上。这里顺手停掉并禁用（新镜像里没有这个服务）。
+          if [ -x /etc/init.d/xray ]; then
+              /etc/init.d/xray stop >/dev/null 2>&1
+              /etc/init.d/xray disable >/dev/null 2>&1
+              logger -t singbox-lite "已停用旧的 xray 服务（避免抢端口）"
+          fi
+          exit 0
+          MIG_EOF
+
           cat > files/usr/bin/dns-recover << "EOF"
           #!/bin/sh
           # 应急回滚：三步，任何一步失败都继续往下退，绝不断网
-          #   1) 停 PassWall：撤掉 TPROXY 规则并断开本地代理端口
+          #   1) 停代理：撤掉 TPROXY 规则并断开本地代理端口
           #   2) 确认 MosDNS 在跑（它挂了 dnsmasq 就没有上游可用）
           #   3) dnsmasq 上游指回 MosDNS，并摘掉 PassWall 塞进去的 addnmount；
           #      MosDNS 也起不来就退回 WAN 明文上游
 
-          echo "== 1/3 停用 PassWall（撤掉 TPROXY 规则）=="
-          /etc/init.d/passwall stop 2>/dev/null || true
-          # 兜底：残留的 nft 链靠重启一次防火墙清干净
+          echo "== 1/3 停用代理（撤掉 TPROXY / redirect 规则）=="
+          /etc/init.d/singbox-lite stop 2>/dev/null || true
+          [ -x /usr/libexec/singbox-ctl ] && /usr/libexec/singbox-ctl nft-down >/dev/null 2>&1
           /etc/init.d/firewall restart 2>/dev/null
 
           echo "== 2/3 确认 MosDNS =="
@@ -544,7 +555,13 @@ jobs:
           else
               echo "   MosDNS 未运行，尝试启动"
               /etc/init.d/mosdns restart 2>/dev/null
-              sleep 3
+              # mosdns 冷启动要 5 秒以上（4.5MB 广告清单要解析），原来固定 sleep 3 会误判"起不来"，
+              # 于是把 dnsmasq 退回明文上游 —— 去广告与 DoH 就永久失效了。这里轮询最多 15 秒。
+              _w=0
+              while [ "$_w" -lt 15 ]; do
+                  pidof mosdns >/dev/null 2>&1 && break
+                  sleep 1; _w=$((_w + 1))
+              done
           fi
 
           echo "== 3/3 让 dnsmasq 指向 MosDNS =="
@@ -555,9 +572,8 @@ jobs:
           uci -q set dhcp.@dnsmasq[0].cachesize="2000"
               # 强制缓存 10 分钟（原来 3600s：改广告清单/换 CDN IP 后最长一小时才生效）
               uci -q set dhcp.@dnsmasq[0].min_cache_ttl="600"
-          # PassWall 用 addnmount 把 /tmp/etc/passwall/acl/default/dnsmasq.d 挂进 dnsmasq
-          # 的 conf-dir 来做分流。它异常退出时这条会残留，目录已删 → dnsmasq 起不来。
-          # 所以这里把带 passwall 字样的挂载点全摘掉（它启动时会自己重新加）。
+          # 旧版 PassWall 会在 addnmount 里留 /tmp/etc/passwall/... 的挂载点，
+          # 目录已不存在时 dnsmasq 会起不来；这里统一摘掉，避免历史配置拖累
           for _m in $(uci -q get dhcp.@dnsmasq[0].addnmount 2>/dev/null); do
             case "$_m" in
               *passwall*) uci -q del_list dhcp.@dnsmasq[0].addnmount="$_m" ;;
@@ -568,8 +584,8 @@ jobs:
           sleep 2
 
           if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
-              echo "✅ DNS 可用（PassWall 已停用，dnsmasq → MosDNS）"
-              echo "   想恢复代理：/etc/init.d/passwall start"
+              echo "✅ DNS 可用（代理已停用，dnsmasq → MosDNS）"
+              echo "   想恢复代理：/etc/init.d/singbox-lite start"
               exit 0
           fi
 
@@ -628,13 +644,23 @@ jobs:
               # 兜底：清单实在拿不到就给个空文件。绝不能让 mosdns 因为缺 domain_set 起不来
               # —— mosdns 挂了 = 53 断 = 全家断网，比少拦几个广告严重得多。
               [ -s /tmp/mosdns/adblock.txt ] || : > /tmp/mosdns/adblock.txt
+              # 墙外域名清单：config.yaml 的 proxy_domains 插件要读它（经代理解析，避免投毒）。
+              # 空文件会让 domain_set 加载失败 → mosdns 起不来 → 全家没有 DNS，所以必须保证非空。
+              if [ ! -s /tmp/mosdns/proxy-domains.txt ]; then
+                  if [ -s /etc/singbox/proxy-domains.txt ]; then
+                      cp -f /etc/singbox/proxy-domains.txt /tmp/mosdns/proxy-domains.txt
+                  elif [ -s /rom/etc/singbox/proxy-domains.txt ]; then
+                      cp -f /rom/etc/singbox/proxy-domains.txt /tmp/mosdns/proxy-domains.txt
+                  fi
+              fi
+              [ -s /tmp/mosdns/proxy-domains.txt ] || printf 'invalid.invalid\n' > /tmp/mosdns/proxy-domains.txt
               #   "listen udp 127.0.0.1:5335: bind: cannot assign requested address" FATAL
               # （随后靠 respawn 重试才成功，日志看着像故障）。
               # 这里先等 loopback 就绪（最多 8 秒），等不到也照样起——交给 respawn 兜底。
               _w=0
               while [ "$_w" -lt 16 ]; do
                   ip -o addr show lo 2>/dev/null | grep -q '127\.0\.0\.1' && break
-                  sleep 0.5
+                  sleep 1
                   _w=$((_w + 1))
               done
               procd_open_instance mosdns
@@ -657,7 +683,7 @@ jobs:
           # MosDNS 5.x 配置 —— 只干两件事：去广告、把上游换成 DoH（加密）
           # 链路：客户端 / 系统 dnsmasq → 127.0.0.1:5335
           #         广告域名 → 返回 0.0.0.0（集合来自 /tmp/mosdns/adblock.txt）
-          #         其他     → DoH（阿里 / 腾讯）+ 进程内缓存
+          #         其他     → DoH（腾讯 DNSPod）+ 进程内缓存
           # 只监听回环地址：局域网和外网都碰不到它，53 由系统 dnsmasq 持有并转发到这里。
           log:
             level: error
@@ -670,20 +696,43 @@ jobs:
                   - /tmp/mosdns/adblock.txt
 
             # 缓存只放内存（不写 dump 文件）：32MB 闪存经不起频繁写
+            # 墙外域名清单（复用 sing-box 的分流名单，init 脚本会把它落到 /tmp/mosdns/）
+            - tag: proxy_domains
+              type: domain_set
+              args:
+                files:
+                  - /tmp/mosdns/proxy-domains.txt
+
             - tag: cache
               type: cache
               args:
                 size: 8192
 
             # 加密上游：DoH。地址用 IP 而不是域名 —— 免得"解析自己"打死自己
-            # （223.5.5.5 是阿里 DoH，1.12.12.12 是腾讯 DoH，证书都含 IP SAN）
+            # （1.12.12.12 是腾讯 DNSPod 的 DoH，证书含 IP SAN）
+            # ⚠️ 不要换成阿里 DoH：实测它对墙外域名返回投毒 IP（详见 upstreams.conf 的注释）
             - tag: forward_doh
               type: forward
               args:
                 concurrent: 2
                 upstreams:
-                  - addr: "https://223.5.5.5/dns-query"
                   - addr: "https://1.12.12.12/dns-query"
+                  - addr: "https://doh.pub/dns-query"
+
+            # 走代理的加密上游：这是整条 DNS 链路唯一不投毒的办法。
+            # 国内所有 DoH（阿里/腾讯/360，实测）对墙外域名都返回假 IP；
+            # 而 1.1.1.1 只有经代理才问得到（路由器自身流量不经过透明代理）。
+            # socks5 指向 sing-box 的 socks 口；代理没起来时这条会失败，
+            # 后面的 has_resp 判定会继续走国内 DoH —— 失败也是"能解析"，不会 SERVFAIL。
+            - tag: fwd_proxy
+              type: forward
+              args:
+                concurrent: 1
+                upstreams:
+                  - addr: "https://1.1.1.1/dns-query"
+                    socks5: "127.0.0.1:1080"
+                  - addr: "https://1.0.0.1/dns-query"
+                    socks5: "127.0.0.1:1080"
 
             # 明文兜底：只在 DoH 完全没应答时用（典型场景：刚开机还没校时，
             # TLS 证书校验必失败）。宁可这一次明文，也不要整个局域网 DNS 停摆。
@@ -692,7 +741,6 @@ jobs:
               args:
                 concurrent: 2
                 upstreams:
-                  - addr: "223.5.5.5"
                   - addr: "119.29.29.29"
 
             - tag: main
@@ -700,6 +748,11 @@ jobs:
               args:
                 - matches: "qname $ad_domains"
                   exec: "black_hole 0.0.0.0 ::"
+                # 墙外域名：经代理问 1.1.1.1，拿真实 IP（顺序必须在 cache/国内 DoH 之前）
+                - matches: "qname $proxy_domains"
+                  exec: $fwd_proxy
+                - matches: has_resp
+                  exec: accept
                 - exec: $cache
                 - matches: has_resp
                   exec: accept
@@ -734,9 +787,17 @@ jobs:
           # MosDNS 上游清单：一行一条，# 开头为注释。
           # 带 https:// tls:// quic:// 的走加密通道（forward_doh），其余走明文（forward_plain）。
           # 修改后在 LuCI 服务 -> MosDNS -> 上游 点保存，或命令行执行 mosdns-ctl apply。
-          https://223.5.5.5/dns-query
+          #
+          # ⚠️ 别再加阿里 DoH（223.5.5.5 / dns.alidns.com）：实测它对墙外域名返回**投毒 IP**
+          #    （www.google.com → 31.13.92.37、www.youtube.com → 69.171.235.22，全是 Facebook 的地址）。
+          #    mosdns 是 concurrent 取最快响应，阿里更快就等于"稳定选中污染答案"，表现是
+          #    google / youtube / twitter 全部 10 秒超时（因为 sing-box 是拿目的 IP 去连代理，
+          #    1.14 已删除 sniff.override_destination，不会用嗅探到的域名替换它）。
+          #
+          # 下面两条是腾讯 DoH（DNSPod），实测墙外域名返回真实 IP：
           https://1.12.12.12/dns-query
-          223.5.5.5
+          https://doh.pub/dns-query
+          # 明文兜底：只在两条 DoH 都挂掉时才会用到（那时本来就上不了网，能用就行）
           119.29.29.29
           MOSDNS_UP_EOF
           
@@ -764,6 +825,8 @@ jobs:
           # 广告清单的运行时位置：放 /tmp（tmpfs），不再往 overlay 写几 MB。
           # 镜像里的原版在 /rom/etc/mosdns/adblock.txt，由 /etc/init.d/mosdns 每次启动拷过去。
           AD=/tmp/mosdns/adblock.txt
+          # 墙外域名清单（由 /etc/singbox/proxy-domains.txt 拷贝到 tmpfs，init 脚本负责拷贝）
+          TD=/tmp/mosdns
           INIT=/etc/init.d/mosdns
           DPORT=5335
 
@@ -788,6 +851,19 @@ jobs:
             [ -f "$UP" ] || : > "$UP"
             [ -f "$BL" ] || : > "$BL"
             [ -f "$WL" ] || : > "$WL"
+            # 首次开机时 uci-defaults(92-services) 先于 init.d/mosdns 执行，/tmp/mosdns/* 还不存在：
+            # domain_set 加载失败 → 本次 render 校验不过 → 旧配置继续用，黑白名单与 adblock 开关全不生效。
+            # 这里按 init 脚本同样的规则先兜个底（能拷就拷真清单，拷不到再放一个占位域名）。
+            [ -d /tmp/mosdns ] || mkdir -p /tmp/mosdns
+            if [ ! -s /tmp/mosdns/adblock.txt ]; then
+                if [ -s /etc/mosdns/adblock.txt ]; then cp -f /etc/mosdns/adblock.txt /tmp/mosdns/adblock.txt
+                elif [ -s /rom/etc/mosdns/adblock.txt ]; then cp -f /rom/etc/mosdns/adblock.txt /tmp/mosdns/adblock.txt
+                else printf 'invalid.invalid\n' > /tmp/mosdns/adblock.txt; fi
+            fi
+            if [ ! -s /tmp/mosdns/proxy-domains.txt ]; then
+                if [ -s /etc/singbox/proxy-domains.txt ]; then cp -f /etc/singbox/proxy-domains.txt /tmp/mosdns/proxy-domains.txt
+                else printf 'invalid.invalid\n' > /tmp/mosdns/proxy-domains.txt; fi
+            fi
             _out="$1"
             _level=$(get_set log_level error)
             _cache=$(get_set cache_size 8192)
@@ -804,6 +880,8 @@ jobs:
               printf '        - %s\n        - %s\n\n' "$AD" "$BL"
               printf '  - tag: allow_domains\n    type: domain_set\n    args:\n      files:\n'
               printf '        - %s\n\n' "$WL"
+              printf '  - tag: proxy_domains\n    type: domain_set\n    args:\n      files:\n'
+              printf '        - %s/proxy-domains.txt\n\n' "$TD"
               printf '  - tag: cache\n    type: cache\n    args:\n      size: %s\n\n' "$_cache"
 
               printf '  - tag: forward_doh\n    type: forward\n    args:\n      concurrent: %s\n      upstreams:\n' "$_conc"
@@ -816,8 +894,13 @@ jobs:
                     printf '        - addr: "%s"\n' "$_l"; _n=$((_n+1)) ;;
                 esac
               done < "$UP"
-              [ "$_n" -gt 0 ] || printf '        - addr: "https://223.5.5.5/dns-query"\n'
+              [ "$_n" -gt 0 ] || printf '        - addr: "https://1.12.12.12/dns-query"\n'
               printf '\n'
+
+              # 墙外域名走代理问 1.1.1.1（国内 DoH 对墙外域名一律返回投毒 IP，实测）
+              printf '  - tag: fwd_proxy\n    type: forward\n    args:\n      concurrent: 1\n      upstreams:\n'
+              printf '        - addr: "https://1.1.1.1/dns-query"\n          socks5: "127.0.0.1:1080"\n'
+              printf '        - addr: "https://1.0.0.1/dns-query"\n          socks5: "127.0.0.1:1080"\n\n'
 
               printf '  - tag: forward_plain\n    type: forward\n    args:\n      concurrent: %s\n      upstreams:\n' "$_conc"
               _n=0
@@ -826,7 +909,7 @@ jobs:
                 case "$_l" in ''|\#*|https://*|tls://*|quic://*) continue ;; esac
                 printf '        - addr: "%s"\n' "$_l"; _n=$((_n+1))
               done < "$UP"
-              [ "$_n" -gt 0 ] || printf '        - addr: "223.5.5.5"\n'
+              [ "$_n" -gt 0 ] || printf '        - addr: "119.29.29.29"\n'
               printf '\n'
 
               printf '  - tag: main\n    type: sequence\n    args:\n'
@@ -835,6 +918,8 @@ jobs:
               if [ "$_ad" = "1" ]; then
                 printf '      - matches: "qname $ad_domains"\n        exec: "black_hole 0.0.0.0 ::"\n'
               fi
+              printf '      - matches: "qname $proxy_domains"\n        exec: $fwd_proxy\n'
+              printf '      - matches: has_resp\n        exec: accept\n'
               printf '      - exec: $cache\n'
               printf '      - matches: has_resp\n        exec: accept\n'
               printf '      - exec: $forward_doh\n'
@@ -842,6 +927,9 @@ jobs:
               printf '      - exec: $forward_plain\n\n'
 
               printf '  - tag: udp_server\n    type: udp_server\n    args:\n      entry: main\n      listen: "127.0.0.1:%s"\n' "$DPORT"
+              # tcp_server 不能少：应答 >512B 或客户端走 TCP 重试时，没有 5335 的 TCP 监听
+              # 会直接解析失败（镜像里那份手写配置本来就有，render 漏了）
+              printf '  - tag: tcp_server\n    type: tcp_server\n    args:\n      entry: main\n      listen: "127.0.0.1:%s"\n' "$DPORT"
             } > "$_out"
           }
 
@@ -953,7 +1041,8 @@ jobs:
           }
 
           do_apply() {
-            [ -f "$UP" ] || printf 'https://223.5.5.5/dns-query\nhttps://1.12.12.12/dns-query\n223.5.5.5\n' > "$UP"
+            # 默认上游：腾讯 DoH 两条 + 明文兜底（不要阿里，见 upstreams.conf 注释）
+            [ -f "$UP" ] || printf 'https://1.12.12.12/dns-query\nhttps://doh.pub/dns-query\n119.29.29.29\n' > "$UP"
             render_to /tmp/mosdns-new.yaml || { printf '{"ok":0,"message":"渲染失败"}\n'; return 1; }
             if ! lint_file /tmp/mosdns-new.yaml >/tmp/mosdns-lint.txt 2>&1; then
               printf '{"ok":0,"message":"新配置未通过校验，已保留旧配置"}\n'
@@ -1003,12 +1092,12 @@ jobs:
           do_chain() {
             _srv=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr ' ' '|')
             _nr=$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)
-            # 代理侧状态：PassWall 是否在跑、配了几个节点（没节点=全部直连，属正常）
-            _se=0; pidof xray >/dev/null 2>&1 && _se=1
-            _sc=$(uci -q show passwall 2>/dev/null | grep -c "=node$")
+            # 代理侧状态：sing-box 是否在跑、配了几个节点（没节点=全部直连，属正常）
+            _se=0; pidof sing-box >/dev/null 2>&1 && _se=1
+            _sc=$(uci -q show singbox-lite 2>/dev/null | grep -c "=node$")
             [ -n "$_sc" ] || _sc=0
             _lsn=0; is_listen && _lsn=1
-            printf '{"ok":1,"dnsmasq_server":"%s","noresolv":"%s","passwall_running":%s,"passwall_nodes":%s,"mosdns_listen":%d}\n' \
+            printf '{"ok":1,"dnsmasq_server":"%s","noresolv":"%s","singbox_running":%s,"singbox_nodes":%s,"mosdns_listen":%d}\n' \
               "$_srv" "$_nr" "$_se" "$_sc" "$_lsn"
           }
 
@@ -1336,8 +1425,8 @@ jobs:
                           'dnsmasq 上游 server = ' + (j.dnsmasq_server || '（空）'),
                           'dnsmasq noresolv    = ' + (j.noresolv || '0'),
                           'MosDNS 监听 5335    = ' + (j.mosdns_listen === 1 ? '是' : '否'),
-                          'PassWall 运行中     = ' + (j.passwall_running === 1 ? '是' : '否（当前全部直连）'),
-                          'PassWall 节点数     = ' + (j.passwall_nodes != null ? j.passwall_nodes + ' 个' : '未知')
+                          'sing-box 运行中     = ' + (j.singbox_running === 1 ? '是' : '否（未启用 / 未加节点）'),
+                          'sing-box 节点数     = ' + (j.singbox_nodes != null ? j.singbox_nodes + ' 个' : '未知')
                         ];
                         preC.textContent = lines.join('\n');
                       });
@@ -1346,7 +1435,7 @@ jobs:
                   E('button', {
                     'class': 'btn cbi-button cbi-button-reset',
                     'click': ui.createHandlerFn(this, function () {
-                      if (!confirm('将停用 MosDNS 与 PassWall（撤掉 TPROXY 规则），并把 dnsmasq 上游改回运营商，使全屋 DNS 恢复直连。确定吗？')) return;
+                      if (!confirm('将停用 MosDNS 与 sing-box（撤掉 TPROXY 规则），并把 dnsmasq 上游改回运营商，使全屋 DNS 恢复直连。确定吗？')) return;
                       return fs.exec('/usr/bin/dns-recover', []).then(function (r) {
                         note('info', 'dns-recover', (r.stdout || r.stderr || '已执行'));
                       });
@@ -1440,6 +1529,1497 @@ jobs:
           
 
           # ---------- D. USB 网卡 / 随身 WiFi 热插拔自动挂 WAN ----------
+          # ---------- L. singbox-lite：sing-box 内核 + 自研 LuCI 面板 ----------
+          # 为什么自研而不是继续用 PassWall：PassWall 26.x 需要新的 golang 框架，跨分支搬会牵连
+          #   所有 Go 包；而 sing-box 是单个 Go 二进制，构建期交叉编译（失败回退官方 tiny 包）即可，
+          #   面板则照本仓库已有的 mosdns-lite 模式（后端 *-ctl + LuCI JS 页面）来做。
+          # 与固件其它部分的配合：
+          #   · DNS 完全不动：仍是 dnsmasq → MosDNS#5335（去广告 + DoH），这里只管"流量怎么走"
+          #   · 分流用 IP（chnroute），不依赖 geoip.dat（本固件故意不打包 geo 数据）
+          #   · 透明代理 TCP/UDP 都走 TPROXY（redirect 在本机实测完全不工作，已废弃），
+          #     不代理 UDP，只把 QUIC(udp/443) drop 掉逼客户端回落 TCP
+          cat > files/etc/config/singbox-lite << 'XCFG_EOF'
+          config singbox 'main'
+              option enabled '0'
+              option mode 'rule'
+              option log_level 'warning'
+              option redirect_port '12345'
+              option tproxy_port '12346'
+              option socks_port '1080'
+              option balance '0'
+              option udp_proxy '0'
+              option sub_url ''
+
+          # 节点示例（面板里"添加节点"会自动生成，这里是字段说明）：
+          #   type      vless | vmess | trojan | shadowsocks
+          #   server/port
+          #   uuid      vless/vmess 的 id、trojan 的密码、ss 的密码
+          #   flow      vless 专用，如 xtls-rprx-vision（不用可留空）
+          #   security  none | tls | reality
+          #   sni       服务器名/伪装域名（reality 时必填）
+          #   fp        指纹，默认 chrome
+          #   pbk/sid   reality 的公钥/短 ID
+          #   network   tcp | ws | grpc
+          #   path      ws 的路径 / grpc 的 serviceName
+          #   host      ws 的 Host 头
+          #   method    ss 的加密方式，如 aes-256-gcm
+          XCFG_EOF
+
+          cat > files/usr/libexec/singbox-ctl << 'XCTL_EOF'
+          #!/bin/sh
+          # singbox-ctl —— singbox-lite 后端（LuCI 面板与命令行共用）
+          #   uci(/etc/config/singbox-lite) 是唯一配置源；render 生成 /var/etc/singbox/config.json；
+          #   透明代理用独立 nft table（TCP redirect + 可选 UDP tproxy），不注入 fw4。
+          # 用法：status|nodes|node-set|node-del|node-enable|mode|enable|render|start|stop|restart|
+          #       nft-up|nft-down|test|version|sub-import <url>|balance <0|1>
+          set -u
+          UCI=singbox-lite
+          DIR=/var/etc/singbox
+          CFG=$DIR/config.json
+          CHN=/etc/singbox/chnroute.txt
+          CHNJ=$DIR/chnroute.json
+          PDOM=/etc/singbox/proxy-domains.txt
+          DDOM=/etc/singbox/direct-domains.txt
+          VERF=/etc/singbox-lite/version
+          # 关于 TUN：2026-11-23 在真机上试过两轮，已取消，不要再加回来。
+          #   · 只开 auto_route：sing-box 把"从 br-lan 进来的回包"也按表 2022 路由，
+          #     路由器对 192.168.2.x 的应答走错出口 → 面板/SSH 当场失联（只能靠规则重装间隙抢连恢复）。
+          #   · 补 route_exclude_address 排除全部私网后，表 2022 确实只剩公网细分前缀，但 LAN 依旧不通。
+          #   本机是"无线中继 + 网关"拓扑，断管理面的风险不可接受，所以只保留 TPROXY。
+
+          jesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+          u()  { uci -q get "$UCI.$1" 2>/dev/null; }
+          uf() { uci -q get "$UCI.$1.$2" 2>/dev/null; }
+          nodes_list() { uci -q show "$UCI" 2>/dev/null | sed -n "s/^$UCI\.\([^.=]*\)=node$/\1/p"; }
+          mode() { _m=$(u main.mode); printf '%s' "${_m:-rule}"; }
+          rport() { _p=$(u main.redirect_port); printf '%s' "${_p:-12345}"; }
+          tport() { _p=$(u main.tproxy_port); printf '%s' "${_p:-12346}"; }
+          sport() { _p=$(u main.socks_port); printf '%s' "${_p:-1080}"; }
+          loglevel() { _l=$(u main.log_level); printf '%s' "${_l:-warning}"; }
+          balance() { [ "$(u main.balance)" = "1" ] && echo 1 || echo 0; }
+          udpproxy() { [ "$(u main.udp_proxy)" = "1" ] && echo 1 || echo 0; }
+          tag_of() { printf 'proxy-%s' "$1"; }
+
+          active_node() { for n in $(nodes_list); do [ "$(uf "$n" enabled)" = "1" ] && { printf '%s' "$n"; return 0; }; done; return 1; }
+          enabled_nodes() { for n in $(nodes_list); do [ "$(uf "$n" enabled)" = "1" ] && printf '%s\n' "$n"; done; }
+
+          status_json() {
+            _pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+            _nft=no; nft list table inet singbox >/dev/null 2>&1 && _nft=yes
+            _ver=unknown; [ -f "$VERF" ] && _ver=$(cat "$VERF")
+            _chn=0; [ -s "$CHN" ] && _chn=$(wc -l < "$CHN" | tr -d ' ')
+            _pd=0; [ -s "$PDOM" ] && _pd=$(grep -vc '^#' "$PDOM" | tr -d ' ')
+            _dd=0; [ -s "$DDOM" ] && _dd=$(grep -vc '^#' "$DDOM" | tr -d ' ')
+            _en=$(enabled_nodes | wc -l | tr -d ' ')
+            _an=$(active_node || true)
+            printf '{"enabled":"%s","mode":"%s","active":"%s","pid":"%s","running":%s,"nft":"%s","version":"%s","chnroute":%s,"redirect_port":"%s","tproxy_port":"%s","socks_port":"%s","balance":"%s","udp_proxy":"%s","nodes":%s,"proxy_domains":%s,"direct_domains":%s,"sub_url":"%s"}\n' \
+              "$(u main.enabled)" "$(mode)" "$(jesc "${_an:-}")" "${_pid:-}" \
+              "$([ -n "${_pid:-}" ] && echo true || echo false)" "$_nft" "$(jesc "$_ver")" "$_chn" \
+              "$(rport)" "$(tport)" "$(sport)" "$(balance)" "$(udpproxy)" "$_en" "$_pd" "$_dd" "$(jesc "$(u main.sub_url)")"
+          }
+
+          nodes_json() {
+            printf '['
+            _f=1
+            for n in $(nodes_list); do
+              [ "$_f" = 1 ] || printf ','
+              _f=0
+              printf '{"name":"%s","remark":"%s","type":"%s","server":"%s","port":"%s","security":"%s","network":"%s","enabled":"%s","sni":"%s","fp":"%s","path":"%s","host":"%s","method":"%s","flow":"%s","ports":"%s","insecure":"%s","pbk":"%s","sid":"%s"}' \
+                "$(jesc "$n")" "$(jesc "$(uf "$n" remark)")" "$(jesc "$(uf "$n" type)")" \
+                "$(jesc "$(uf "$n" server)")" "$(jesc "$(uf "$n" port)")" "$(jesc "$(uf "$n" security)")" \
+                "$(jesc "$(uf "$n" network)")" "$(jesc "$(uf "$n" enabled)")" \
+                "$(jesc "$(uf "$n" sni)")" "$(jesc "$(uf "$n" fp)")" "$(jesc "$(uf "$n" path)")" \
+                "$(jesc "$(uf "$n" host)")" "$(jesc "$(uf "$n" method)")" "$(jesc "$(uf "$n" flow)")" \
+                "$(jesc "$(uf "$n" ports)")" "$(jesc "$(uf "$n" insecure)")" \
+                "$(jesc "$(uf "$n" pbk)")" "$(jesc "$(uf "$n" sid)")"
+            done
+            printf ']\n'
+          }
+
+          # uci set 不会创建不存在的配置文件（会报 Entry not found），所以先保证文件在
+          uci_ensure() { [ -f "/etc/config/$UCI" ] || : > "/etc/config/$UCI"; }
+
+          # uci 不会自动创建 section：main 段不存在时所有 main.* 写入都会失败
+          uci_main() { uci_ensure; uci -q get "$UCI.main" >/dev/null 2>&1 || uci -q set "$UCI.main=singbox" 2>/dev/null || return 1; }
+
+          node_set() {  # $1=节名 其余 k=v ；任何一步写失败即返回 1
+            # 变量一律带 _ns 前缀：ash 没有 local，_n 会和调用方（sub_import 的计数器）打架
+            _ns="$1"; shift
+            # 段名校验：uci 段名只允许字母数字下划线连字符，主键段 main 也不能被节点占用。
+            # 不加这道闸，用户在面板「标识」里填中文只会得到一句"保存失败"，看不出原因。
+            case "$_ns" in
+              '') echo "标识不能为空" >&2; return 1 ;;
+              main) echo "标识 main 是保留名字，请换一个" >&2; return 1 ;;
+              *[!A-Za-z0-9_]*) echo "标识只能用字母、数字、下划线（当前：$_ns）" >&2; return 1 ;;
+            esac
+            uci_ensure
+          # 先扫参数做校验，避免"写了一半再失败"留下半残节点
+          _want_sec=""; _have_pbk=""
+          for _a in "$@"; do
+            case "$_a" in
+              security=*) _want_sec="${_a#security=}" ;;
+              pbk=*)      _have_pbk="${_a#pbk=}" ;;
+            esac
+          done
+          [ -n "$_want_sec" ] || _want_sec=$(uf "$_ns" security)
+          [ -n "$_have_pbk" ] || _have_pbk=$(uf "$_ns" pbk)
+          if [ "$_want_sec" = "reality" ] && [ -z "$_have_pbk" ]; then
+            echo "reality 节点必须填 pbk（Reality 公钥），否则 sing-box 会拒绝整份配置" >&2
+            return 1
+          fi
+          # 必填校验（真机实测：把启用中节点的 port 写成 abc，整份 config.json 非法、
+          # sing-box 起不来，面板只会显示"未运行"）。写库前就拦住，别让它进 uci。
+          _want_srv=""; _want_port=""; _want_uuid=""
+          for _a in "$@"; do
+            case "$_a" in
+              server=*) _want_srv="${_a#server=}" ;;
+              port=*)   _want_port="${_a#port=}" ;;
+              uuid=*)   _want_uuid="${_a#uuid=}" ;;
+            esac
+          done
+          [ -n "$_want_srv" ]  || _want_srv=$(uf "$_ns" server)
+          [ -n "$_want_port" ] || _want_port=$(uf "$_ns" port)
+          [ -n "$_want_uuid" ] || _want_uuid=$(uf "$_ns" uuid)
+          [ -n "$_want_srv" ] || { echo "服务器地址不能为空" >&2; return 1; }
+          case "$_want_port" in
+            '') echo "端口不能为空" >&2; return 1 ;;
+            *[!0-9]*) echo "端口必须是纯数字（当前：$_want_port）" >&2; return 1 ;;
+          esac
+          [ "$_want_port" -ge 1 ] && [ "$_want_port" -le 65535 ] || { echo "端口超出 1-65535" >&2; return 1; }
+          [ -n "$_want_uuid" ] || { echo "UUID / 密码不能为空" >&2; return 1; }
+            uci -q get "$UCI.$_ns" >/dev/null 2>&1 || uci set "$UCI.$_ns=node" 2>/dev/null || return 1
+            while [ $# -gt 0 ]; do
+              _nk="${1%%=*}"; _nv="${1#*=}"
+              if [ -n "$_nk" ]; then
+                # 失败要 revert：uci set 先进 /tmp/.uci 的 delta，不 revert 的话下次 commit 会把半成品带上
+                uci -q set "$UCI.$_ns.$_nk=$_nv" 2>/dev/null || { uci -q revert "$UCI"; return 1; }
+              fi
+              shift
+            done
+            uci commit "$UCI" 2>/dev/null || return 1
+            return 0
+          }
+
+          # ---- 域名清单拆成 sing-box 的 domain / domain_suffix / domain_keyword ----
+          # 清单里 domain:/full:/keyword: 三种前缀的语义要和 sing-box 对齐
+          dom_rule() {  # $1=文件 $2=json 字段名前缀（不用）-> 输出 {"domain":[...],"domain_suffix":[...],"domain_keyword":[...]}
+            [ -s "$1" ] || { printf '{}'; return; }
+            awk 'BEGIN{fs=""; d=""; s=""; k=""; n1=0; n2=0; n3=0}
+                 {
+                   sub(/\r$/, "");
+                   gsub(/^[ \t]+|[ \t]+$/, "");
+                   if ($0 == "" || substr($0,1,1) == "#") next;
+                   if ($0 ~ /^full:/) { v = substr($0, 6); t = "d" }
+                   else if ($0 ~ /^keyword:/) { v = substr($0, 9); t = "k" }
+                   else if ($0 ~ /^domain:/) { v = substr($0, 8); t = "s" }
+                   else if ($0 ~ /^regexp:/) next;
+                   else { v = $0; t = "s" }
+                   gsub(/"/, "", v);
+                   if (v == "") next;
+                   if (t == "d") { d = d (n1++ ? "," : "") "\"" v "\"" }
+                   else if (t == "k") { k = k (n3++ ? "," : "") "\"" v "\"" }
+                   else { s = s (n2++ ? "," : "") "\"" v "\"" }
+                 }
+                 END{
+                   printf "{";
+                   c = 0;
+                   if (n1) { printf "\"domain\":[%s]", d; c++ }
+                   if (n2) { if (c++) printf ","; printf "\"domain_suffix\":[%s]", s }
+                   if (n3) { if (c++) printf ","; printf "\"domain_keyword\":[%s]", k }
+                   printf "}"
+                 }' "$1"
+          }
+
+          # chnroute（CIDR 列表）-> JSON 数组
+          cidr_json() {
+            [ -s "$1" ] || return 1
+            if [ ! -s "$2" ] || [ "$1" -nt "$2" ]; then
+              awk 'BEGIN{printf "["} {gsub(/[ \t\r]/,""); if($0==""||substr($0,1,1)=="#")next; printf "%s\"%s\"", (n++?",":""), $0} END{printf "]"}' "$1" > "$2"
+            fi
+            cat "$2"
+          }
+
+          # 单节点 -> sing-box outbound
+          sb_outbound() {  # $1=节名 $2=tag
+            _n="$1"; _tag="$2"
+            _t=$(uf "$_n" type); _srv=$(uf "$_n" server); _port=$(uf "$_n" port)
+            _sec=$(uf "$_n" security); _sni=$(uf "$_n" sni); _fp=$(uf "$_n" fp); _fp=${_fp:-chrome}
+            # hysteria2 / tuic 走 QUIC，uTLS 不适用（check 查不出，运行时才报 unsupported usage for uTLS）
+            case "$_t" in hysteria2|hy2|tuic) _fp="" ;; esac
+            _net=$(uf "$_n" network); _net=${_net:-tcp}
+            _path=$(uf "$_n" path); _host=$(uf "$_n" host)
+            # 端口归一化：JSON 数字不允许前导零（"0443" 会生成非法的 "server_port":0443 → 整份配置被拒）
+            _port=$(printf '%s' "${_port:-443}" | sed -e 's/^0*//' -e 's/[^0-9].*//')
+            [ -n "$_port" ] || _port=443
+            case "$_t" in
+              vless)
+                printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s"' \
+                  "$_tag" "$(jesc "$_srv")" "${_port:-443}" "$(jesc "$(uf "$_n" uuid)")"
+                _fl=$(uf "$_n" flow); [ -n "$_fl" ] && printf ',"flow":"%s"' "$(jesc "$_fl")" ;;
+              vmess)
+                printf '{"type":"vmess","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","security":"auto"' \
+                  "$_tag" "$(jesc "$_srv")" "${_port:-443}" "$(jesc "$(uf "$_n" uuid)")" ;;
+              trojan)
+                printf '{"type":"trojan","tag":"%s","server":"%s","server_port":%s,"password":"%s"' \
+                  "$_tag" "$(jesc "$_srv")" "${_port:-443}" "$(jesc "$(uf "$_n" uuid)")" ;;
+              shadowsocks|ss)
+                _ssm=$(uf "$_n" method); [ -n "$_ssm" ] || _ssm=aes-256-gcm
+                printf '{"type":"shadowsocks","tag":"%s","server":"%s","server_port":%s,"method":"%s","password":"%s"' \
+                  "$_tag" "$(jesc "$_srv")" "${_port:-8388}" "$(jesc "$_ssm")" "$(jesc "$(uf "$_n" uuid)")" ;;
+              hysteria2|hy2)
+                printf '{"type":"hysteria2","tag":"%s","server":"%s","server_port":%s,"password":"%s"' \
+                  "$_tag" "$(jesc "$_srv")" "${_port:-443}" "$(jesc "$(uf "$_n" uuid)")"
+                _sports=$(uf "$_n" ports)
+                if [ -n "$_sports" ]; then
+                  printf ',"server_ports":['
+                  _pc=0; _oldifs=$IFS; IFS=','
+                  for _p in $_sports; do
+                    [ -n "$_p" ] && { [ "$_pc" = 1 ] && printf ','; printf '"%s"' "$(printf '%s' "$_p" | tr '-' ':')"; _pc=1; }
+                  done
+                  IFS=$_oldifs
+                  printf ']'
+                fi
+                _tls_insecure=$(uf "$_n" insecure) ;;
+              *)  printf '{"type":"direct","tag":"%s"}' "$_tag"; return ;;
+            esac
+            # 传输层
+            case "$_net" in
+              ws)
+                printf ',"transport":{"type":"ws","path":"%s"' "$(jesc "${_path:-/}")"
+                [ -n "$_host" ] && printf ',"headers":{"Host":"%s"}' "$(jesc "$_host")"
+                printf '}' ;;
+              grpc)
+                printf ',"transport":{"type":"grpc","service_name":"%s"}' "$(jesc "$_path")" ;;
+            esac
+            # TLS
+            case "$_sec" in
+              tls|reality)
+                printf ',"tls":{"enabled":true'
+                [ -n "$_sni" ] && printf ',"server_name":"%s"' "$(jesc "$_sni")"
+                [ "$(uf "$_n" insecure)" = "1" ] && printf ',"insecure":true'
+                [ -n "$_fp" ] && printf ',"utls":{"enabled":true,"fingerprint":"%s"}' "$(jesc "$_fp")"
+                if [ "$_sec" = "reality" ]; then
+                  # reality 公钥必须是 raw base64（无填充 "="）。订阅里常见 %3D→"=xxx=" 的带填充写法，
+                  # 直接写进去 sing-box 会报 "illegal base64 data at input byte N"，整份配置被拒。
+                  _pbkv=$(uf "$_n" pbk); _pbkv=$(printf '%s' "$_pbkv" | sed 's/=*$//')
+                  printf ',"reality":{"enabled":true,"public_key":"%s"' "$(jesc "$_pbkv")"
+                  _sid=$(uf "$_n" sid); [ -n "$_sid" ] && printf ',"short_id":"%s"' "$(jesc "$_sid")"
+                  printf '}'
+                fi
+                printf '}' ;;
+              *)
+                # hysteria2/tuic 天然是 TLS，没写 security 也要开
+                case "$_t" in
+                  hysteria2|hy2)
+                    printf ',"tls":{"enabled":true'
+                    [ -n "$_sni" ] && printf ',"server_name":"%s"' "$(jesc "$_sni")"
+                    [ "$(uf "$_n" insecure)" = "1" ] && printf ',"insecure":true'
+                    [ -n "$_fp" ] && printf ',"utls":{"enabled":true,"fingerprint":"%s"}' "$(jesc "$_fp")"
+                    printf '}' ;;
+                esac ;;
+            esac
+            # TFO：握手少一个 RTT；对端不支持时内核自动回退，无副作用
+            printf ',"tcp_fast_open":true}'
+          }
+
+          render() {
+            mkdir -p "$DIR"
+            _rp=$(rport); _tp=$(tport); _sp=$(sport); _m=$(mode); _bal=$(balance); _udp=$(udpproxy)
+            _lv=$(loglevel)
+            case "$_lv" in
+              trace|debug|info|warn|warning|error|fatal) : ;;
+              *) _lv=warn ;;
+            esac
+            [ "$_lv" = "warning" ] && _lv=warn
+            _cnt=0; _obs=""; _tags=""; _first=""
+            for _nd in $(enabled_nodes); do
+              _tg=$(tag_of "$_nd"); _cnt=$((_cnt + 1))
+              [ -n "$_first" ] || _first=$_tg
+              _obs="$_obs${_obs:+,}$(sb_outbound "$_nd" "$_tg")"
+              _tags="$_tags${_tags:+,}\"$_tg\""
+            done
+            if [ "$_cnt" = 0 ]; then
+              # 没有任何启用节点（开箱状态）：outbounds 只能从 direct 开始，不能带前导逗号
+              _def=direct
+              _obs='{"type":"direct","tag":"direct"}'
+            else
+              # 自动选择：探测必须用 **HTTPS**。实测（2026-11-23）：节点可能"HTTP 204 通、HTTPS 全断"，
+              # 用 http:// 探测会把这种半死节点判成健康并锁死（现象：面板 test 全 000、网页打不开）。
+              if [ "$_bal" = "1" ] && [ "$_cnt" -gt 1 ]; then
+                _def=auto
+                _obs="$_obs,{\"type\":\"urltest\",\"tag\":\"auto\",\"outbounds\":[$_tags],\"url\":\"https://www.gstatic.com/generate_204\",\"interval\":\"2m\",\"tolerance\":50}"
+              else
+                _def=$_first
+              fi
+              _obs="$_obs,{\"type\":\"direct\",\"tag\":\"direct\"}"
+            fi
+
+            # 路由规则
+            case "$_m" in
+              direct) _rules=""; _def=direct ;;
+              global)
+                _rules=''
+                if [ "$_cnt" -gt 1 ] && [ "$_bal" = "1" ]; then _def=auto
+                elif [ "$_cnt" -gt 0 ]; then _def=$_first
+                else _def=direct; fi ;;
+              *)
+                _rules=',{"ip_is_private":true,"outbound":"direct"}'
+                _dr=$(dom_rule "$DDOM")
+                [ "$_dr" != "{}" ] && _rules="$_rules,${_dr%\}},\"outbound\":\"direct\"}"
+                _pr=$(dom_rule "$PDOM")
+                [ "$_pr" != "{}" ] && _rules="$_rules,${_pr%\}},\"outbound\":\"$_def\"}"
+                _ci=$(cidr_json "$CHN" "$CHNJ" 2>/dev/null)
+                [ -n "$_ci" ] && _rules="$_rules,{\"ip_cidr\":$_ci,\"outbound\":\"direct\"}"
+                ;;
+            esac
+            if [ "$_m" != "direct" ]; then
+              # 透明代理只有 tcp-in 一个入站（UDP 不代理，原因见 nft 段注释）
+              _ins='"tcp-in"'
+              _rules="{\"inbound\":[$_ins],\"action\":\"sniff\"},{\"inbound\":[\"socks-in\"],\"action\":\"sniff\"}$_rules"
+            fi
+
+            {
+              printf '{\n'
+              printf '  "log": { "level": "%s", "timestamp": true },\n' "$_lv"
+              printf '  "inbounds": [\n'
+              printf '    { "type": "tproxy", "tag": "tcp-in", "listen": "0.0.0.0", "listen_port": %s, "network": "tcp" },\n' "$_rp"
+              # （实测 redirect 方案在本机完全不工作：nc 监听 12345 零字节、sing-box 无 inbound 日志）
+              printf '    { "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": %s }\n' "$_sp"
+              printf '  ],\n'
+              printf '  "outbounds": [%s],\n' "$_obs"
+              printf '  "route": { "rules": [%s], "final": "%s", "auto_detect_interface": true }\n' "$_rules" "$_def"
+              printf '}\n'
+            } > "$CFG.new"
+
+            # 原子落盘：check 不通过就保留上一份可用配置（否则一次手滑输入非法端口
+            # 就会把正在跑的配置覆盖成非法，服务再也起不来）
+            if /usr/bin/sing-box check -c "$CFG.new" >/tmp/sb-check.log 2>&1; then
+              mv -f "$CFG.new" "$CFG"
+              echo "OK"
+            else
+              echo "CONFIG_INVALID"
+              head -3 /tmp/sb-check.log >&2
+              rm -f "$CFG.new"
+              return 1
+              return 1
+            fi
+          }
+
+          # ---------- nft 规则：独立 table inet singbox，TCP/UDP 全用 tproxy ----------
+          # 为什么不用 redirect：本机实测 redirect 后 sing-box 收不到连接（nc 监听 12345 零字节、
+          # /proc/net/tcp 无 ESTABLISHED），换 tproxy 后立刻出现 inbound connection、出口 IP 变节点 IP。
+          # tproxy 必须挂 filter/priority mangle（不能挂 nat），并且 TCP 也要配策略路由。
+          nft_up() {
+            # 注意：这里不能先 nft_down（旧表还在用），要等下面 nft -c 校验通过后再拆
+            [ "$(u main.enabled)" = "1" ] || { echo "disabled"; return 0; }
+            _rp=$(rport); _tp=$(tport); _m=$(mode); _udp=$(udpproxy)
+            {
+              echo "table inet singbox {"
+              if [ "$_m" = "rule" ] && [ -s "$CHN" ]; then
+                echo "  set chn { type ipv4_addr; flags interval; elements = {"
+                awk '{gsub(/[ \t\r]/,""); if($0!="" && substr($0,1,1)!="#") printf "%s%s", (n++?", ":""), $0}' "$CHN"
+                echo ""; echo "  } }"
+              fi
+              echo "  chain prerouting {"
+              echo "    type filter hook prerouting priority mangle; policy accept;"
+              echo "    iifname != \"br-lan\" return"
+              echo "    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } return"
+              # IPv6 一律不进 tproxy：sing-box 的 tproxy 入站只监听 0.0.0.0（v4），
+              # v6 包投进去会被静默丢弃 → LAN 客户端的 v6 出网全断（浏览器优先 v6，表现为网页卡住）。
+              echo "    meta nfproto ipv6 return"
+              [ "$_m" = "rule" ] && [ -s "$CHN" ] && echo "    ip daddr @chn return"
+              echo "    tcp dport $_rp return"
+              echo "    meta l4proto tcp meta mark set 0x1 tproxy to :$_rp accept"
+              # 本机不做 UDP 代理。两轮实测的结论：
+              #   · tproxy 的 UDP 拿不到原始目标地址（origdst 只剩端口，地址变成 LAN IP），1.12/1.14 都一样；
+              #   · TUN 能代理 UDP，但 auto_route 会把 LAN 回程一起接管，面板/SSH 当场失联（已取消，见文件头）。
+              # 所以 UDP 一律不代理，只把 QUIC(udp/443) drop 掉逼浏览器回落 TCP ——
+              # 这比"打开 UDP 代理后所有 UDP 全超时"要稳得多。
+              echo "    iifname \"br-lan\" udp dport 443 drop"
+              echo "  }"
+              echo "}"
+            } > /var/etc/singbox.nft
+            # 先校验再拆旧表：chnroute 一旦有冲突/脏行，整份 nft 会失败；
+            # 若先把旧表删了，就成了"代理全断、进程还在跑、面板显示运行中"。
+            if ! nft -c -f /var/etc/singbox.nft 2>/tmp/nft-check.log; then
+              logger -t singbox-lite "nft 规则校验失败，保留现有规则（未动旧表）"
+              head -3 /tmp/nft-check.log >&2
+              return 1
+            fi
+            nft_down
+            if nft -f /var/etc/singbox.nft; then
+              # tproxy 必须配套策略路由，TCP 也要（不只是 UDP）
+              ip rule add fwmark 1 lookup 100 2>/dev/null
+              ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+              echo "nft OK"
+            else
+              logger -t singbox-lite "nft 规则下发失败，规则留在 /var/etc/singbox.nft"
+              echo "nft FAILED"
+              echo "规则文件已保留：/var/etc/singbox.nft" >&2
+              return 1
+            fi
+          }
+
+          nft_down() {
+            nft delete table inet singbox 2>/dev/null
+            ip rule del fwmark 1 lookup 100 2>/dev/null
+            ip route flush table 100 2>/dev/null
+            return 0
+          }
+          # ---------- 订阅导入：自动识别 v2ray(base64/明文 URI) / Clash(YAML) / sing-box / Xray(JSON) ----------
+          TAB=$(printf '\t')
+          # 拼一行 tab 分隔的 k=v，跳过空值
+          jline() {
+            _l=""
+            for _a in "$@"; do
+              # 只丢掉真正的空值（key=）；以 "=" 结尾的字段（如带 base64 填充的 pbk=）必须保留，
+              # 否则 reality 节点会因为"pbk 为空"整节点被拒，而导入统计仍算成功
+              case "$_a" in *=) [ -z "${_a#*=}" ] && continue ;; esac
+              _a=$(printf '%s' "$_a" | tr -d '\t\r\n')
+              _l="${_l:+$_l$TAB}$_a"
+            done
+            [ -n "$_l" ] && printf '%s\n' "$_l"
+          }
+
+          # URL 解码（%XX → 字节；+ → 空格）
+          urldec() { printf '%b' "$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%/\\x/g')"; }
+
+          # 兼容标准/URL-safe/无填充 base64
+          sub_b64() {
+            tr -d '\r\n \t' < "$1" | tr '_-' '/+' > "$1.b64"
+            _bn=$(wc -c < "$1.b64" | tr -d ' ')
+            _br=$((_bn % 4))
+            if [ "$_br" = 3 ]; then printf '=' >> "$1.b64"
+            elif [ "$_br" = 2 ]; then printf '==' >> "$1.b64"; fi
+            base64 -d < "$1.b64" > "$2" 2>/dev/null
+            [ -s "$2" ]
+          }
+
+          # 格式嗅探：clash | json | uri | b64 | unknown
+          sub_sniff() {
+            grep -qiE '^[[:space:]]*(proxies|proxy-groups)[[:space:]]*:' "$1" && { echo clash; return; }
+            _h=$(head -c 768 "$1" | tr -d ' \t\r\n')
+            case "$_h" in \{*|\[*) echo json; return ;; esac
+            grep -q '://' "$1" && { echo uri; return; }
+            _c=$(wc -c < "$1" | tr -d ' ')
+            [ "$_c" -gt 32 ] && base64 -d < "$1" >/dev/null 2>&1 && { echo b64; return; }
+            echo unknown
+          }
+
+          # Clash / Clash.Meta：交给 awk 解析
+          sub_nodes_clash() { awk -f /usr/libexec/singbox-sub-clash.awk "$1"; }
+
+          # sing-box / Xray 完整配置：jsonfilter 取 outbounds
+          sub_jf() { printf '%s' "$1" > /tmp/singbox-sub-ob.json; jsonfilter -i /tmp/singbox-sub-ob.json -e "$2" 2>/dev/null; }
+          sub_g() {  # $1=JSON对象 其余为候选表达式，取第一个非空
+            _o="$1"; shift
+            for _e in "$@"; do _v=$(sub_jf "$_o" "$_e"); [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }; done
+            return 1
+          }
+
+          sub_nodes_json() {
+            _f="$1"; _i=0; _imp=0; _uns=0
+            while : ; do
+              _o=$(jsonfilter -i "$_f" -e "@.outbounds[$_i]" 2>/dev/null) || break
+              [ -n "$_o" ] || break
+              _t=$(sub_g "$_o" '@.type' '@.protocol')
+              _t=$(printf '%s' "${_t:-}" | tr 'A-Z' 'a-z')
+              case "$_t" in
+                vless|vmess|trojan|shadowsocks|ss|hysteria2|hy2) : ;;
+                freedom|blackhole|dns|selector|urltest|direct|block|''|wireguard|socks|http)
+                  _i=$((_i + 1)); continue ;;
+                *) _uns=$((_uns + 1)); _i=$((_i + 1)); continue ;;
+              esac
+              [ "$_t" = ss ] && _t=shadowsocks
+              [ "$_t" = hy2 ] && _t=hysteria2
+              _srv=$(sub_g "$_o" '@.server' '@.settings.vnext[0].address' '@.settings.servers[0].address')
+              _port=$(sub_g "$_o" '@.server_port' '@.settings.vnext[0].port' '@.settings.servers[0].port')
+              _uid=$(sub_g "$_o" '@.uuid' '@.password' '@.settings.vnext[0].users[0].id' '@.settings.servers[0].password')
+              if [ -z "$_srv" ] || [ -z "$_port" ]; then _uns=$((_uns + 1)); _i=$((_i + 1)); continue; fi
+              _tag=$(sub_g "$_o" '@.tag' '@.remarks')
+              _flow=$(sub_g "$_o" '@.flow' '@.settings.vnext[0].users[0].flow')
+              _meth=$(sub_g "$_o" '@.method' '@.settings.servers[0].method')
+              _sni=$(sub_g "$_o" '@.tls.server_name' '@.tls.reality.server_name' '@.streamSettings.tlsSettings.serverName' '@.streamSettings.realitySettings.serverName')
+              _pbk=$(sub_g "$_o" '@.tls.reality.public_key' '@.streamSettings.realitySettings.publicKey')
+              _sid=$(sub_g "$_o" '@.tls.reality.short_id' '@.streamSettings.realitySettings.shortId')
+              _fp=$(sub_g "$_o" '@.tls.utls.fingerprint' '@.streamSettings.realitySettings.fingerprint' '@.streamSettings.tlsSettings.fingerprint')
+              _net=$(sub_g "$_o" '@.transport.type' '@.streamSettings.network')
+              _path=$(sub_g "$_o" '@.transport.path' '@.streamSettings.wsSettings.path' '@.streamSettings.grpcSettings.serviceName' '@.settings.vnext[0].users[0].path')
+              _host=$(sub_g "$_o" '@.transport.headers.Host' '@.streamSettings.wsSettings.headers.Host')
+              _tls=$(sub_g "$_o" '@.tls.enabled' '@.streamSettings.security')
+              _sec=none
+              if [ -z "$_pbk" ] && [ "$_t" = hysteria2 ]; then _sec=tls; fi
+              if [ -n "$_pbk" ]; then _sec=reality
+              elif [ "$_tls" = "true" ] || [ "$_tls" = "tls" ]; then _sec=tls
+              elif [ "$_tls" = "reality" ]; then _sec=reality; fi
+              [ -z "$_net" ] && _net=tcp
+              case "$_net" in h2|http) _net=grpc ;; tcp|ws|grpc) : ;; *) _net=tcp ;; esac
+              _imp=$((_imp + 1))
+              _ins=""
+              [ "$(sub_g "$_o" '@.tls.insecure')" = "true" ] && _ins=1
+              _sports=$(sub_g "$_o" '@.server_ports' '@.ports')
+              jline "type=$_t" "server=$_srv" "port=$_port" "remark=${_tag:-sub$_imp}" \
+                "uuid=$_uid" "flow=$_flow" "method=$_meth" "security=$_sec" "sni=$_sni" \
+                "fp=$_fp" "pbk=$_pbk" "sid=$_sid" "network=$_net" "path=$_path" "host=$_host" \
+                "insecure=$_ins" "ports=$_sports"
+              _i=$((_i + 1))
+            done
+            printf '__STAT__%simported=%s%sunsupported=%s%sformat=json\n' "$TAB" "$_imp" "$TAB" "$_uns" "$TAB"
+          }
+
+          # 纯 URI 列表（vless/vmess/trojan/ss），也覆盖 v2rayN 明文导出
+          sub_nodes_uri() {
+            _imp=0; _uns=0
+            while IFS= read -r _line || [ -n "$_line" ]; do
+              _line=$(printf '%s' "$_line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+              case "$_line" in
+                vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*) : ;;
+                tuic://*|ssr://*|hysteria://*) _uns=$((_uns + 1)); continue ;;
+                *) continue ;;
+              esac
+              case "$_line" in
+                vmess://*)
+                  _vb=$(printf '%s' "${_line#vmess://}" | sed -e 's/%3D/=/g' -e 's/%3d/=/g' | tr -d ' \t\r\n' | tr '_-' '/+')
+                  case $(( ${#_vb} % 4 )) in
+                    3) _vb="$_vb=" ;;
+                    2) _vb="$_vb==" ;;
+                  esac
+                  _j=$(printf '%s' "$_vb" | base64 -d 2>/dev/null)
+                  [ -n "$_j" ] || { _uns=$((_uns + 1)); continue; }
+                  _get() { printf '%s' "$_j" | sed -n "s/.*\"$1\":[ ]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1; }
+                  _add=$(_get add); _pt=$(_get port); _id=$(_get id); _ps=$(_get ps)
+                  _net=$(_get net); _tls=$(_get tls); _sni=$(_get sni); _host=$(_get host); _path=$(_get path)
+                  [ -n "$_add" ] && [ -n "$_id" ] || { _uns=$((_uns + 1)); continue; }
+                  _sec2=none; [ "$_tls" = "tls" ] && _sec2=tls
+                  _imp=$((_imp + 1))
+                  jline "type=vmess" "server=$_add" "port=${_pt:-443}" "uuid=$_id" \
+                    "network=${_net:-tcp}" "security=$_sec2" "sni=$_sni" "host=$_host" "path=$_path" \
+                    "remark=$(urldec "${_ps:-sub$_imp}")"
+                  ;;
+                *)
+                  _scheme="${_line%%://*}"; _rest="${_line#*://}"
+                  _frag="${_rest#*#}"; [ "$_frag" = "$_rest" ] && _frag=""
+                  _rest="${_rest%%#*}"
+                  _q=""; case "$_rest" in *\?*) _q="${_rest#*\?}"; _rest="${_rest%%\?*}";; esac
+                  _user="${_rest%%@*}"; _hp="${_rest#*@}"
+                  case "$_hp" in
+                    \[*\]:*) _host="${_hp%]:*}"; _host="${_host#[}"; _port="${_hp##*]:}" ;;
+                    \[*\])   _host="${_hp#[}"; _host="${_host%]}"; _port="" ;;
+                    *:*)     _host="${_hp%:*}"; _port="${_hp##*:}" ;;
+                    *)       _host="$_hp"; _port="" ;;
+                  esac
+                  _port="${_port%%/*}"   # hysteria2 常见 host:60000/，去掉路径尾巴
+                  # query 值必须做 URL 解码：订阅里 reality 的 pbk 常写成 xxx%3D（base64 填充），
+                  # 不解码就会把 %3D 原样写进 uci → sing-box 报 illegal base64 data → 整份配置被拒
+                  _gp() { urldec "$(printf '%s' "$_q" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1)"; }
+                  _sni=$(_gp sni); _tls=$(_gp security); _type=$(_gp type)
+                  _pbk=$(_gp pbk); _sid=$(_gp sid); _flow=$(_gp flow); _fp=$(_gp fp)
+                  _path=$(_gp path); _hosth=$(_gp host); _method=$(_gp method)
+                  [ -n "$_sni" ] || _sni=$(_gp servername)
+                  # gRPC 的 URI 用 serviceName=，统一存进 path 字段
+                  [ -n "$_path" ] || _path=$(_gp serviceName)
+                  [ -n "$_tls" ] || _tls=none
+                  [ -n "$_type" ] || _type=tcp
+                  if [ "$_scheme" = trojan ] && [ "$_tls" = none ]; then _tls=tls; fi
+                  _insecure=""; _ports=""; _pin=""
+                  case "$_scheme" in
+                    hysteria2|hy2)
+                      _t=hysteria2
+                      _tls=tls
+                      # 密码在 userinfo；insecure/mport 在 query 里
+                      _ports=$(_gp mport); [ -n "$_ports" ] || _ports=$(_gp ports)
+                      case "$(_gp insecure)" in 1|true|yes) _insecure=1 ;; esac
+                      _pin=$(_gp pinSHA256)
+                      # sing-box 1.12 没有 certificate_public_key_sha256（1.13+ 才加），
+                      # 订阅给了 pin 又不让跳过校验时只能退化成 insecure，否则证书链校验必失败
+                      if [ -n "$_pin" ] && [ "$_insecure" != "1" ]; then _insecure=1; fi
+                      ;;
+                    ss) _t=shadowsocks
+                        # 旧式 ss://base64(method:pass@host:port)：外层没有 @，主机藏在 base64 里
+                        case "$_rest" in
+                          *@*) : ;;
+                          *)
+                            _sd=$(printf '%s' "${_rest%%\?*}" | tr '_-' '/+' | base64 -d 2>/dev/null)
+                            case "$_sd" in
+                              *@*:*)
+                                _hp="${_sd##*@}"
+                                _port="${_hp##*:}"; _host="${_hp%:*}"
+                                _user="${_sd%@*}" ;;
+                            esac ;;
+                        esac
+                        # ss://base64(method:pass)@host:port 或 ss://base64(all)
+                        case "$_user" in *:*) _method="${_user%%:*}"; _user="${_user#*:}" ;;
+                          *) _d=$(printf '%s' "$_user" | tr '_-' '/+' | base64 -d 2>/dev/null)
+                             case "$_d" in *:*) _method="${_d%%:*}"; _user="${_d#*:}" ;; esac ;;
+                        esac
+                        _user=$(printf '%s' "$_user" | sed 's/%3D/=/g;s/%2F/\//g;s/%2B/+/g') ;;
+                    *) _t=$_scheme ;;
+                  esac
+                  # uuid / 密码 也可能带 URL 编码（含 @ : / 等字符），统一解一次；ss 分支已单独处理
+                  case "$_scheme" in ss) : ;; *) _user=$(urldec "$_user") ;; esac
+                  [ -n "$_host" ] || { _uns=$((_uns + 1)); continue; }
+                  _imp=$((_imp + 1))
+                  jline "type=$_t" "server=$_host" "port=${_port:-443}" "uuid=$_user" \
+                    "network=$_type" "security=$_tls" "sni=$_sni" "fp=$_fp" "pbk=$_pbk" "sid=$_sid" \
+                    "flow=$_flow" "path=$_path" "host=$_hosth" "method=$_method" \
+                    "insecure=$_insecure" "ports=$_ports" "pin=$_pin" \
+                    "remark=$(urldec "${_frag:-sub$_imp}")"
+                  ;;
+              esac
+            done < "$1"
+            printf '__STAT__%simported=%s%sunsupported=%s%sformat=uri\n' "$TAB" "$_imp" "$TAB" "$_uns" "$TAB"
+          }
+
+          sub_import() {
+            _url="$1"; [ -n "$_url" ] || { echo "NO_URL"; return 1; }
+            _f=$(mktemp /tmp/singbox-sub.XXXXXX 2>/dev/null) || _f=/tmp/singbox-sub.raw
+            _nd=/tmp/singbox-sub-nodes.txt
+            curl -fsSL -m 60 -A 'v2rayN/6.0' "$_url" -o "$_f" 2>/dev/null || { echo "DOWNLOAD_FAILED"; rm -f "$_f"; return 1; }
+            [ -s "$_f" ] || { echo "EMPTY_RESPONSE"; return 1; }
+            _fmt=$(sub_sniff "$_f")
+            if [ "$_fmt" = b64 ]; then
+              sub_b64 "$_f" "$_f.d" || { echo "BASE64_DECODE_FAILED"; rm -f "$_f" "$_f.b64"; return 1; }
+              mv "$_f.d" "$_f"; _fmt=$(sub_sniff "$_f")
+            fi
+            [ "$_fmt" = unknown ] && { echo "UNKNOWN_FORMAT"; rm -f "$_f" "$_f.b64"; return 1; }
+            if [ "$_fmt" = json ] && ! command -v jsonfilter >/dev/null 2>&1; then
+              echo "JSONFILTER_MISSING"; rm -f "$_f" "$_f.b64"; return 1
+            fi
+            case "$_fmt" in
+              clash) sub_nodes_clash "$_f" > "$_nd" ;;
+              json)  sub_nodes_json  "$_f" > "$_nd" ;;
+              uri)   sub_nodes_uri   "$_f" > "$_nd" ;;
+            esac
+            _si_cnt=$(grep -cv '^__STAT__' "$_nd" 2>/dev/null || true)
+            if [ "${_si_cnt:-0}" -lt 1 ]; then
+              echo "NO_NODES_PARSED"
+              rm -f "$_f" "$_f.b64" "$_nd"
+              return 1
+            fi
+            # 落库前先备份，写失败就整份回滚（不能让用户从 N 个节点变成 0 个）
+            _bak=/tmp/singbox-sub.uci.bak
+            [ -f "/etc/config/$UCI" ] && cp "/etc/config/$UCI" "$_bak" 2>/dev/null
+            # 落库：节点集合按导入顺序重建为 sub1..subN
+            for _old in $(uci -q show "$UCI" 2>/dev/null | awk -F'[.=]' -v p="$UCI" '$1==p && NF==3 && $3=="node" {print $2}'); do
+              uci -q delete "$UCI.$_old" 2>/dev/null
+            done
+            _si_n=0; _si_imp=0; _si_uns=0; _si_fail=0
+            while IFS= read -r _si_l; do
+              case "$_si_l" in
+                __STAT__*)
+                  _si_uns=$(printf '%s' "$_si_l" | tr "$TAB" '\n' | sed -n 's/^unsupported=//p')
+                  continue ;;
+                '') continue ;;
+              esac
+              _si_n=$((_si_n + 1))
+              _si_sec="sub$_si_n"
+              _si_imp=$((_si_imp + 1))
+              set -f
+              _oldifs=$IFS; IFS=$TAB
+              set -- $_si_l
+              IFS=$_oldifs
+              set +f
+              if node_set "$_si_sec" "$@" >/dev/null 2>&1; then
+                uci -q set "$UCI.$_si_sec.enabled=1" 2>/dev/null
+              else
+                _si_fail=$((_si_fail + 1))
+                uci -q delete "$UCI.$_si_sec" 2>/dev/null
+              fi
+            done < "$_nd"
+            uci_ensure
+            uci -q get "$UCI.main" >/dev/null 2>&1 || uci -q set "$UCI.main=singbox" 2>/dev/null
+            if [ "$_si_n" -gt 1 ]; then uci -q set "$UCI.main.balance=1" 2>/dev/null; fi
+            uci -q set "$UCI.main.sub_url=$_url" 2>/dev/null
+            uci commit "$UCI" 2>/dev/null
+            if [ "$_si_fail" -ge "$_si_n" ] && [ "$_si_n" -gt 0 ]; then
+              [ -s "$_bak" ] && cp "$_bak" "/etc/config/$UCI" 2>/dev/null && uci commit "$UCI" 2>/dev/null
+              rm -f "$_f" "$_f.b64" "$_nd" "$_bak" /tmp/singbox-sub-ob.json
+              printf 'WRITE_FAILED（%s 个节点全部写入失败，已回滚到导入前的配置）\n' "$_si_n"
+              return 1
+            fi
+            # 落库后立刻验证：字段问题（base64 填充、非法端口…）会让整份配置被 sing-box 拒绝。
+            # 不验证的话用户看到"导入成功"，实际代理根本起不来（渲染失败就一直沿用旧配置）。
+            if ! render >/dev/null 2>&1; then
+                [ -s "$_bak" ] && cp "$_bak" "/etc/config/$UCI" 2>/dev/null && uci commit "$UCI" 2>/dev/null
+                rm -f "$_f" "$_f.b64" "$_nd" "$_bak" /tmp/singbox-sub-ob.json
+                printf 'CONFIG_INVALID（导入后配置校验失败，已回滚到导入前的配置）\n'
+                return 1
+            fi
+            rm -f "$_f" "$_f.b64" "$_nd" "$_bak" /tmp/singbox-sub-ob.json
+            printf 'IMPORTED=%s\nUNSUPPORTED=%s\nFORMAT=%s\n' "$_si_imp" "${_si_uns:-0}" "$_fmt"
+          }
+
+          case "${1:-status}" in
+            status) status_json ;;
+            nodes) nodes_json ;;
+          node-set)
+            shift; _name="$1"; shift
+            node_set "$_name" "$@" || { echo "保存失败（见上面的提示）" >&2; exit 1; }
+            echo "saved $_name" ;;
+            node-del) shift; uci -q delete "$UCI.$1"; uci commit "$UCI"; echo "deleted $1" ;;
+            node-enable)
+              shift; _name="$1"; _v="${2:-1}"
+              if [ "$_v" = "1" ] && [ "$(balance)" = "0" ]; then
+                for n in $(nodes_list); do [ "$n" = "$_name" ] || uci -q set "$UCI.$n.enabled=0"; done
+              fi
+              uci -q set "$UCI.$_name.enabled=$_v"; uci commit "$UCI"; echo "enabled=$_v $_name" ;;
+          mode) shift; _v="${1:-rule}"; \
+            uci_main && uci -q set "$UCI.main.mode=$_v" && uci commit "$UCI" \
+              || { echo "uci set mode 失败（/etc/config/$UCI 不可写？）" >&2; exit 1; }; \
+            echo "mode=$_v" ;;
+          enable) shift; _v="${1:-1}"; \
+            uci_main && uci -q set "$UCI.main.enabled=$_v" && uci commit "$UCI" \
+              || { echo "uci set enabled 失败（/etc/config/$UCI 不可写？）" >&2; exit 1; }; \
+            echo "enabled=$_v" ;;
+          balance) shift; _v="${1:-0}"; \
+            uci_main && uci -q set "$UCI.main.balance=$_v" && uci commit "$UCI" \
+              || { echo "uci set balance 失败（/etc/config/$UCI 不可写？）" >&2; exit 1; }; \
+            echo "balance=$_v" ;;
+            sub-import) shift; sub_import "${1:-}" ;;
+            render) render ;;
+            start|stop|restart) /etc/init.d/singbox-lite "$1"; sleep 1; status_json ;;
+            nft-up) nft_up ;;
+            nft-down) nft_down ;;
+            version) /usr/bin/sing-box version 2>/dev/null | head -1 ;;
+            test)
+              _sp=$(sport)
+              _c=$(curl -s -o /dev/null -m 12 -w '%{http_code}' -x "socks5h://127.0.0.1:$_sp" https://www.gstatic.com/generate_204 2>/dev/null)
+              printf '{"socks_port":"%s","http_code":"%s","ok":%s}\n' "$_sp" "${_c:-000}" "$([ "${_c:-000}" = "204" ] && echo true || echo false)" ;;
+            *) echo "usage: $0 {status|nodes|node-set|node-del|node-enable|mode|enable|balance|sub-import|render|start|stop|restart|nft-up|nft-down|test|version}" >&2; exit 1 ;;
+          esac
+          XCTL_EOF
+
+          cat > files/usr/libexec/singbox-sub-clash.awk << 'XAWK_EOF'
+          # singbox-sub-clash.awk —— 解析 Clash / Clash.Meta 订阅的 proxies: 段
+          # 输出：每行一个节点，字段用 TAB 分隔的 k=v（字段名即 singbox-lite 的 uci 选项名）
+          # 末尾输出 __STAT__ 行（imported / unsupported / format）
+          # 只用 POSIX 字符类，避免 \t 之类的转义在不同 awk 实现上的差异
+          BEGIN {
+              TAB = sprintf("%c", 9)
+              inproxies = 0; started = 0; item_indent = -1
+              imported = 0; unsupported = 0
+              split("", key_at)
+          }
+          function trim(s) {
+              gsub(/^[[:space:]]+/, "", s)
+              gsub(/[[:space:]]+$/, "", s)
+              return s
+          }
+          function unq(s) {
+              # 以引号开头的值：引号内的 # 是内容，整体取到闭合引号为止
+              if (s ~ /^"/) { sub(/^"/, "", s); sub(/".*$/, "", s); return s }
+              if (s ~ /^'/) { sub(/^'/, "", s); sub(/'.*$/, "", s); return s }
+              # 裸值：YAML 规则「空白 + #」之后才是注释
+              sub(/[[:space:]]+#.*$/, "", s)
+              return trim(s)
+          }
+          function clean(s) {
+              s = unq(s)
+              gsub(/[[:cntrl:]]/, " ", s)      # 值里的 TAB/CR/LF 会拆坏 TAB 分隔的记录
+              return s
+          }
+          # 由 key_at[1..lvl-1] 拼出父路径
+          function parent(lvl,   i, p) {
+              p = ""
+              for (i = 1; i < lvl; i++) if (key_at[i] != "") p = (p == "" ? key_at[i] : p "." key_at[i])
+              return p
+          }
+          function flush(   t, sec, sni, fp, net, v, h) {
+              if (!started) return
+              started = 0
+              t = tolower(rec["type"])
+              if (t == "ss") t = "shadowsocks"
+              if (t == "hy2") t = "hysteria2"
+              if (t != "vless" && t != "vmess" && t != "trojan" && t != "shadowsocks" && t != "hysteria2") { unsupported++; delete rec; return }
+              if (rec["server"] == "" || rec["port"] == "") { unsupported++; delete rec; return }
+              imported++
+              v = "type=" t TAB "server=" clean(rec["server"]) TAB "port=" clean(rec["port"]) TAB "remark=" clean(rec["name"])
+              if (t == "shadowsocks")      v = v TAB "uuid=" clean(rec["password"]) TAB "method=" clean(rec["cipher"])
+              else if (t == "trojan")      v = v TAB "uuid=" clean(rec["password"])
+              else if (t == "hysteria2")   v = v TAB "uuid=" clean(rec["password"])
+              else {
+                  v = v TAB "uuid=" clean(rec["uuid"])
+                  if (rec["flow"] != "") v = v TAB "flow=" clean(rec["flow"])
+              }
+              sec = "none"
+              if (t == "hysteria2") sec = "tls"
+              else if (rec["reality-opts.public-key"] != "") sec = "reality"
+              else if (rec["tls"] == "true" || rec["security"] == "tls" || rec["security"] == "reality" ||
+                       rec["servername"] != "" || rec["sni"] != "") {
+                  sec = (rec["security"] == "reality") ? "reality" : "tls"
+              }
+              if (sec != "none") {
+                  sni = clean(rec["servername"]); if (sni == "") sni = clean(rec["sni"])
+                  fp  = clean(rec["client-fingerprint"]); if (fp == "") fp = "chrome"
+                  v = v TAB "security=" sec
+                  if (sni != "") v = v TAB "sni=" sni
+                  v = v TAB "fp=" fp
+                  if (sec == "reality") {
+                      v = v TAB "pbk=" clean(rec["reality-opts.public-key"])
+                      v = v TAB "sid=" clean(rec["reality-opts.short-id"])
+                  }
+              }
+              net = clean(rec["network"]); if (net == "") net = "tcp"
+              if (net == "h2" || net == "http") net = "grpc"
+              if (net != "tcp" && net != "ws" && net != "grpc") net = "tcp"
+              v = v TAB "network=" net
+              if (net == "ws") {
+                  if (rec["ws-opts.path"] != "") v = v TAB "path=" clean(rec["ws-opts.path"])
+                  h = clean(rec["ws-opts.headers.Host"])
+                  if (h == "") h = clean(rec["ws-opts.headers.host"])
+                  if (h != "") v = v TAB "host=" h
+              } else if (net == "grpc") {
+                  if (rec["grpc-opts.grpc-service-name"] != "") v = v TAB "path=" clean(rec["grpc-opts.grpc-service-name"])
+              }
+              # 证书校验开关对所有 TLS 协议都适用（不只 hysteria2）：自签证书/裸 IP 的 vless、trojan 很常见
+              if (rec["skip-cert-verify"] == "true") v = v TAB "insecure=1"
+              if (t == "hysteria2") {
+                  if (rec["ports"] != "") v = v TAB "ports=" clean(rec["ports"])
+                  else if (rec["port-range"] != "") v = v TAB "ports=" clean(rec["port-range"])
+              }
+              print v
+              delete rec
+          }
+          {
+              line = $0
+              sub(/\r$/, "", line)
+              if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) next
+
+              if (!inproxies) {
+                  if (line ~ /^proxies:[[:space:]]*$/) { inproxies = 1; item_indent = -1 }
+                  next
+              }
+              # proxies 段结束：回到顶格的其它键
+              if (line !~ /^[[:space:]]/ && line ~ /^[A-Za-z0-9_."'-]+[[:space:]]*:/) { flush(); inproxies = 0; next }
+
+              # 新记录：只有 proxies 直接子项那层缩进的 "- " 才算；alpn 之类的嵌套列表项跳过
+              if (line ~ /^[[:space:]]*-[[:space:]]+/) {
+                  match(line, /^[[:space:]]*/)
+                  if (item_indent < 0) item_indent = RLENGTH
+                  if (RLENGTH != item_indent) next
+                  flush()
+                  started = 1
+                  split("", key_at)
+                  sub(/^[[:space:]]*-[[:space:]]+/, "", line)
+                  if (line ~ /^[A-Za-z0-9_.-]+[[:space:]]*:/) {
+                      k = line; sub(/[[:space:]]*:.*/, "", k); k = unq(k)
+                      v = line; sub(/^[^:]*:[[:space:]]*/, "", v)
+                      if (v != "") rec[k] = v; else key_at[2] = k
+                  }
+                  next
+              }
+              if (!started) next
+
+              if (line ~ /^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*:/) {
+                  match(line, /^[[:space:]]*/); lvl = int(RLENGTH / 2)
+                  k = line; sub(/^[[:space:]]*/, "", k); sub(/[[:space:]]*:.*/, "", k); k = unq(k)
+                  v = line; sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "", v)
+                  p = parent(lvl)
+                  if (v != "") {
+                      rec[(p == "" ? k : p "." k)] = v
+                      for (i = lvl; i <= 12; i++) key_at[i] = ""
+                  } else {
+                      key_at[lvl] = k
+                      for (i = lvl + 1; i <= 12; i++) key_at[i] = ""
+                  }
+              }
+          }
+          END {
+              flush()
+              printf "__STAT__%cimported=%d%cunsupported=%d%cformat=clash\n", TAB, imported, TAB, unsupported, TAB
+          }
+          XAWK_EOF
+
+          cat > files/etc/init.d/singbox-lite << 'XINIT_EOF'
+          #!/bin/sh /etc/rc.common
+          # START=95：晚于 network(20)/firewall(21)，确保 br-lan 早就绪，nft 规则能挂上
+          START=95
+          STOP=10
+          USE_PROCD=1
+
+          start_service() {
+              [ "$(uci -q get singbox-lite.main.enabled)" = "1" ] || { logger -t singbox-lite "main.enabled != 1，跳过启动"; return 0; }
+              _r=$(/usr/libexec/singbox-ctl render 2>&1)
+              case "$_r" in
+                  OK*) : ;;
+                  *) logger -t singbox-lite "配置生成/校验失败：$_r"; echo "$_r" >&2; return 1 ;;
+              esac
+              /usr/libexec/singbox-ctl nft-up >/dev/null 2>&1
+              procd_open_instance
+              procd_set_param command /usr/bin/sing-box run -c /var/etc/singbox/config.json
+              # 配置文件变了 procd 会自己重启实例（面板改完点“保存并启用”也走这条路）
+              procd_set_param file /var/etc/singbox/config.json
+              procd_set_param respawn 3600 5 0
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+
+          stop_service() {
+              /usr/libexec/singbox-ctl nft-down >/dev/null 2>&1
+          }
+
+          reload_service() {
+              stop
+              sleep 1
+              start
+          }
+          XINIT_EOF
+
+          # LuCI 面板（照 mosdns-lite 的写法：纯 E() 渲染 + fs.exec 调后端）
+          cat > files/usr/share/luci/menu.d/luci-app-singbox-lite.json << 'XMENU_EOF'
+          {
+            "admin/services/singbox": {
+              "title": "sing-box",
+              "order": 61,
+              "action": {
+                "type": "view",
+                "path": "singbox/overview"
+              },
+              "depends": {
+                "acl": [
+                  "luci-app-singbox-lite"
+                ]
+              }
+            }
+          }
+          XMENU_EOF
+
+          cat > files/usr/share/rpcd/acl.d/luci-app-singbox-lite.json << 'XACL_EOF'
+          {
+            "luci-app-singbox-lite": {
+              "description": "singbox-lite 管理：状态、节点增删启停、模式切换、代理测试",
+              "read": {
+                "file": {
+                  "/usr/libexec/singbox-ctl": [ "exec" ],
+                  "/etc/config/singbox-lite": [ "read" ],
+                  "/etc/singbox-lite/version": [ "read" ],
+                  "/var/etc/singbox/config.json": [ "read" ]
+                }
+              },
+              "write": {
+                "file": {
+                  "/usr/libexec/singbox-ctl": [ "exec" ],
+                  "/etc/config/singbox-lite": [ "write" ]
+                }
+              }
+            }
+          }
+          XACL_EOF
+
+          cat > files/www/luci-static/resources/view/singbox/overview.js << 'XJS_EOF'
+          'use strict';
+          'require view';
+          'require fs';
+          'require ui';
+
+          var CTL = '/usr/libexec/singbox-ctl';
+
+          /* ---------- 样式（一次性注入；明暗自适应；不依赖 color-mix 等新特性） ---------- */
+          var CSS = [
+            '.sb{--c-bg:#ffffff;--c-soft:#f6f7f9;--c-line:#e5e7eb;--c-txt:#111827;--c-dim:#6b7280;',
+            '--c-acc:#2563eb;--c-acc2:#1d4ed8;--c-acc-soft:rgba(37,99,235,.10);--c-ok:#15803d;--c-ok-soft:rgba(21,128,61,.10);',
+            '--c-warn:#b45309;--c-bad:#b91c1c;--c-bad-soft:rgba(185,28,28,.10);--r:14px;',
+            'color:var(--c-txt);font-size:14px;max-width:1080px;margin:0 auto;line-height:1.5}',
+            '.dark .sb,.sb.dark{--c-bg:#15181d;--c-soft:#1c2027;--c-line:#2a2f38;--c-txt:#e8eaed;--c-dim:#9aa2ad;',
+            '--c-acc:#6ea8fe;--c-acc2:#8ab4f8;--c-acc-soft:rgba(110,168,254,.14);--c-ok:#4ade80;--c-ok-soft:rgba(74,222,128,.12);',
+            '--c-warn:#fbbf24;--c-bad:#f87171;--c-bad-soft:rgba(248,113,113,.14)}',
+            '@media(prefers-color-scheme:dark){.sb{color-scheme:dark;--c-bg:#15181d;--c-soft:#1c2027;--c-line:#2a2f38;--c-txt:#e8eaed;--c-dim:#9aa2ad;--c-acc:#6ea8fe;--c-acc2:#8ab4f8;--c-acc-soft:rgba(110,168,254,.14);--c-ok:#4ade80;--c-ok-soft:rgba(74,222,128,.12);--c-warn:#fbbf24;--c-bad:#f87171;--c-bad-soft:rgba(248,113,113,.14)}}',
+            '.sb *{box-sizing:border-box}',
+            '.sb h2,.sb h3,.sb h4{margin:0;font-weight:650;letter-spacing:-.01em}',
+            /* hero */
+            '.sb-hero{position:relative;overflow:hidden;border:1px solid var(--c-line);border-radius:18px;padding:20px 22px;margin:4px 0 16px;',
+            'background:linear-gradient(135deg,var(--c-acc-soft),transparent 55%),var(--c-bg)}',
+            '.sb-hero:after{content:"";position:absolute;inset:0 0 auto 0;height:3px;',
+            'background:linear-gradient(90deg,var(--c-acc),#22d3ee 60%,#a78bfa)}',
+            '.sb-hero .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+            '.sb-hero h2{font-size:21px}',
+            '.sb-hero .sub{color:var(--c-dim);font-size:12.5px;margin-top:6px}',
+            '.sb-hero .right{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}',
+            /* pills */
+            '.sb-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;',
+            'border:1px solid var(--c-line);background:var(--c-soft);color:var(--c-dim);white-space:nowrap}',
+            '.sb-pill.ok{color:var(--c-ok);background:var(--c-ok-soft);border-color:rgba(21,128,61,.25)}',
+            '.sb-pill.bad{color:var(--c-bad);background:var(--c-bad-soft);border-color:rgba(185,28,28,.25)}',
+            '.sb-pill.acc{color:var(--c-acc);background:var(--c-acc-soft);border-color:rgba(37,99,235,.25)}',
+            '.sb-pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto}',
+            '.sb-pill.ok .dot{box-shadow:0 0 0 3px var(--c-ok-soft)}',
+            '.sb-pill.bad .dot{box-shadow:0 0 0 3px var(--c-bad-soft)}',
+            /* stat cards */
+            '.sb-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px}',
+            '.sb-stat{position:relative;background:var(--c-bg);border:1px solid var(--c-line);border-radius:var(--r);padding:13px 15px;',
+            'transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}',
+            '.sb-stat:hover{transform:translateY(-2px);border-color:rgba(37,99,235,.35);box-shadow:0 10px 24px -18px rgba(17,24,39,.55)}',
+            '.sb-stat .k{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--c-dim)}',
+            '.sb-stat .v{margin-top:5px;font-size:17px;font-weight:680;font-variant-numeric:tabular-nums;',
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+            '.sb-stat .s{margin-top:2px;font-size:11.5px;color:var(--c-dim)}',
+            /* cards */
+            '.sb-card{background:var(--c-bg);border:1px solid var(--c-line);border-radius:var(--r);padding:16px 18px;margin-bottom:14px}',
+            '.sb-card>h3{font-size:14.5px;display:flex;align-items:center;gap:8px;margin-bottom:12px}',
+            '.sb-card>h3 .cnt{font-size:12px;font-weight:500;color:var(--c-dim)}',
+            '.sb-hint{color:var(--c-dim);font-size:12.5px;margin-bottom:10px}',
+            /* buttons */
+            '.sb-btn{appearance:none;border:1px solid var(--c-line);background:var(--c-bg);color:var(--c-txt);border-radius:10px;',
+            'padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s ease;white-space:nowrap}',
+            '.sb-btn:hover{border-color:rgba(37,99,235,.45);color:var(--c-acc);background:var(--c-acc-soft)}',
+            '.sb-btn:active{transform:scale(.98)}',
+            '.sb-btn.primary{background:var(--c-acc);border-color:var(--c-acc);color:#fff}',
+            '.sb-btn.primary:hover{background:var(--c-acc2);border-color:var(--c-acc2);color:#fff}',
+            '.sb-btn.danger{color:var(--c-bad);border-color:rgba(185,28,28,.3)}',
+            '.sb-btn.danger:hover{background:var(--c-bad-soft);color:var(--c-bad);border-color:rgba(185,28,28,.45)}',
+            '.sb-btn.sm{padding:5px 10px;font-size:12px;border-radius:8px}',
+            '.sb-btn.on{background:var(--c-acc-soft);border-color:rgba(37,99,235,.45);color:var(--c-acc)}',
+            /* inputs */
+            '.sb-in,.sb-sel{appearance:none;width:100%;border:1px solid var(--c-line);background:var(--c-bg);color:var(--c-txt);',
+            'border-radius:10px;padding:9px 12px;font-size:13px;transition:border-color .15s ease,box-shadow .15s ease}',
+            '.sb-sel{appearance:auto;line-height:1.4;padding:8px 8px 8px 10px}',
+            '.sb-in:focus,.sb-sel:focus{outline:none;border-color:var(--c-acc);box-shadow:0 0 0 3px var(--c-acc-soft)}',
+            '.sb-in::placeholder{color:var(--c-dim);opacity:.75}',
+            /* toolbar */
+            '.sb-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}',
+            '.sb-bar .sep{width:1px;height:22px;background:var(--c-line);margin:0 4px}',
+            '.sb-spacer{flex:1 1 auto}',
+            /* node list */
+            '.sb-nodes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}',
+            '.sb-node{display:flex;align-items:center;gap:10px 12px;padding:11px 13px;border:1px solid var(--c-line);border-radius:12px;flex-wrap:wrap;',
+            'background:var(--c-soft);transition:border-color .15s ease,background .15s ease}',
+            '.sb-node:hover{border-color:rgba(37,99,235,.35)}',
+            '.sb-node.on{background:linear-gradient(90deg,var(--c-ok-soft),transparent 60%),var(--c-soft);border-color:rgba(21,128,61,.35)}',
+            '.sb-node .grow{flex:1 1 auto;min-width:0}',
+            '.sb-node .nm{font-weight:640;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+            '.sb-node .meta{color:var(--c-dim);font-size:11.5px;font-variant-numeric:tabular-nums;margin-top:2px;',
+            'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+            '.sb-node .acts{display:flex;gap:6px;flex:0 0 auto;margin-left:auto}',
+            '.sb-tag{font-size:10.5px;font-weight:750;letter-spacing:.05em;padding:3px 7px;border-radius:6px;text-transform:uppercase;',
+            'border:1px solid;flex:0 0 auto}',
+            '.sb-tag.vless{color:#7c3aed;border-color:rgba(124,58,237,.4);background:rgba(124,58,237,.10)}',
+            '.sb-tag.vmess{color:#0284c7;border-color:rgba(2,132,199,.4);background:rgba(2,132,199,.10)}',
+            '.sb-tag.trojan{color:#ea580c;border-color:rgba(234,88,12,.4);background:rgba(234,88,12,.10)}',
+            '.sb-tag.shadowsocks{color:#059669;border-color:rgba(5,150,105,.4);background:rgba(5,150,105,.10)}',
+            '.sb-tag.hysteria2{color:#d946ef;border-color:rgba(217,70,239,.4);background:rgba(217,70,239,.10)}',
+            /* form grid */
+            '.sb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 12px}',
+            '.sb-grid label{display:block;font-size:11px;color:var(--c-dim);margin-bottom:4px;letter-spacing:.02em}',
+            /* details */
+            '.sb details>summary{cursor:pointer;list-style:none;font-size:14.5px;font-weight:650;display:flex;align-items:center;gap:8px}',
+            '.sb details>summary::-webkit-details-marker{display:none}',
+            '.sb details>summary:before{content:"\\25B8";color:var(--c-dim);display:inline-block;transition:transform .16s ease}',
+            '.sb details[open]>summary:before{transform:rotate(90deg)}',
+            '.sb-empty{padding:26px;text-align:center;color:var(--c-dim);font-size:13px;border:1px dashed var(--c-line);border-radius:12px}',
+            '.sb-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}',
+            '.sb-chip{font-size:11px;color:var(--c-dim);border:1px solid var(--c-line);border-radius:999px;padding:2px 9px;background:var(--c-soft)}',
+            '@media(max-width:620px){.sb-hero .right{width:100%;margin-left:0}',
+            '.sb-node .grow{flex:1 1 100%}.sb-node .acts{margin-left:0}.sb-node .nm,.sb-node .meta{white-space:normal}}',
+            '@media(min-width:340px) and (max-width:620px){.sb-stats{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}}'
+          ].join('\n');
+
+          function injectCss() {
+            var old = document.getElementById('sb-style');
+            if (old && old.parentNode) old.parentNode.removeChild(old);
+            document.head.appendChild(E('style', { 'id': 'sb-style' }, CSS));
+          }
+
+          function ctl(args) {
+            return fs.exec(CTL, args || []).then(function (r) {
+              return { code: r.code || 0, out: r.stdout || '', err: r.stderr || '' };
+            }).catch(function (e) { return { code: -1, out: '', err: String(e) }; });
+          }
+
+          function parseJson(res) { try { return JSON.parse(res.out); } catch (e) { return null; } }
+          function note(m, k) { ui.addNotification(null, E('p', {}, m), k || 'info'); }
+          function t(s) { return (s === undefined || s === null || s === '') ? '—' : String(s); }
+          function esc(s) { return String(s === undefined || s === null ? '' : s); }
+          function btn(label, cls, fn) {
+            return E('button', { 'class': 'sb-btn ' + (cls || ''), 'click': ui.createHandlerFn(this, fn) }, label);
+          }
+          function pill(cls, label) {
+            return E('span', { 'class': 'sb-pill ' + cls }, [E('span', { 'class': 'dot' }), label]);
+          }
+          function stat(k, v, sub) {
+            return E('div', { 'class': 'sb-stat' }, [
+              E('div', { 'class': 'k' }, k),
+              E('div', { 'class': 'v' }, esc(v)),
+              sub ? E('div', { 'class': 's' }, sub) : ''
+            ]);
+          }
+
+          return view.extend({
+            load: function () { return Promise.all([ctl(['status']), ctl(['nodes'])]); },
+
+            render: function (data) {
+              injectCss();
+              var self = this;
+              var st = parseJson(data[0]) || {};
+              var nodes = parseJson(data[1]) || [];
+              var on = (st.enabled === '1');
+              var run = !!st.running;
+              var bal = (st.balance === '1');
+              var MODES = { rule: '规则分流', global: '全局代理', direct: '全部直连' };
+              var modeTxt = MODES[st.mode] || t(st.mode);
+
+              /* doRestart=false：stop/restart 本身已经改变进程状态，否则「停止」会被随后的 restart 立刻拉起来 */
+              function run_(args, msg, doRestart) {
+                return ctl(args).then(function (r) {
+                  if (r.code !== 0) note('失败：' + (r.err || r.out), 'danger');
+                  else if (msg) note(msg, 'info');
+                  if (doRestart === false) return null;
+                  return ctl(['restart']);
+                }).then(function () { self.refresh(); });
+              }
+              function quick(args, msg) {
+                return ctl(args).then(function () { return ctl(['restart']); }).then(function () {
+                  if (msg) note(msg, 'info');
+                  self.refresh();
+                });
+              }
+
+              /* ---------- hero ---------- */
+              var hero = E('div', { 'class': 'sb-hero' }, [
+                E('div', { 'class': 'top' }, [
+                  E('h2', {}, 'sing-box'),
+                  pill(run ? 'ok' : 'bad', run ? '运行中' : '未运行'),
+                  E('span', { 'class': 'sb-pill' }, esc(st.version || '内核版本未知')),
+                  E('div', { 'class': 'right' }, [
+                    btn(on ? '停用' : '启用', on ? 'danger' : 'primary', function () {
+                      return ctl(['enable', on ? '0' : '1']).then(function () { return ctl(['restart']); }).then(function () {
+                        note(on ? '已停用 sing-box' : '已启用 sing-box');
+                        self.refresh();
+                      });
+                    }),
+                    btn('应用配置', '', function () { return run_(['restart'], '已重启生效', false); })
+                  ])
+                ]),
+                E('div', { 'class': 'sub' },
+                  modeTxt + ' · ' + (st.nodes || 0) + ' 个启用节点' +
+                  (bal ? ' · 负载均衡（leastPing）' : (st.active ? ' · 当前出口 ' + esc(st.active) : '')))
+              ]);
+
+              /* ---------- stats ---------- */
+              var stats = E('div', { 'class': 'sb-stats' }, [
+                stat('进程', run ? ('PID ' + esc(st.pid)) : 'stopped', run ? 'sing-box · procd' : '未启动'),
+                stat('出口', bal ? '负载均衡' : t(st.active), bal ? 'leastPing 自动选优' : '手动节点'),
+                stat('透明代理', st.nft === 'yes' ? '已下发' : '未下发', 'TPROXY · 仅 TCP（UDP 不代理）'),
+                stat('分流规则', (st.chnroute || 0) + ' / ' + (st.proxy_domains || 0) + ' / ' + (st.direct_domains || 0),
+                  'CIDR / 代理域名 / 直连域名')
+              ]);
+
+              /* ---------- toolbar ---------- */
+              var bar = E('div', { 'class': 'sb-card' }, [
+                E('h3', {}, '运行控制'),
+                E('div', { 'class': 'sb-bar' }, [
+                  btn('重启', '', function () { return run_(['restart'], '已重启', false); }),
+                  btn('停止', 'danger', function () { return run_(['stop'], '已停止', false); }),
+                  btn('测试代理', '', function () {
+                    note('正在通过 SOCKS 测试出口…');
+                    return ctl(['test']).then(function (r) {
+                      var r0 = parseJson(r) || {};
+                      note('代理测试：HTTP ' + (r0.http_code || '000') + (r0.ok ? ' · 连通' : ' · 不通') +
+                        '（SOCKS 端口 ' + t(r0.socks_port) + '）', r0.ok ? 'info' : 'danger');
+                    });
+                  }),
+                  E('div', { 'class': 'sep' }),
+                  E('span', { 'class': 'sb-hint', 'style': 'margin:0 2px' }, '模式'),
+                  E('select', {
+                    'class': 'sb-sel', 'style': 'width:auto;min-width:105px',
+                    'change': ui.createHandlerFn(this, function (ev) {
+                      return quick(['mode', ev.target.value], '已切换为' + (MODES[ev.target.value] || ev.target.value));
+                    })
+                  }, ['rule', 'global', 'direct'].map(function (m) {
+                    return E('option', { 'value': m, 'selected': (st.mode === m) ? '' : null }, MODES[m]);
+                  })),
+                  btn(bal ? '均衡 开' : '均衡 关', bal ? 'on' : '', function () {
+                    return quick(['balance', bal ? '0' : '1'], bal ? '已关闭负载均衡' : '已开启负载均衡');
+                  }),
+                ])
+              ]);
+
+              /* ---------- nodes ---------- */
+              var items = nodes.length ? nodes.map(function (n) {
+                var isOn = (n.enabled === '1');
+                var inUse = (st.active === n.name) && !bal;
+                var meta = esc(t(n.server)) + ':' + esc(t(n.port)) + ' · ' +
+                  esc(t(n.security)) + ' · ' + esc(t(n.network));
+                return E('li', { 'class': 'sb-node' + (isOn ? ' on' : '') }, [
+                  E('span', { 'class': 'sb-tag ' + esc(n.type) }, esc(n.type) || '?'),
+                  E('div', { 'class': 'grow' }, [
+                    E('div', { 'class': 'nm', 'title': esc(n.remark || n.name) }, esc(n.remark || n.name)),
+                    E('div', { 'class': 'meta', 'title': meta }, meta)
+                  ]),
+                  inUse ? pill('ok', '使用中') : '',
+                  !isOn ? pill('', '未启用') : '',
+                  E('div', { 'class': 'acts' }, [
+                    btn('启用', 'sm' + (isOn ? ' on' : ''), function () {
+                      return quick(['node-enable', n.name, '1'], '已切换到「' + esc(n.remark || n.name) + '」');
+                    }),
+                    btn('编辑', 'sm', function () { self.fillForm(n); }),
+                    btn('删除', 'sm danger', function () {
+                      if (!confirm('删除节点「' + (n.remark || n.name) + '」？删除后会重启 sing-box。')) return;
+                      return ctl(['node-del', n.name]).then(function () { return ctl(['restart']); }).then(function () { self.refresh(); });
+                    })
+                  ])
+                ]);
+              }) : [E('div', { 'class': 'sb-empty' }, '还没有节点：用下面的订阅导入，或手动添加一个。')];
+
+              var nodesCard = E('section', { 'class': 'sb-card' }, [
+                E('h3', {}, '节点', E('span', { 'class': 'cnt' }, nodes.length + ' 个 · 启用 ' + (st.nodes || 0))),
+                E('ul', { 'class': 'sb-nodes' }, items)
+              ]);
+
+              /* ---------- subscription ---------- */
+              var subCard = E('section', { 'class': 'sb-card' }, [
+                E('h3', {}, '订阅导入'),
+                E('div', { 'class': 'sb-hint' },
+                  '自动识别 4 种格式，导入后按顺序重建节点，支持 vless / vmess / trojan / shadowsocks（含 Reality、WS、gRPC）。'),
+                E('div', { 'class': 'sb-bar' }, [
+                  E('input', {
+                    'class': 'sb-in', 'type': 'text', 'style': 'flex:1 1 320px;min-width:220px',
+                    'id': 'sb-sub-url', 'placeholder': 'https://example.com/api/v1/client/subscribe?token=…',
+                    'value': esc(st.sub_url)
+                  }),
+                  btn('导入订阅', 'primary', function () {
+                    var el = document.getElementById('sb-sub-url');
+                    var u = el ? el.value.replace(/^\s+|\s+$/g, '') : '';
+                    if (!u) { note('请先填写订阅地址', 'danger'); return; }
+                    note('正在下载并解析订阅…');
+                    return ctl(['sub-import', u]).then(function (r) {
+                      var o = r.out || '';
+                      var m = /IMPORTED=(\d+)/.exec(o), s = /UNSUPPORTED=(\d+)/.exec(o),
+                        f = /FORMAT=(\w+)/.exec(o);
+                      if (r.code === 0 && m) {
+                        note('导入完成：' + m[1] + ' 个节点 · 格式 ' + (f ? f[1] : '?') +
+                          (s && s[1] !== '0' ? ' · 跳过 ' + s[1] + ' 个不支持的协议' : ''), 'info');
+                        return ctl(['restart']).then(function () { self.refresh(); });
+                      }
+                      note('导入失败：' + (o || r.err || '未知原因').replace(/\s+/g, ' '), 'danger');
+                    });
+                  })
+                ]),
+                E('div', { 'class': 'sb-chips' }, [
+                  E('span', { 'class': 'sb-chip' }, 'v2ray · base64 / 明文 URI'),
+                  E('span', { 'class': 'sb-chip' }, 'Clash · Clash.Meta YAML'),
+                  E('span', { 'class': 'sb-chip' }, 'sing-box / Xray JSON'),
+                  E('span', { 'class': 'sb-chip' }, '纯 URI 列表')
+                ])
+              ]);
+
+              /* ---------- editor ---------- */
+              var formCard = E('details', { 'class': 'sb-card', 'open': nodes.length ? null : '' }, [
+                E('summary', {}, '添加 / 编辑节点'),
+                E('div', { 'class': 'sb-grid', 'style': 'margin-top:12px' }, [
+                  this.field('name', '标识（英文、唯一）'),
+                  this.field('remark', '备注 / 显示名'),
+                  this.select('type', '协议类型', ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2']),
+                  this.field('server', '服务器地址'),
+                  this.field('port', '端口'),
+                  this.field('uuid', 'UUID / 密码'),
+                  this.field('method', 'SS 加密方式'),
+                  this.select('security', '传输加密', ['none', 'tls', 'reality']),
+                  this.field('sni', 'SNI / serverName'),
+                  this.field('fp', 'uTLS 指纹'),
+                  this.field('pbk', 'Reality 公钥 (pbk)'),
+                  this.field('sid', 'Reality 短 ID (sid)'),
+                  this.select('network', '传输层', ['tcp', 'ws', 'grpc']),
+                  this.field('path', '路径 / serviceName'),
+                  this.field('host', 'WS Host'),
+                  this.field('flow', 'VLESS flow'),
+                  this.field('ports', '端口跳跃 (hysteria2, 如 20000-30000)'),
+                  this.select('insecure', '跳过证书校验 (hysteria2)', ['', '1'])
+                ]),
+                E('div', { 'class': 'sb-bar', 'style': 'margin-top:12px' }, [
+                  btn('保存并启用', 'primary', function () {
+                    var f = self.form || {};
+                    var n = f.name ? f.name.value.replace(/^\s+|\s+$/g, '') : '';
+                    if (!n) { note('标识不能为空', 'danger'); return; }
+                    // 端口直接拼进 config.json 的数字位，非数字会让整份配置非法
+                    var _pv = f.port ? f.port.value.replace(/^\s+|\s+$/g, '') : '';
+                    if (_pv && !/^[0-9]+$/.test(_pv)) { note('端口必须是纯数字（1-65535）', 'danger'); return; }
+                    if (_pv && (+_pv < 1 || +_pv > 65535)) { note('端口必须在 1-65535 之间', 'danger'); return; }
+                    var args = ['node-set', n];
+                    // insecure 单独处理：它是 0/1 开关，从 1 改回空时必须显式提交 0，
+                    // 否则"只提交非空值"的规则会让旧值 1 永远留在 uci 里
+                    ['remark', 'type', 'server', 'port', 'uuid', 'method', 'security', 'sni', 'fp', 'pbk', 'sid', 'network', 'path', 'host', 'flow', 'ports']
+                      .forEach(function (k) {
+                        if (f[k] && f[k].value !== '') args.push(k + '=' + f[k].value.replace(/^\s+|\s+$/g, ''));
+                      });
+                    args.push('insecure=' + (f.insecure && f.insecure.value === '1' ? '1' : '0'));
+                    args.push('enabled=1');
+                    return ctl(args).then(function (r) {
+                      if (r.code !== 0) { note('保存失败：' + (r.err || r.out), 'danger'); return null; }
+                      return ctl(['node-enable', n, '1']);
+                    }).then(function () { return ctl(['restart']); })
+                      .then(function () { note('已保存并启用'); self.refresh(); });
+                  }),
+                  btn('清空表单', '', function () {
+                    var f = self.form || {};
+                    Object.keys(f).forEach(function (k) { if (f[k]) f[k].value = ''; });
+                  })
+                ])
+              ]);
+
+              /* 本页所有操作即时生效，LuCI 自动加的「保存/重置」页脚没有意义，隐藏掉 */
+              requestAnimationFrame(function () {
+                var a = document.querySelector('.cbi-page-actions');
+                if (a) a.style.display = 'none';
+              });
+
+              return E('div', { 'class': 'xl' }, [hero, stats, bar, nodesCard, subCard, formCard]);
+            },
+
+            field: function (name, label) {
+              if (!this.form) this.form = {};
+              var el = E('input', { 'class': 'sb-in', 'type': 'text', 'placeholder': label });
+              this.form[name] = el;
+              return E('div', {}, [E('label', {}, label), el]);
+            },
+
+            select: function (name, label, opts) {
+              if (!this.form) this.form = {};
+              var el = E('select', { 'class': 'sb-sel' }, opts.map(function (o) {
+                return E('option', { 'value': o }, o);
+              }));
+              this.form[name] = el;
+              return E('div', {}, [E('label', {}, label), el]);
+            },
+
+            fillForm: function (n) {
+              var f = this.form || {};
+              ['name', 'remark', 'type', 'server', 'port', 'security', 'network', 'sni', 'fp', 'path', 'host', 'method', 'flow', 'ports', 'insecure', 'pbk', 'sid']
+                .forEach(function (k) { if (f[k]) f[k].value = n[k] || ''; });
+              var det = document.querySelector('.sb details');
+              if (det) det.setAttribute('open', '');
+              note('已填入「' + (n.remark || n.name) + '」的可回填字段；密钥类字段出于安全不回填。');
+            },
+
+            refresh: function () { window.location.reload(); }
+          });
+          XJS_EOF
+
+          # ---- sing-box 内核：优先用官方 Go 交叉编译最新版，失败自动回退 OpenWrt tiny ----
+          # 结论修正（2026-11-23 实机验证）：
+          #   · 官方 release 的 linux-mipsle 是 **hardfloat**，而本机 OpenWrt 用 **softfloat**
+          #     → 直接 Illegal instruction。这是 ABI 不匹配，不是"CPU 不支持"。
+          #   · 用官方 Go 交叉编译并显式 GOMIPS=softfloat，编出的 42.7MB 二进制能正常跑：
+          #     实测 version / check（1.12 生成的配置直接兼容）/ TCP 代理出网 全部 OK。
+          #   · 体积代价实测（xz -9 ≈ squashfs）：1.14.4 raw 41728KB → 7954KB；tiny 1.12.22 raw
+          #     31145KB → 6162KB —— 只差 1.8MB（此前按 gzip 比例估成"多 3MB"，是高估）。
+          #     参照：25.12 实机镜像 squashfs 24.8MB/可用约 29MB，删掉 xray-core(33.5MB raw)
+          #     换 sing-box(42.7MB raw) 净多约 1.3MB，余量约 3MB，装得下。
+          #   · 构建多 5-8 分钟（下 Go + 依赖 + 编译）；任何一步失败都会回退 tiny。
+          # ★ UDP 走 tproxy 不通与版本无关（1.12 与 1.14 都是 origdst 丢地址 → 目标变成 LAN IP），
+          #   要代理 UDP 只能用 TUN 模式，别把锅算到版本头上。
+          mkdir -p files/usr/bin files/etc/singbox-lite files/etc/singbox
+          SB_VER="v1.14.4"
+          GO_VER="1.26.11"
+          SB_TAGS="with_quic,with_utls"     # hysteria2/tuic 要 with_quic；Reality 要 with_utls
+          _sok=0
+          # ---- 路线 A：官方 Go 交叉编译（mipsle/softfloat，CGO 关掉=纯静态，不依赖 musl）----
+          if curl -fsSL -m 600 "https://mirrors.ustc.edu.cn/golang/go${GO_VER}.linux-amd64.tar.gz" -o /tmp/go.tgz 2>/dev/null; then
+            rm -rf /tmp/gotk && mkdir -p /tmp/gotk
+            if tar -xzf /tmp/go.tgz -C /tmp/gotk --strip-components=1 2>/dev/null; then
+              if ( export PATH=/tmp/gotk/bin:$PATH GOPATH=/tmp/gopath \
+                        GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct \
+                        GOSUMDB=off GOTOOLCHAIN=local \
+                        GOOS=linux GOARCH=mipsle GOMIPS=softfloat CGO_ENABLED=0
+                   go install -trimpath -tags "$SB_TAGS" \
+                     -ldflags "-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=$SB_VER" \
+                     "github.com/sagernet/sing-box/cmd/sing-box@$SB_VER" ); then
+                _cand=/tmp/gopath/bin/linux_mipsle/sing-box
+                if [ -s "$_cand" ] && [ "$(wc -c < "$_cand")" -le 45000000 ]; then
+                  cp -f "$_cand" files/usr/bin/sing-box
+                  echo "sing-box $SB_VER (self-compiled go$GO_VER, mipsle softfloat)" > files/etc/singbox-lite/version
+                  _sok=1
+                  echo "  ✓ sing-box $SB_VER 自编译成功 ← go$GO_VER ($(wc -c < files/usr/bin/sing-box) 字节)"
+                else
+                  echo "::warning::自编译产物缺失或超过 45MB，回退 tiny"
+                fi
+              else
+                echo "::warning::go install 失败（源码/依赖下载问题），回退 tiny"
+              fi
+            fi
+          else
+            echo "::warning::Go $GO_VER 下载失败，回退 tiny"
+          fi
+          # ---- 路线 B：回退 OpenWrt 24.10 的 sing-box-tiny 1.12.22（31.9MB，已验证可跑）----
+          if [ "$_sok" = "0" ]; then
+            SB_PKG="sing-box-tiny_1.12.22-r1_mipsel_24kc.ipk"
+            rm -f /tmp/sb.ipk
+            _pkgok=0
+            for _u in "https://downloads.openwrt.org/releases/24.10.4/packages/mipsel_24kc/packages" \
+                      "https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/24.10.4/packages/mipsel_24kc/packages" \
+                      "https://mirrors.ustc.edu.cn/openwrt/releases/24.10.4/packages/mipsel_24kc/packages"; do
+              if curl -fsSL -m 300 "$_u/$SB_PKG" -o /tmp/sb.ipk 2>/dev/null; then
+                _pkgok=1; echo "  ✓ sing-box 包 ← $_u"; break
+              fi
+            done
+            [ "$_pkgok" = "1" ] || { echo "::error::sing-box 内核下载失败（自编译与 tiny 都失败）"; exit 1; }
+            rm -rf /tmp/sbx && mkdir -p /tmp/sbx
+            if tar -xzf /tmp/sb.ipk -C /tmp/sbx 2>/dev/null && [ -f /tmp/sbx/data.tar.gz ]; then
+              tar -xzf /tmp/sbx/data.tar.gz -C /tmp/sbx
+            elif ar x /tmp/sb.ipk --output=/tmp/sbx 2>/dev/null || (cd /tmp/sbx && ar x /tmp/sb.ipk 2>/dev/null); then
+              tar -xzf /tmp/sbx/data.tar.gz -C /tmp/sbx
+            fi
+            [ -s /tmp/sbx/usr/bin/sing-box ] || { echo "::error::sing-box 二进制解包失败"; exit 1; }
+            cp -f /tmp/sbx/usr/bin/sing-box files/usr/bin/sing-box
+            echo "sing-box 1.12.22 (openwrt tiny)" > files/etc/singbox-lite/version
+            echo "  ✓ sing-box 1.12.22 tiny ($(wc -c < files/usr/bin/sing-box) 字节)"
+          fi
+          chmod +x files/usr/bin/sing-box
+          # 记录编译特性：with_quic 缺失则 hysteria2 用不了
+          strings files/usr/bin/sing-box 2>/dev/null | grep -m1 'with_quic' >/dev/null \
+            && echo "  ✓ with_quic 在（hysteria2/tuic 可用）" \
+            || echo "::warning::这个 sing-box 可能不含 with_quic，hysteria2 会不可用"
+
+          # ---- 国内 CIDR（rule 模式"国内直连"用；不依赖 geoip.dat）----
+          _cok=0
+          for _u in "https://ispip.clang.cn/all_cn.txt" \
+                    "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt" \
+                    "https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt"; do
+            if curl -fsSL -m 90 "$_u" -o /tmp/chn.txt 2>/dev/null && [ "$(wc -l < /tmp/chn.txt)" -gt 1000 ]; then
+              grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' /tmp/chn.txt | tr -d ' \r' | sort -u > files/etc/singbox/chnroute.txt
+              [ "$(wc -l < files/etc/singbox/chnroute.txt)" -gt 1000 ] && { _cok=1; echo "  ✓ chnroute $(wc -l < files/etc/singbox/chnroute.txt) 条 ← $_u"; break; }
+            fi
+          done
+          [ "$_cok" = "1" ] || echo "::warning::chnroute 下载失败：rule 模式会退化成全局代理（功能仍可用）"
+
+          # ---- 域名分流名单（不依赖 geosite/geoip）----
+          # gfwlist → proxy-domains.txt（rule 模式下命中即走代理）
+          _pok=0
+          for _gu in "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt" \
+                     "https://cdn.jsdelivr.net/gh/gfwlist/gfwlist@master/gfwlist.txt"; do
+            if curl -fsSL -m 90 "$_gu" -o /tmp/gfw.txt 2>/dev/null && [ -s /tmp/gfw.txt ]; then
+              base64 -d /tmp/gfw.txt 2>/dev/null > /tmp/gfw.d || cp /tmp/gfw.txt /tmp/gfw.d
+              grep -oE '\|\|[a-zA-Z0-9._-]+' /tmp/gfw.d | sed 's/^||//' | tr 'A-Z' 'a-z' | sort -u > files/etc/singbox/proxy-domains.txt
+              if [ "$(wc -l < files/etc/singbox/proxy-domains.txt)" -gt 500 ]; then
+                _pok=1; echo "  ✓ proxy-domains $(wc -l < files/etc/singbox/proxy-domains.txt) 条 ← $_gu"; break
+              fi
+            fi
+          done
+          [ "$_pok" = "1" ] || echo "::warning::gfwlist 下载失败：域名分流不可用（仍可按 IP 分流）"
+
+          # 强制直连名单（避免 CDN/支付/银行被代理绕路）
+          cat > files/etc/singbox/direct-domains.txt << 'DDOM_EOF'
+          # 每行一个域名（子域自动命中）；# 开头是注释
+          qq.com
+          weixin.qq.com
+          tencent.com
+          taobao.com
+          tmall.com
+          alipay.com
+          aliyun.com
+          aliyuncs.com
+          jd.com
+          baidu.com
+          bilibili.com
+          iqiyi.com
+          youku.com
+          meituan.com
+          pinduoduo.com
+          didiglobal.com
+          12306.cn
+          gov.cn
+          DDOM_EOF
+          echo "  ✓ direct-domains $(grep -vc '^#' files/etc/singbox/direct-domains.txt | tr -d ' ') 条"
           cat > files/etc/hotplug.d/net/20-usbwan << 'EOF'
           #!/bin/sh
           [ -n "$INTERFACE" ] || exit 0
@@ -1641,7 +3221,7 @@ jobs:
               _k=$(printf '%s' "$_k" | tr -d ' \t')
               _v=$(printf '%s' "$_v" | sed 's/^[ \t]*//; s/[ \t]*$//')
               [ -n "$_k" ] || continue
-              if sysctl -q -w "${_k}=${_v}" 2>/dev/null; then
+              if sysctl -w "${_k}=${_v}" >/dev/null 2>&1; then
                   _ok=$((_ok + 1))
               else
                   _bad=$((_bad + 1))
@@ -1654,9 +3234,9 @@ jobs:
           EOF
 
           cat > files/etc/crontabs/root << 'EOF'
-          # 本固件不自动升级、不自动下载固件与规则包：分流规则随 PassWall 包发布，
-          # 广告清单在构建期写进镜像；PassWall 自己的规则/订阅定时任务默认也不启用
-          # （tasks.sh 只在 uci 里配了 update_week_mode 时才动作，出厂没有该选项）。
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          # 本固件不自动升级、不自动下载固件与规则包：分流名单（chnroute / proxy-domains）与
+          # 广告清单都在构建期写进镜像，运行期没有任何"订阅 / 规则"定时拉取任务。
           # 下面七条全是纯本地动作，一个字节都不出网：
           # （原来还有一条"每天 04:00 drop_caches"，2026-11-16 删掉：页缓存丢了下一次读盘
           #   立刻又长回来，定时清只会让第二天首次访问变慢；真缺内存时 memguard 会处理）
@@ -1822,31 +3402,31 @@ jobs:
           EOF
 
           # ---------- H. 规则手动刷新工具（固件不会自动调用它）----------
-          # PassWall 自带 /usr/share/passwall/rules/{gfwlist,chnroute}（随包发布，约 130KB），
-          # 运行时不联网更新；这个工具是「想刷才刷」，默认没有任何 cron 会碰它。
-          # 它只写 proxy_host 这一份清单：PassWall 的 helper_dnsmasq.lua / helper_chinadns_add.lua
-          # 只读 /usr/share/passwall/rules/ 下的文件，全仓库没有一处读 /etc/passwall/rules；
-          # 根文件系统是 overlayfs，写 /usr/share 会 copy-up 到 overlay，不动 squashfs 本体。
+          # 手动刷新「走代理的域名」清单：写 /etc/singbox/proxy-domains.txt 并重启 sing-box。
+          # 运行时不联网更新，这个工具是「想刷才刷」，默认没有任何 cron 会碰它。
+          # 根文件系统是 overlayfs，写 /etc/singbox 会 copy-up 到 overlay，不动 squashfs 本体。
           # 下载或重启失败自动回滚。
           cat > files/usr/bin/rule-refresh << 'EOF'
           #!/bin/sh
-          # 注意：本脚本会联网下载，只在手动执行时才会跑；固件不会自动调用它。
+          # 手动刷新"走代理的域名"清单：写 /etc/singbox/proxy-domains.txt 并重启 sing-box。
+          # 只在手动执行时跑，固件不会自动调用它（不联网自更新）。
           LOG=/var/log/rule-refresh.log
-          RULES=/usr/share/passwall/rules
-          TARGET=$RULES/proxy_host
+          TARGET=/etc/singbox/proxy-domains.txt
           TMP=/tmp/rules.$$
           log() { echo "$(date '+%F %T') $*" >> "$LOG"; logger -t rule-refresh "$*"; }
-          
-          [ -d /usr/share/passwall/rules ] || { log "跳过：没有安装 PassWall"; exit 0; }
+
+          [ -d /etc/singbox ] || { log "跳过：没有 /etc/singbox"; exit 0; }
           mkdir -p "$TMP" || exit 1
-          
+          # 中断/超时也要清掉下载残留（tmpfs 是 RAM，反复中断会一直占着）
+          trap 'rm -rf "$TMP"' EXIT INT TERM
+
           # 空间预检：清单约 200KB，留 2MB 余量，不够就安静跳过
           FREE=$(df -Pk /overlay 2>/dev/null | awk 'NR==2{print int($4/1024)}')
           if [ -n "$FREE" ] && [ "$FREE" -lt 2 ]; then
               log "跳过：overlay 仅剩 ${FREE}MB"
               rm -rf "$TMP"; exit 0
           fi
-          
+
           fetch() {
               _url="$1"; _out="$2"; _min="${3:-1000}"
               if command -v curl >/dev/null 2>&1; then
@@ -1863,14 +3443,15 @@ jobs:
               [ "$_n" -ge "$_min" ] || { log "失败：$_out 行数异常($_n)"; return 1; }
               log "完成：$_out 下载($_n 行)"
           }
-          
-          # gfw.txt：纯域名清单，和 PassWall 自带 gfwlist 是同一份数据
+
+          # gfw.txt：纯域名清单（Loyalsoldier 维护，和机场用的 gfwlist 同源）
           fetch "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/gfw.txt" gfw.raw 1000 \
+              || fetch "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt" gfw.raw 1000 \
               || { rm -rf "$TMP"; exit 0; }
           if grep -qE '^(domain|full|regexp|keyword|include):' "$TMP/gfw.raw"; then
               log "失败：gfw.txt 是 v2ray 规则格式，不能直接当域名清单"; rm -rf "$TMP"; exit 0
           fi
-          
+
           # 归一化：去注释与空行、去掉 *./. /http:// 前缀、只留合法域名、转小写、去重
           tr -d '\r' < "$TMP/gfw.raw" | awk '{
                 gsub(/^[ \t]+/, ""); gsub(/[ \t]+$/, "")
@@ -1878,21 +3459,32 @@ jobs:
                 sub(/^\*\./, ""); sub(/^\./, "")
                 sub(/^https?:\/\/[^\/]*/, ""); sub(/\/.*$/, "")
                 if ($0 ~ /^[A-Za-z0-9._-]+$/ && index($0, ".") > 0) print tolower($0)
-              }' | sort -u > "$TMP/proxy_host.new"
-          _n=$(wc -l < "$TMP/proxy_host.new" | tr -d ' ')
+              }' | sort -u > "$TMP/domains.new"
+          _n=$(wc -l < "$TMP/domains.new" | tr -d ' ')
           [ -n "$_n" ] || _n=0
           [ "$_n" -ge 1000 ] || { log "失败：清洗后只剩 $_n 条，保持原规则"; rm -rf "$TMP"; exit 0; }
-          
-          cp -f "$TARGET" "$TMP/proxy_host.bak" 2>/dev/null || true
-          mv -f "$TMP/proxy_host.new" "$TARGET"
-          
-          # 让规则生效：PassWall 启动时会把 proxy_host 并进它的域名表
-          if /etc/init.d/passwall restart >/dev/null 2>&1; then
-              log "生效：用户级代理域名 $_n 条 → $TARGET"
+
+          cp -f "$TARGET" "$TMP/domains.bak" 2>/dev/null || true
+          mv -f "$TMP/domains.new" "$TARGET"
+
+          # 让新规则生效：重新生成配置并重启（未启用时只重生成，不动进程）
+          if [ "$(uci -q get singbox-lite.main.enabled)" = "1" ]; then
+              if /etc/init.d/singbox-lite restart >/dev/null 2>&1; then
+                  log "生效：代理域名 $_n 条 → $TARGET（sing-box 已重启）"
+                  # MosDNS 的 domain_set 是启动时一次性读入的，而且读的是 /tmp/mosdns 那份：
+                  # 不同步 + 不重启，刷新的墙外域名仍按"国内"解析（拿到投毒 IP），等于白刷。
+                  if cp -f "$TARGET" /tmp/mosdns/proxy-domains.txt 2>/dev/null; then
+                      /etc/init.d/mosdns restart >/dev/null 2>&1
+                      log "MosDNS 已同步新清单并重启"
+                  fi
+              else
+                  log "回滚：sing-box 重启失败，恢复旧清单"
+                  if [ -f "$TMP/domains.bak" ]; then cp -f "$TMP/domains.bak" "$TARGET"; else rm -f "$TARGET"; fi
+                  /etc/init.d/singbox-lite restart >/dev/null 2>&1
+              fi
           else
-              log "回滚：PassWall 重启失败，恢复旧清单"
-              if [ -f "$TMP/proxy_host.bak" ]; then cp -f "$TMP/proxy_host.bak" "$TARGET"; else rm -f "$TARGET"; fi
-              /etc/init.d/passwall restart >/dev/null 2>&1
+              /usr/libexec/singbox-ctl render >/dev/null 2>&1 || true
+              log "已更新：代理域名 $_n 条 → $TARGET（代理未启用，只重生成配置）"
           fi
           rm -rf "$TMP"
           exit 0
@@ -1909,51 +3501,12 @@ jobs:
           t()  { d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else ng "$d"; fi; }
 
           echo "===== Newifi-D2 固件自检 ====="
-          t "xray 可执行"        xray version
+          t "sing-box 可执行"    sing-box version
           t "dnsmasq 运行中"     pidof dnsmasq
           t "DNS 解析正常"       nslookup www.baidu.com 127.0.0.1
           t "NAT 转发开启"       test -e /proc/sys/net/ipv4/ip_forward
 
           [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ok "ip_forward=1" || ng "ip_forward≠1"
-          # PassWall：只看配置里的硬证据。没配节点时 xray 本来就不启动，
-          # 所以不拿 pidof 当失败判据（否则开箱必报红）。
-          [ -f /usr/share/passwall/app.sh ] && ok "PassWall 主程序已装（app.sh）" \
-            || ng "缺 app.sh：LuCI 能点，但分流逻辑不在"
-          [ "$(uci -q get passwall.@global[0].enabled)" = "1" ] && ok "PassWall 已启用（enabled=1）" \
-            || ng "PassWall 未启用（/etc/config/passwall）"
-          [ "$(uci -q get passwall.@global[0].tcp_proxy_mode)" = "proxy" ] && ok "TCP 代理模式=proxy（绕过大陆）" \
-            || ng "TCP 代理模式不是 proxy（分流不会按预期走）"
-          [ "$(uci -q get passwall.@global[0].udp_proxy_mode)" = "disable" ] && ok "UDP 不代理（udp_proxy_mode=disable）" \
-            || ng "UDP 代理没关（QUIC/UDP 容易出回环）"
-          # dns_redirect=1 会让 PassWall 抢 53 并绕开 MosDNS，去广告随即失效——这条必须查
-          [ "$(uci -q get passwall.@global[0].dns_redirect)" = "0" ] && ok "PassWall 不抢 53（dns_redirect=0，DNS 仍归 MosDNS）" \
-            || ng "dns_redirect≠0：PassWall 会劫持 53，绕开 MosDNS"
-          [ "$(uci -q get passwall.@global[0].use_block_list)" = "0" ] && ok "PassWall 屏蔽列表已关（去广告由 MosDNS 负责）" \
-            || ng "use_block_list=1：会和 MosDNS 抢同一件事"
-          # DNS 分流：dns_shunt=chinadns-ng 时被代理域名走 chinadns-ng（→ 隧道），
-          # 它不在就没法给被墙域名拿到干净 IP，表现是「能连、解析到假地址」。
-          if command -v chinadns-ng >/dev/null 2>&1; then ok "chinadns-ng 已装"; else ng "缺 chinadns-ng（DNS 分流失效）"; fi
-          [ "$(uci -q get passwall.@global[0].dns_shunt)" = "chinadns-ng" ] && ok "DNS 分流=chinadns-ng" \
-            || ng "dns_shunt 不是 chinadns-ng（被墙域名可能解析到污染地址）"
-          # 可信 DNS 的加密通道：这个 PassWall 版本的 dns_mode 只认 dns2socks/sing-box/xray/udp/tcp，
-          # 没有 doh 分支。真正的 DoH 是 xray + v2ray_dns_mode=tcp+doh（查询经节点 socks 出去）。
-          _dm=$(uci -q get passwall.@global[0].dns_mode)
-          _vdm=$(uci -q get passwall.@global[0].v2ray_dns_mode)
-          _doh=$(uci -q get passwall.@global[0].remote_dns_doh)
-          if [ "$_dm" = "xray" ] && [ "$_vdm" = "tcp+doh" ]; then
-            ok "可信 DNS 走 DoH（xray + tcp+doh，地址 ${_doh:-未设}）"
-          elif [ "$_dm" = "tcp" ]; then
-            printf '  · 可信 DNS 是明文 tcp://%s（想加密：dns_mode=xray + v2ray_dns_mode=tcp+doh）\n' "$(uci -q get passwall.@global[0].remote_dns)"
-          else
-            printf '  · 可信 DNS 模式 dns_mode=%s / v2ray_dns_mode=%s\n' "${_dm:-?}" "${_vdm:-?}"
-          fi
-          if nft list table inet passwall >/dev/null 2>&1; then
-            ok "nft 规则表已装载（table inet passwall）"
-          else
-            printf '  · nft 表 inet passwall 未装载（没配节点时正常；配了节点仍无则看 logread -e passwall）\n'
-          fi
-          _nc=$(uci -q show passwall 2>/dev/null | grep -c "=node$")
-          printf '  ·· 代理节点 %s 个（0 个时全部流量直连，属正常）\n' "${_nc:-0}"
           t "MosDNS 运行中"       pidof mosdns
           # 5335 = 0x14D7：直接读 /proc/net/udp{,6}，不依赖 busybox 是否编了 netstat
           _p5335=0
@@ -1970,20 +3523,7 @@ jobs:
           [ "$AD_N" -ge 50000 ] && ok "广告域名 $AD_N 条" || ng "广告域名清单异常（$AD_N 条）"
           [ -x /usr/libexec/mosdns-ctl ] && ok "MosDNS 管理脚本已装（LuCI 页面同一入口）" || ng "mosdns-ctl 缺失"
           [ -f /www/luci-static/resources/view/mosdns/overview.js ] && ok "MosDNS 管理页面已装" || ng "MosDNS 管理页面缺失"
-          # 规则文件必须齐：gfwlist / chnroute 随 luci-app-passwall 发布，运行时不自动更新
-          for _f in gfwlist chnroute; do
-              if [ -s "/usr/share/passwall/rules/$_f" ]; then ok "规则 $_f 已内置"; else ng "规则 $_f 缺失（分流会失效）"; fi
-          done
-          _gfn=$(wc -l < /usr/share/passwall/rules/gfwlist 2>/dev/null | tr -d " ")
-          [ -n "$_gfn" ] || _gfn=0
-          [ "$_gfn" -ge 3000 ] && ok "代理域名(gfwlist) $_gfn 条" || ng "gfwlist 条数异常（$_gfn 条）"
-          _cnn=$(wc -l < /usr/share/passwall/rules/chnroute 2>/dev/null | tr -d " ")
-          [ -n "$_cnn" ] || _cnn=0
-          [ "$_cnn" -ge 3000 ] && ok "国内 IP 段(chnroute) $_cnn 条" || ng "chnroute 条数异常（$_cnn 条）"
-          _phn=$(wc -l < /usr/share/passwall/rules/proxy_host 2>/dev/null | tr -d " ")
-          [ -n "$_phn" ] || _phn=0
-          [ "$_phn" -ge 1000 ] && ok "代理域名(proxy_host) $_phn 条" || ng "proxy_host 只有 $_phn 条（覆盖层没盖过包内那份）"
-          if grep -qE "rule_update|subscribe\.lua|singbox-ctl sub-auto" /etc/crontabs/root 2>/dev/null; then
+          if grep -qE "rule_update|subscribe\.lua|singbox-ctl[[:space:]]+sub-import|rule-refresh" /etc/crontabs/root 2>/dev/null; then
               ng "crontab 里仍有自动下载任务"
           else
               ok "无自动下载任务"
@@ -2024,6 +3564,69 @@ jobs:
           [ "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)" = "32768" ] && ok "conntrack=32768" || ng "conntrack 未调优"
           # 没插 U 盘是正常状态（固件里 ksmbd 由 usb-service 按需起），不该拉低信噪比
 
+          # ---------- LuCI 监听（首刷踩过：LAN IP 是 CIDR 时 uhttpd 绑不上，80 全关）----------
+          if netstat -lnt 2>/dev/null | grep -qE ':80[[:space:]]'; then
+              ok "LuCI 正在监听 :80（listen_http=$(uci -q get uhttpd.main.listen_http)）"
+          else
+              ng "uhttpd 没监听 80：listen_http 必须是 裸IP:80，不能带 /24（改完 /etc/init.d/uhttpd restart）"
+          fi
+
+          # ---------- 透明代理（自研 singbox-lite）----------
+          if [ -x /usr/libexec/singbox-ctl ]; then
+              _xs=$(/usr/libexec/singbox-ctl status 2>/dev/null)
+              case "$_xs" in
+                  *'"running":true'*) ok "sing-box 运行中（$(/usr/libexec/singbox-ctl version 2>/dev/null | head -1)）" ;;
+                  *)
+                      if [ "$(uci -q get singbox-lite.main.enabled)" = "1" ]; then
+                          ng "singbox-lite 已启用但没在跑（查 logread -e singbox / singbox-ctl render）"
+                      else
+                          printf '  · singbox-lite 未启用（服务 → sing-box 里加节点后启用）\n'
+                      fi ;;
+              esac
+              if nft list table inet singbox >/dev/null 2>&1; then
+                  ok "透明代理 nft 规则已下发（table inet singbox）"
+              else
+                  printf '  · nft 规则未下发（未启用/未启动时属于正常）\n'
+              fi
+              for _p in /usr/libexec/singbox-ctl /usr/libexec/singbox-sub-clash.awk; do
+                  [ -f "$_p" ] || ng "缺少 $_p（订阅导入会失败）"
+              done
+              if command -v jsonfilter >/dev/null 2>&1; then
+                  ok "jsonfilter 已装（sing-box / Xray JSON 订阅可解析）"
+              else
+                  printf '  · 没有 jsonfilter：JSON 订阅将无法解析\n'
+              fi
+              if [ -x /usr/bin/sing-box ]; then
+                  _sv=$(/usr/bin/sing-box version 2>/dev/null | head -1)
+                  case "$_sv" in
+                      "sing-box "*) ok "内核：$_sv" ;;
+                      *) ng "sing-box 无法执行（架构或依赖不对）" ;;
+                  esac
+                  # 优先问二进制自己（version 输出带 Tags: 行），strings 不是每个 busybox 镜像都编了
+                  if /usr/bin/sing-box version 2>/dev/null | grep -q 'with_quic'; then
+                      ok "含 with_quic（hysteria2 可用）"
+                  elif command -v strings >/dev/null 2>&1 && strings /usr/bin/sing-box 2>/dev/null | grep -q 'with_quic'; then
+                      ok "含 with_quic（hysteria2 可用）"
+                  else
+                      ng "缺 with_quic：hysteria2 节点会用不了"
+                  fi
+              else
+                  ng "缺 /usr/bin/sing-box（面板没有内核）"
+              fi
+              if [ -s /etc/singbox/chnroute.txt ]; then
+                  _cnn=$(wc -l < /etc/singbox/chnroute.txt | tr -d ' ')
+                  if [ "${_cnn:-0}" -ge 3000 ]; then ok "国内 IP 段 $_cnn 条"; else ng "chnroute 只有 ${_cnn:-0} 条"; fi
+              else
+                  ng "缺 /etc/singbox/chnroute.txt（rule 模式国内直连失效）"
+              fi
+              if [ -s /etc/singbox/proxy-domains.txt ]; then
+                  _gfn=$(grep -vc '^#' /etc/singbox/proxy-domains.txt | tr -d ' ')
+                  if [ "${_gfn:-0}" -ge 1000 ]; then ok "代理域名 $_gfn 条"; else ng "代理域名只有 ${_gfn:-0} 条"; fi
+              else
+                  ng "缺 /etc/singbox/proxy-domains.txt"
+              fi
+          fi
+
           # ---------- 整形能力 / SQM / TCP 看门狗（升级内核后第一件要看的事）----------
           if command -v tc >/dev/null 2>&1; then
               ok "tc 已安装"
@@ -2053,6 +3656,8 @@ jobs:
           echo
           printf '通过 %d 项，失败 %d 项\n' "$P" "$F"
           if [ "$F" -eq 0 ]; then echo "🎉 一切正常"; else echo "⚠️  有失败项，按上面 ❌ 对应功能排查"; fi
+          # 有失败项就返回非 0（原来恒定 exit 0，脚本化判读永远通过，自检形同虚设）
+          [ "$F" -eq 0 ] || exit 1
           exit 0
           EOF
 
@@ -2067,7 +3672,7 @@ jobs:
           #     DNS 全挂   → dns-recover
           #     无线异常   → wifi-doctor
           #     逐项细节   → fw-selftest
-          #     代理问题   → 服务 → PassWall（节点 / 日志），或 /etc/init.d/passwall restart
+          #     代理问题   → 服务 → sing-box（节点 / 日志），或 /etc/init.d/singbox-lite restart
           # ---------------------------------------------------------------
           OK=0; WARN=0; BAD=0
           ok()   { OK=$((OK+1));     printf "  ✅ %s\n" "$*"; }
@@ -2084,14 +3689,18 @@ jobs:
           printf "  内核 : %s\n" "$(uname -r)"
           printf "  运行 : %s\n" "$(uptime | sed 's/^ *//')"
           case "$DISTRIB_RELEASE" in
-            25.12*) ok "系统分支 25.12（内核 6.12，apk 包管理器）" ;;
-            *)      warn "系统分支是 $DISTRIB_RELEASE，不是预期的 25.12" ;;
+           24.10*) ok "系统分支 24.10（内核 6.6，2.4G AP 经验证正常）" ;;
+            25.12*) warn "系统分支 25.12：mt7603 的 2.4G AP 在 6.12 上可能不发信标（已知问题）" ;;
+            *)      warn "系统分支是 $DISTRIB_RELEASE，不是预期的 24.10" ;;
           esac
 
           # ---------- 2. 闪存与内存 ----------
           sec "2. 闪存与内存"
-          set -- $(df -k /overlay 2>/dev/null | tail -n1)
-          _ovsize=$2; _ovused=$3; _ovfree=$4; _ovpct=$5
+          _ovsize=0; _ovused=0; _ovfree=0; _ovpct=0
+          # 不能用 set -- $(df ...)：那会把脚本自己的位置参数覆盖掉，且 df 换行时取值错位
+          read _ovsize _ovused _ovfree _ovpct <<EOF
+          $(df -k /overlay 2>/dev/null | awk 'NR==2{print $2, $3, $4, $5}')
+          EOF
           if [ -n "$_ovfree" ]; then
             printf "  overlay : 共 %s MB，已用 %s (%s)，剩 %s MB\n" "$((_ovsize / 1024))" "$_ovused" "$_ovpct" "$((_ovfree / 1024))"
             if [ "$_ovfree" -lt 2048 ]; then
@@ -2196,48 +3805,53 @@ jobs:
             fi
           fi
 
-          # ---------- 4. 代理（PassWall + Xray） ----------
-          sec "4. 代理（PassWall + Xray）"
-          if command -v xray >/dev/null 2>&1; then
-            ok "$(xray version 2>/dev/null | head -n1 | cut -c1-60)"
+          # ---------- 4. 代理（sing-box） ----------
+          sec "4. 代理（sing-box）"
+          if command -v sing-box >/dev/null 2>&1; then
+            ok "$(sing-box version 2>/dev/null | head -n1 | cut -c1-60)"
           else
-            bad "xray 二进制缺失：这个固件不完整，重新刷入"
+            bad "sing-box 二进制缺失：这个固件不完整，重新刷入"
           fi
-          _pe=$(uci -q get passwall.@global[0].enabled)
-          [ "$_pe" = "1" ] && ok "PassWall 已启用" || warn "PassWall 处于关闭状态（服务 → PassWall 打开）"
-          _nodes=$(uci -q show passwall 2>/dev/null | grep -c "=node$")
+          if [ "$(uci -q get singbox-lite.main.enabled)" = "1" ]; then
+            ok "透明代理已启用（singbox-lite.main.enabled=1）"
+          else
+            warn "透明代理关闭（服务 → sing-box 里导入订阅后启用）"
+          fi
+          _nodes=$(uci -q show singbox-lite 2>/dev/null | grep -c "=node$")
           [ -n "$_nodes" ] || _nodes=0
-          if [ "$_nodes" -le 1 ]; then
-            warn "还没添加自己的节点（列表里那个是内置的分流示例节点）：当前全部直连，加节点后立即生效"
+          if [ "$_nodes" -le 0 ]; then
+            warn "还没有节点：当前全部直连，导入订阅后立即生效"
           else
-            ok "节点数 $_nodes（含 1 个内置分流示例）"
+            ok "节点数 $_nodes"
           fi
-          pidof xray >/dev/null 2>&1 && ok "Xray 进程在跑（PID $(pidof xray)）" || warn "Xray 没在跑：没选节点时正常，选了节点还这样就看 PassWall → 日志"
-          if nft list table inet passwall >/dev/null 2>&1; then
-            ok "nftables 规则表 inet passwall 已装载"
+          pidof sing-box >/dev/null 2>&1 && ok "sing-box 进程在跑（PID $(pidof sing-box)）" \
+            || warn "sing-box 没在跑：没节点/未启用时正常，否则看 logread -e sing-box"
+          # 配置合法性必须单独查：进程能起来不代表下次 restart 还能起来
+          if [ -s /var/etc/singbox/config.json ] && [ -x /usr/bin/sing-box ]; then
+            if /usr/bin/sing-box check -c /var/etc/singbox/config.json >/dev/null 2>&1; then
+              ok "sing-box 配置合法（check 通过）"
+            else
+              bad "sing-box 配置非法：restart 会失败（/var/etc/singbox/config.json）"
+            fi
+          fi
+          if nft list table inet singbox >/dev/null 2>&1; then
+            ok "nftables 规则表 inet singbox 已装载"
           else
-            warn "没有 inet passwall 表：没选节点时正常（规则只在有节点时下发）"
+            warn "没有 inet singbox 表：未启用时正常（规则只在启用后下发）"
           fi
-          _dr=$(uci -q get passwall.@global[0].dns_redirect)
-          [ "$_dr" = "0" ] && ok "dns_redirect=0（PassWall 不抢 53，去广告不会被绕开）" || bad "dns_redirect=$_dr：PassWall 会劫持 53 并绕开 MosDNS，改回 0"
-          _bl=$(uci -q get passwall.@global[0].use_block_list)
-          [ "$_bl" = "0" ] && ok "PassWall 自带去广告已关（统一由 MosDNS 拦）" || warn "use_block_list=$_bl：会和 MosDNS 重复拦截，建议设 0"
-          _um=$(uci -q get passwall.@global[0].udp_proxy_mode)
-          [ "$_um" = "disable" ] && ok "UDP 不代理（省 CPU，QUIC 自动回落 TCP）" || warn "udp_proxy_mode=$_um：UDP 走代理在 mipsel 上很吃 CPU"
           _ph=0
-          [ -s /usr/share/passwall/rules/proxy_host ] && _ph=$(wc -l < /usr/share/passwall/rules/proxy_host | tr -d " ")
-          if [ "$_ph" -ge 1000 ]; then
-            ok "代理域名清单(proxy_host) $_ph 条"
+          [ -s /etc/singbox/proxy-domains.txt ] && _ph=$(grep -vc '^#' /etc/singbox/proxy-domains.txt | tr -d " ")
+          if [ "${_ph:-0}" -ge 1000 ]; then
+            ok "代理域名清单 $_ph 条"
           else
-            warn "proxy_host 只有 $_ph 条（出厂应 >=1000）：覆盖层没生效？"
+            warn "proxy-domains.txt 只有 ${_ph:-0} 条（出厂应 >=1000）"
           fi
-          _gf=0; _cn=0
-          [ -s /usr/share/passwall/rules/gfwlist ] && _gf=$(wc -l < /usr/share/passwall/rules/gfwlist | tr -d " ")
-          [ -s /usr/share/passwall/rules/chnroute ] && _cn=$(wc -l < /usr/share/passwall/rules/chnroute | tr -d " ")
-          if [ "$_gf" -ge 1000 ] && [ "$_cn" -ge 1000 ]; then
-            ok "包自带规则：gfwlist $_gf 行 / chnroute $_cn 行"
+          _cn=0
+          [ -s /etc/singbox/chnroute.txt ] && _cn=$(wc -l < /etc/singbox/chnroute.txt | tr -d " ")
+          if [ "${_cn:-0}" -ge 3000 ]; then
+            ok "国内 CIDR $_cn 条"
           else
-            warn "包自带规则不全（gfwlist $_gf / chnroute $_cn 行），重新刷入整包"
+            warn "chnroute.txt 不全（${_cn:-0} 行），重新刷入整包"
           fi
           # ---------- 5. 本机服务 ----------
           sec "5. 本机服务"
@@ -2313,7 +3927,7 @@ jobs:
             _fo_cfg=$(uci -q get firewall.@defaults[0].flow_offloading)
             _fo_nft=$(nft list ruleset 2>/dev/null | grep -c 'flow offload')
             _fo_tbl=$(nft list flowtable inet fw4 2>/dev/null | grep -c 'flowtable')
-            if [ "$_fo_cfg" = "1" ] && [ "$_fo_nft" -gt 0 ]; then
+            if [ "$_fo_cfg" = "1" ] && [ "$(( ${_fo_nft:-0} + ${_fo_tbl:-0} ))" -gt 0 ]; then
               warn "flow offload 真的在跑：中继场景建议关（uci set firewall.@defaults[0].flow_offloading=0 后 /etc/init.d/firewall restart）"
             elif [ "$_fo_cfg" = "1" ]; then
               ok "flow offload 配置位=1 但内核没有 flowtable（实际不生效，可以不管）"
@@ -2371,7 +3985,8 @@ jobs:
           fi
           echo
           echo "  相关命令：fw-selftest（逐项细节）  wifi-doctor（无线）  dns-recover（DNS 兜底）"
-          echo "            rule-refresh（手动刷分流名单）  /etc/init.d/passwall restart"
+          echo "            rule-refresh（手动刷分流名单）  /etc/init.d/singbox-lite restart"
+          [ "$BAD" -eq 0 ] || exit 1
           exit 0
           QUICKCHECK
 
@@ -2572,13 +4187,13 @@ jobs:
           # 2.4G AP 会在同一秒被拆掉重建 —— 手机当场搜不到 SSID，重连还要等 DHCP，
           # 表现就是"5G 中继一抖，2.4G 跟着断好几分钟"。
           # 用法：wifi-watchdog（静默，给 cron 用）  wifi-watchdog status（看当前状态）
-          
+
           LOG=/var/log/wifi-watchdog.log
           TMP=/tmp
           HW_FILE=$TMP/wifi-watchdog.hw
           CNT_FILE=$TMP/wifi-watchdog.cnt
           MAXH=5
-          
+
           log() {
               printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
               _sz=$(wc -c < "$LOG" 2>/dev/null | tr -d " ")
@@ -2587,12 +4202,16 @@ jobs:
                   tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
               fi
           }
-          
+
           # 驱动报错计数：mt76 崩溃一定会在这里留痕
           hw_count() {
               dmesg 2>/dev/null | grep -ciE 'hardware restart|firmware crash|mcu message' | tr -d ' '
           }
-          
+
+          # 接口/radio 查询（同名函数在 relay-tune 里，但这个脚本是独立进程，必须自带）
+          live_ifaces() { iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'; }
+          iface_type() { iw dev "$1" info 2>/dev/null | sed -n 's/.*type //p' | head -n 1; }
+
           # ---- 判活：三通道，任一成立即算"在发信标" ----
           # 血泪教训（2026-11-14 现场）：旧写法是 grep -q 'ESSID: "."'，
           # 那个模式只匹配「引号里恰好一个字符」的 ESSID —— SSID 叫 alon（4 个字符）时
@@ -2622,7 +4241,7 @@ jobs:
           sta_link() {
               iw dev "$1" link 2>/dev/null | grep -q 'Connected to'
           }
-          
+
           # ---- 接口 → radio 段名 ----
           # 恢复动作必须落到「那一个 radio」上。wifi up / wifi reload 都是全量的：
           # 5G 中继抖一下、2.4G 的 AP 也一起被拆掉重建，手机当场就搜不到 SSID，
@@ -2669,27 +4288,27 @@ jobs:
                   fi
                   if radio_has_sta "$_r"; then
                       log "第 ${CN} 次恢复：$_if 不发信标，但 $_r 同时承载中继，不 down（避免拆掉上行），只补 wifi up"
-                      wifi up "$_r" >/dev/null 2>&1
+                      /sbin/wifi up "$_r" >/dev/null 2>&1
                       continue
                   fi
                   log "第 ${CN} 次恢复：只重启 $_r（$_if 不发信标），其他 radio 不动"
-                  wifi down "$_r" >/dev/null 2>&1
+                  /sbin/wifi down "$_r" >/dev/null 2>&1
                   sleep 2
-                  wifi up "$_r" >/dev/null 2>&1
+                  /sbin/wifi up "$_r" >/dev/null 2>&1
               done
               if [ "$_fallback" -eq 1 ]; then
                   # 全量 wifi reload 会把中继一起拆掉；有中继时宁可只做 wifi up（幂等、不拆接口），
                   # 拆分用户的 AP 换一次"可能修好"，在这里不值得。
                   if [ -n "$(for _d in $(live_ifaces); do [ "$(iface_type "$_d")" = managed ] && echo x; done)" ]; then
                       log "定位不到 radio，且本机有中继：只做 wifi up（不做全量 reload，避免拆掉上行）"
-                      wifi up >/dev/null 2>&1
+                      /sbin/wifi up >/dev/null 2>&1
                   else
                       log "定位不到掉线接口所属 radio，退化到 wifi reload（整机无线重建）"
-                      wifi reload >/dev/null 2>&1
+                      /sbin/wifi reload >/dev/null 2>&1
                   fi
               fi
           }
-          
+
           # 刚开机那两分钟无线还没起完，别把它当故障。
           # 开机阶段的收敛交给 relay-tune（先拉 AP、再等中继，日志里有"第几秒连上"）；
           # 这里只让出 100 秒，避免开机时两边抢着动无线。
@@ -2697,14 +4316,14 @@ jobs:
           if [ -z "$1" ] && [ -n "$UP" ] && [ "$UP" -lt 100 ]; then
               exit 0
           fi
-          
+
           HOUR=$(date '+%Y%m%d%H')
           CN=0
           if [ -r "$CNT_FILE" ]; then
               read -r _h _c < "$CNT_FILE" 2>/dev/null
               [ "$_h" = "$HOUR" ] && CN=${_c:-0}
           fi
-          
+
           # 按内核真实存在的接口枚举：uci 里的 section 名（default_radio0 / wwan）不是网卡名，
           # 网卡名是 phy0-ap0 / phy1-sta0 这种。原来的写法拿 section 名去 iwinfo，永远读不到，
           # 会把“正常”误判成“掉线”，每 6 分钟 wifi 重启一次。
@@ -2724,7 +4343,7 @@ jobs:
           done
           # 中继是否纳入监控：没有 iw 就没法判断“连没连上”，宁可不看也不误判
           command -v iw >/dev/null 2>&1 || STA_IFS=""
-          
+
           DEAD_LIST=""
           for _if in $AP_IFS; do
               _f=$TMP/wifi-watchdog.fail.$_if
@@ -2745,7 +4364,7 @@ jobs:
               DEAD_LIST="$DEAD_LIST $_if"
               [ "$1" = "status" ] && printf '  ❌ %-9s 已掉（连续 %s 次探测不到）\n' "$_if" "$_n"
           done
-          
+
           if [ -n "$DEAD_LIST" ] && [ -z "$1" ]; then
               recover_ap $DEAD_LIST
               for _if in $DEAD_LIST; do rm -f "$TMP/wifi-watchdog.fail.$_if"; done
@@ -2827,11 +4446,11 @@ jobs:
                           for _r in $_rs; do wifi reconf "$_r" >/dev/null 2>&1; done
                       else
                           log "中继仍未连上，且定位不到所属 radio：退化到 wifi reload（整机无线重建）"
-                          wifi reload >/dev/null 2>&1
+                          /sbin/wifi reload >/dev/null 2>&1
                       fi
                   elif [ "$_tr" -eq 4 ]; then
                       log "中继仍未连上，第 ${CN} 次恢复（累计第 ${_tr} 次）：wifi reload 全量重建（代价：2.4G AP 会一起断十几秒）"
-                      wifi reload >/dev/null 2>&1
+                      /sbin/wifi reload >/dev/null 2>&1
                   fi
                   if [ "$_tr" -ge 5 ]; then
                       : > "$GIVE"
@@ -2840,7 +4459,7 @@ jobs:
               fi
               for _if in $STA_DEAD; do rm -f "$TMP/wifi-watchdog.sta.$_if"; done
           fi
-          
+
           HW=$(hw_count)
           [ -n "$HW" ] || HW=0
           PREV=0
@@ -2851,7 +4470,7 @@ jobs:
               log "内核新增 $((HW - PREV)) 条无线驱动报错（累计 ${HW}）：$_last"
           fi
           printf '%s\n' "$HW" > "$HW_FILE"
-          
+
           # ---- 自检：判活逻辑的回归保护 ----
           # 这个脚本最贵的一次教训不是驱动崩，而是判活的正则写错（'ESSID: "."' 只匹配
           # 单字符 SSID），结果把正常的 AP 永久判死、每小时 wifi up 5 次。
@@ -2975,6 +4594,8 @@ jobs:
           _now=$(date +%s)
           if [ "$((_now - _last))" -lt 1800 ] 2>/dev/null; then
               log "距上次恢复不足 30 分钟（$(((_now - _last) / 60)) 分钟），只记录不动手"
+              # 计数必须清零：否则冷却一过，下一次失败(第 4 次)立刻又触发重建
+              rm -f "$ST"
               exit 0
           fi
           date +%s > /tmp/net-watchdog.last
@@ -3098,12 +4719,28 @@ jobs:
               # 不加锁就会自激（ifup → hotplug → once → ifup → …）。现场有一次改信道后 3 秒内跑了 4 遍。
               # 60 秒内的重复调用直接跳过：真正的收敛由第一次跑完负责。
               _lk=/tmp/relay-tune.lock
-              if [ -f "$_lk" ]; then
-                  _age=$(( _t0 - $(sed -n '1p' "$_lk" 2>/dev/null || echo 0) ))
-                  [ "$_age" -ge 0 ] && [ "$_age" -lt 60 ] && { log "已有一次在收敛（锁 ${_age}s），本次跳过"; return 0; }
+              # 原子锁：mkdir 是原子的（原来"先 test -f 再写"在 hotplug 两路 ifup 同时到达时
+              # 两个实例都能通过，随后互相 ifdown 对方刚建立的关联，越跑越乱）
+              if ! mkdir "$_lk" 2>/dev/null; then
+                  _lkt=$(sed -n '1p' "$_lk/t" 2>/dev/null)
+                  if [ -z "$_lkt" ]; then
+                      # 另一个实例刚 mkdir、时间戳还没写进去：此时不能当成"空锁"去夺，
+                      # 否则会把刚起来的实例踢掉（正是注释里要防的自激）。按目录 mtime 算年龄，60 秒内都算在跑。
+                      _lkt=$(stat -c %Y "$_lk" 2>/dev/null); [ -n "$_lkt" ] || _lkt=0
+                      _age=$(( $(date +%s) - _lkt ))
+                  else
+                      case "$_lkt" in *[!0-9]*) _lkt=0 ;; esac
+                      _age=$(( _t0 - _lkt ))
+                  fi
+                  if [ "$_age" -ge 0 ] && [ "$_age" -lt 60 ]; then
+                      log "已有一次在收敛（锁 ${_age}s），本次跳过"; return 0
+                  fi
+                  # 陈旧锁（上一轮被 kill -9 或空锁）：接管，避免永久卡死
+                  rm -rf "$_lk"
+                  mkdir "$_lk" 2>/dev/null || return 0
               fi
-              printf '%s\n' "$_t0" > "$_lk"
-              trap 'rm -f "$_lk"' EXIT INT TERM
+              printf '%s\n' "$_t0" > "$_lk/t"
+              trap 'rm -rf "$_lk"' EXIT INT TERM
               log "开始收敛（开机第 ${_t0}s，中继段：$(sta_secs | tr '\n' ' ')）"
               offload_off
 
@@ -3113,7 +4750,8 @@ jobs:
                   _i=$((_i + 1))
                   _bad=""
                   for _d in $(ap_ifaces); do ap_alive "$_d" || _bad="$_bad $_d"; done
-                  [ -n "$(ap_ifaces)" ] || _bad="(无 AP 接口)"
+                  # 没有 AP 接口（纯中继 / 2.4G AP 被关）时不要空转 9 轮 × 10 秒：直接进阶段 2 等中继
+                  [ -n "$(ap_ifaces)" ] || { log "没有 AP 接口：跳过阶段 1，直接等中继"; break; }
                   if [ -z "$_bad" ]; then
                       log "AP 就绪（用时 $(( $(uptime_sec) - _t0 ))s，此刻开机第 $(uptime_sec)s）"
                       break
@@ -3278,13 +4916,8 @@ jobs:
           uci -q delete dhcp.lan.ra_slaac
           uci -q delete dhcp.lan.ra_default
 
-          # 4) PassWall：被墙域名过滤 AAAA（走 IPv4 代理），国内域名保留 AAAA 直连 v6。
-          #    ipv6_tproxy 关掉是刻意的：这台机器不值得为 v6 再开一套 tproxy 规则。
-          if uci -q get passwall.@global[0] >/dev/null 2>&1; then
-              uci set passwall.@global[0].filter_proxy_ipv6='1'
-              uci set passwall.@global_forwarding[0].ipv6_tproxy='0'
-              uci commit passwall
-          fi
+          # 4) sing-box：被墙域名按域名规则走代理（等价于旧 PassWall 的 filter_proxy_ipv6），
+          #    国内域名保留 AAAA 直连 v6；不为 v6 单独开一套 tproxy 规则（这台机器不值当）。
 
           uci commit network
           uci commit dhcp
@@ -3304,7 +4937,7 @@ jobs:
           [ -x /usr/bin/relay-tune ] || exit 0
           # 收敛进行中就别再插一脚：relay-tune 自己 ifup 中继时也会触发这个钩子，
           # 没有这道门就会自激（3 秒内跑 4 遍）。锁由 relay-tune 自己创建/删除。
-          [ -f /tmp/relay-tune.lock ] && exit 0
+          [ -d /tmp/relay-tune.lock ] && exit 0
           case "$INTERFACE" in
               wwan|wwan6) ;;
               *)
@@ -3440,7 +5073,11 @@ jobs:
               if [ -n "$_mp" ] && [ "$DRY" = "0" ]; then
                   _cur=$(uci -q get ksmbd.@share[0].path)
                   if [ "$_cur" != "$_mp" ]; then
-                      uci -q set ksmbd.@share[0].path="$_mp" && uci -q commit ksmbd && log "共享路径 -> $_mp"
+                      if uci -q set ksmbd.@share[0].path="$_mp" && uci -q commit ksmbd; then
+                          log "共享路径 -> $_mp"
+                          # ksmbd 已经在跑时不会自己重读配置，不 reload 就还共享着旧（多半已空的）目录
+                          /etc/init.d/ksmbd reload >/dev/null 2>&1
+                      fi
                   fi
               fi
 
@@ -3734,7 +5371,7 @@ jobs:
           echo "  ✅ 手工补充清单已并入（tanx/mobvista/ads.iqiyi/stat.youku/simba.taobao/log.sina 均在）"
 
           chmod +x files/usr/bin/dns-recover files/usr/bin/fw-selftest files/usr/bin/rule-refresh files/usr/bin/wifi-doctor files/usr/bin/memguard files/usr/bin/quick-check files/usr/bin/sysctl-apply files/usr/bin/wifi-watchdog files/usr/bin/relay-tune files/usr/bin/usb-service files/usr/bin/net-watchdog files/usr/bin/sqm-setup \
-                   files/etc/init.d/mosdns files/etc/init.d/relay-tune files/etc/init.d/usb-service \
+                   files/etc/init.d/mosdns files/etc/init.d/relay-tune files/etc/init.d/usb-service files/etc/init.d/singbox-lite \
                    files/etc/hotplug.d/net/20-usbwan files/etc/uci-defaults/* files/etc/rc.local \
                    files/etc/hotplug.d/usb/50-usb-services files/etc/hotplug.d/block/50-usb-services \
                    files/etc/hotplug.d/iface/90-relay-tune
@@ -3743,10 +5380,12 @@ jobs:
             [ -f "$f" ] || continue
             sh -n "$f" || { echo "::error::脚本语法错误：$f"; exit 1; }
           done
-          chmod +x files/usr/libexec/mosdns-ctl
-          sh -n files/usr/libexec/mosdns-ctl || { echo "::error::脚本语法错误：files/usr/libexec/mosdns-ctl"; exit 1; }
+          chmod +x files/usr/libexec/mosdns-ctl files/usr/libexec/singbox-ctl
+          for c in /usr/libexec/mosdns-ctl /usr/libexec/singbox-ctl; do
+            sh -n "files$c" || { echo "::error::脚本语法错误：files$c"; exit 1; }
+          done
           # LuCI 页面是 JS：只做最基本的括号/引号配平检查（没有 node 也能跑）
-          for f in files/www/luci-static/resources/view/mosdns/overview.js; do
+          for f in files/www/luci-static/resources/view/mosdns/overview.js files/www/luci-static/resources/view/singbox/overview.js; do
             awk 'BEGIN{d=0}{for(i=1;i<=length($0);i++){c=substr($0,i,1); if(c=="{")d++; else if(c=="}")d--}}END{if(d!=0){print "unbalanced braces: " FILENAME; exit 1}}' "$f" \
               || { echo "::error::JS 括号不平衡：$f"; exit 1; }
           done
@@ -3776,7 +5415,7 @@ jobs:
 
           # ---------- Go 工具链版本 ----------
           # feeds 的 GO_DEFAULT_VERSION 决定 Go 组件用哪个 Go 编译。
-          # 25.12 的 xray-core 是预编译二进制包（不需要 Go），MosDNS 用 feeds 默认 Go 即可。
+          # MosDNS 是唯一需要 Go 工具链的运行时组件（代理内核 sing-box 用预编译二进制）。
           # 若日志出现 "go.mod requires go >= 1.XX"，把 go_version 输入改成 1.XX 重跑
           # （25.12 的 golang 带 GO_DEFAULT_VERSION，这项输入会真正生效）。
           GO_VER="${{ inputs.go_version }}"
@@ -3793,8 +5432,6 @@ jobs:
           grep -n '^GO_DEFAULT_VERSION' feeds/packages/lang/golang/golang-values.mk \
             || echo "  （本分支无 GO_DEFAULT_VERSION，使用 golang 包自带版本）"
           ls -d feeds/packages/lang/golang/golang[0-9]* 2>/dev/null | sed 's/^/  可用版本: /' || true
-          echo "xray-core 版本: $(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/xray-core/Makefile 2>/dev/null)"
-          echo "passwall 版本 : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/luci/luci-app-passwall/Makefile 2>/dev/null)"
           echo "mosdns 版本   : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/mosdns/Makefile 2>/dev/null)"
 
           # ---------- Go 模块缓存移出 dl（关键）----------
@@ -3878,10 +5515,8 @@ jobs:
             MISSING=1
           fi
           check CONFIG_PACKAGE_mosdns
-          check CONFIG_PACKAGE_luci-app-passwall
           # 25.12.16 没有 Nftables/Iptables_Transparent_Proxy 开关（自己按 fw4+nftset 判断），
           # 也必须有中文翻译包，否则页面是英文
-          check CONFIG_PACKAGE_luci-i18n-passwall-zh-cn
           # 语言开关：符号是 CONFIG_LUCI_LANG_<po 目录名>；25.12 的 LuCI 也只带 zh_Hans / zh_Hant。
           # zh-cn 只是 luci.mk 的 LC 别名（只用于 i18n 包名），写成 CONFIG_LUCI_LANG_zh-cn
           # 不会报错、只会静默失效（除下面点名的几个页面外，LuCI 全是英文），所以单独点名核对。
@@ -3890,16 +5525,14 @@ jobs:
           else
             echo "::warning::CONFIG_LUCI_LANG_zh_Hans 未生效：符号写错会被 defconfig 丢弃，除显式点名的页面外 LuCI 显示英文"
           fi
-          check CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray
-          check CONFIG_PACKAGE_xray-core
-          check CONFIG_PACKAGE_chinadns-ng
-          check CONFIG_PACKAGE_dns2socks
-          # sing-box / SSR-Plus 已整体移除：一旦被别的依赖偷偷拉回来，镜像会白占约 40MB，
-          # 而且两套透明代理同时挂 nft 规则必然打架，所以这里反向硬拦。
+          # 代理内核是构建期下载的 sing-box（不走 .config）。这里反向硬拦：
+          # feeds 里的 sing-box / xray-core / PassWall 一旦被别的依赖拉回来，
+          # 要么白占 40MB，要么两套透明代理同时挂 nft 规则打架。
           for bad in CONFIG_PACKAGE_sing-box CONFIG_PACKAGE_sing-box-tiny \
+                     CONFIG_PACKAGE_xray-core CONFIG_PACKAGE_luci-app-passwall \
                      CONFIG_PACKAGE_luci-app-ssr-plus; do
             if grep -qx "$bad=y" .config; then
-              echo "::error::$bad 又被拉进 .config 了（本固件用 PassWall + Xray，不能再有第二套透明代理）"
+              echo "::error::$bad 被拉进 .config 了（本固件只用构建期下载的 sing-box 内核）"
               MISSING=1
             fi
           done
@@ -3943,7 +5576,7 @@ jobs:
           if [ "$MISSING" -ne 0 ]; then
             echo "::error::存在未生效的组件，拒绝继续构建（否则会产出残缺固件）"
             echo "---- feeds 里这些包是否存在（1=有，0=没有）----"
-          for p in luci-app-passwall xray-core chinadns-ng dns2socks mosdns luci-compat luci-lib-jsonc nftables \
+          for p in mosdns luci-compat luci-lib-jsonc nftables \
                        kmod-nft-tproxy kmod-nft-socket kmod-nft-nat luci-app-turboacc; do
                 printf '  %-24s %s\n' "$p" "$(./scripts/feeds list -n 2>/dev/null | grep -cx "$p")"
               done
@@ -3959,7 +5592,7 @@ jobs:
             echo "### 📦 参与构建的关键包"
             echo ""
             echo '```'
-          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-passwall_INCLUDE_Xray|xray-core|chinadns-ng|dns2socks|mosdns|dnsmasq-full|luci-app-ksmbd|zram-swap|sqm-scripts|kmod-sched-cake)=' .config | sort
+          grep -E '^CONFIG_PACKAGE_(mosdns|dnsmasq-full|luci-app-ksmbd|zram-swap|sqm-scripts|kmod-sched-cake|jsonfilter|curl)=' .config | sort
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -3978,17 +5611,14 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
-      - name: 9. 预置 PassWall 分流名单（出厂即生效，不依赖运行时联网）
+      - name: 9. 预置 sing-box 域名分流名单（出厂即生效，不依赖运行时联网）
         run: |
           cd immortalwrt
-          # PassWall 包自带四份规则（chnroute / chnroute6 / gfwlist / chnlist），装好就在
-          # /usr/share/passwall/rules/，官方清单已经很全，所以这里不重复下载 CIDR。
-          # 只做一件事：把"上游清单常常滞后"的高频域名并进 proxy_host。
-          # 关键：PassWall 的 helper_dnsmasq.lua（411/433 行）与 helper_chinadns_add.lua（31/244 行）
-          # 只读 /usr/share/passwall/rules/ 下的 proxy_host，全仓库没有一处读 /etc/passwall/rules，
-          # 所以这里必须写 files/usr/share/passwall/rules/proxy_host。files/ 覆盖层在 opkg 装包之后
-          # 才拷进 rootfs，能盖掉包自带的 14 行 proxy_host；squashfs 是只读的，只有这样做才生效。
-          RULES="files/usr/share/passwall/rules"
+          # 代理域名清单：sing-box 的 route 规则用 domain_suffix 匹配，一行一个纯域名，
+          # 目标文件是 files/etc/singbox/proxy-domains.txt（singbox-ctl render 时读它）。
+          # 这里只做一件事：把"上游清单常常滞后"的高频域名并进来。
+          # 国内 CIDR 不在这里——第 4 步已从 ispip.clang.cn 下载到 files/etc/singbox/chnroute.txt。
+          RULES="files/etc/singbox"
           mkdir -p "$RULES"
           TMP=$(mktemp -d)
 
@@ -4014,12 +5644,12 @@ jobs:
           echo "✅ 上游 gfw.txt：$_have 个域名"
           fi
           else
-          echo "::warning::gfw.txt 下载失败，只用人工清单（PassWall 自带的 gfwlist 仍然生效）"
+          echo "::warning::gfw.txt 下载失败，改用人工清单兜底"
           : > "$TMP/gfw.dom"
           fi
 
-          # 离线兜底：构建树里本来就有 PassWall 自带的 gfwlist（约 5900 条纯域名），
-          # 上游拉不动时用它，避免 proxy_host 只剩几十条人工名单这种半成品。
+          # 离线兜底：构建树里若还有 PassWall 的 gfwlist（约 5900 条纯域名）就用它，
+          # 上游拉不动时避免名单只剩几十条人工条目。
           if [ "$_have" -eq 0 ]; then
             _pkg_gfw=package/feeds/luci/luci-app-passwall/root/usr/share/passwall/rules/gfwlist
             if [ -s "$_pkg_gfw" ]; then
@@ -4114,24 +5744,24 @@ jobs:
           economist.com
           EXTRA
 
-          # 合并去重：PassWall 读 proxy_host 时一行一条，不接受注释与空行
-          cat "$TMP/gfw.dom" "$TMP/extra" | sort -u > "$RULES/proxy_host"
-          _total=$(wc -l < "$RULES/proxy_host" | tr -d " ")
-          _bad=$(grep -cvE '^[a-z0-9._-]+$' "$RULES/proxy_host" || true)
+          # 合并去重：sing-box 的域名清单一行一条纯域名，不接受注释与空行
+          cat "$TMP/gfw.dom" "$TMP/extra" | sort -u > "$RULES/proxy-domains.txt"
+          _total=$(wc -l < "$RULES/proxy-domains.txt" | tr -d " ")
+          _bad=$(grep -cvE '^[a-z0-9._-]+$' "$RULES/proxy-domains.txt" || true)
           echo "分流名单: $_total 条（人工 $(wc -l < "$TMP/extra" | tr -d " ") 条，上游 $_have 条）"
           if [ "$_bad" -ne 0 ]; then
-          echo "::error::proxy_host 里有 $_bad 行不是纯域名，PassWall 会解析失败"
-          grep -nvE '^[a-z0-9._-]+$' "$RULES/proxy_host" | head -n 10
+          echo "::error::proxy-domains.txt 里有 $_bad 行不是纯域名，sing-box 会拒绝加载"
+          grep -nvE '^[a-z0-9._-]+$' "$RULES/proxy-domains.txt" | head -n 10
           exit 1
           fi
           if [ "$_total" -lt 100 ]; then
-          echo "::error::proxy_host 只有 $_total 行，明显不对劲，拒绝产出半成品名单"
+          echo "::error::proxy-domains.txt 只有 $_total 行，明显不对劲，拒绝产出半成品名单"
           exit 1
           fi
           rm -rf "$TMP"
+          rm -rf "$TMP"
 
-          echo "ℹ️  不编入 GeoIP / GeoSite：v2ray-geoip(23MB) 与 v2ray-geosite(2.3MB) 都不装，
-          国内 IP 直连靠 PassWall 自带的 chnroute，省下约 25MB 闪存。"
+          echo "ℹ️  不编入 GeoIP / GeoSite：国内 IP 直连靠 /etc/singbox/chnroute.txt（第 4 步下载），省下约 25MB 闪存。"
 
           # 覆盖层快照必须包含这份名单：第 12 步"缺件补齐"会用它还原 files/，
           # 快照若停在生成之前，一旦触发补齐就等于把名单删了，而补齐逻辑只会重装包、
@@ -4217,7 +5847,6 @@ jobs:
           {
             echo "==== 构建环境 ===="
             echo "Go: $(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)"
-            echo "xray      : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/xray-core/Makefile)"
             echo "mosdns   : $(sed -n 's/^PKG_VERSION:=//p' package/feeds/packages/mosdns/Makefile)"
             echo "===================="
           } >> build.log
@@ -4242,7 +5871,7 @@ jobs:
           # 单包预编的价值：整机 -j 编译时 make 会把真实报错淹没，早失败几分钟就能定位。
           # 这两个包都不依赖内核模块，所以不需要先编 target/linux。
           GOVER=$(sed -n 's/^GO_DEFAULT_VERSION:=//p' feeds/packages/lang/golang/golang-values.mk)
-          echo "🔧 预编译代理侧组件（Go ${GOVER:-feeds 默认} + mosdns / xray-core）..."
+          echo "🔧 预编译 DNS 组件（Go ${GOVER:-feeds 默认} + mosdns）..."
 
           try_build() {
           make -j1 V=s "$1" 2>&1 | tee -a build.log
@@ -4284,12 +5913,9 @@ jobs:
           echo "================ 预编 mosdns ================"
           go_build "package/feeds/packages/mosdns/compile" "mosdns" || die_with_log "mosdns"
 
-          # ③ xray-core（24.10 的 feeds 里它是"预编译二进制"包，只做下载+校验，几十秒）
-          # 这一步专门抓"上游 release 地址变了 / 校验和对不上"，否则要等整机编译一小时才暴露。
-          echo "================ 预编 xray-core ================"
-          try_build "package/feeds/packages/xray-core/compile" || die_with_log "xray-core"
+          # ③ 代理内核 sing-box 是构建期下载的预编译二进制（见第 5 步），不在这里预编
 
-          echo "✅ 代理侧组件预编译通过"
+          echo "✅ DNS 组件预编译通过"
 
           build_once() {
             RC=0
@@ -4389,7 +6015,7 @@ jobs:
             _KB=$(( $(wc -c < "$_IMG") / 1024 ))
             printf '  · %s 体积 %s KB（分区上限 32448 KB，余量 %s KB）\n' "$_IMG" "$_KB" "$((32448 - _KB))"
             if [ "$_KB" -gt 32448 ]; then
-                      printf '::error::镜像 %s KB 已超过固件分区 32448 KB —— 需要缩小包集合（xray-core 与 mosdns 是最大的两块，先考虑去掉 TurboACC 或换轻量上游）\n' "$_KB"
+                      printf '::error::镜像 %s KB 已超过固件分区 32448 KB —— 需要缩小包集合（sing-box 内核 32MB 是最大的一块，可考虑换 sing-box-tiny 或精简 LuCI）\n' "$_KB"
             elif [ "$_KB" -gt 31000 ]; then
               printf '::warning::镜像 %s KB，距分区上限只剩 %s KB\n' "$_KB" "$((32448 - _KB))"
             fi
@@ -4418,7 +6044,7 @@ jobs:
             printf '::warning::未找到内核 .config，跳过整形能力校验\n'
           fi
 
-          MUST="luci-app-passwall xray-core mosdns dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat \
+          MUST="mosdns dnsmasq-full luci-app-ksmbd ksmbd-server p910nd zram-swap luci-compat \
                 kmod-sched-core kmod-sched-cake kmod-ifb tc-full sqm-scripts luci-app-sqm"
 
           echo "---- 软件包 ----"
@@ -4450,21 +6076,9 @@ jobs:
               LOST=$((LOST + 1))
               return 0
             }
-            chk passwall-init  etc/init.d/passwall
-            chk passwall-app   usr/share/passwall/app.sh
-            chk passwall-rules usr/share/passwall/rules/chnroute
-            chk passwall-gfw   usr/share/passwall/rules/gfwlist
-            chk passwall-luci  usr/lib/lua/luci/model/cbi/passwall/client/global.lua
-            chk xray-bin       usr/bin/xray
-                      # /etc/config/passwall 构建期不存在（首启由 92-services 从 0_default_config 生成），
-                      # 所以这里不查文件，改查"兜底逻辑在不在"，避免把正常状态判成缺失。
-                      if [ -e "$ROOTFS/etc/config/passwall" ]; then
-                        echo "  ✅ etc/config/passwall"
-                      elif grep -q "0_default_config" "$ROOTFS/etc/uci-defaults/92-services" 2>/dev/null; then
-                        echo "  ✅ PassWall 配置首启生成（92-services 已兜底）"
-                      else
-                        echo "::warning::既没有 /etc/config/passwall，92-services 也没有兜底（PassWall 会停在出厂默认）"
-                      fi
+            chk singbox-bin    usr/bin/sing-box
+            chk singbox-sub-awk usr/libexec/singbox-sub-clash.awk
+            chk singbox-ui   www/luci-static/resources/view/singbox/overview.js
           # dnsmasq-full 是整条 DNS 链路的地基：nftset 支持（PassWall 域名分流）+ 我们的上游锁定都靠它
             chk dnsmasq-bin  usr/sbin/dnsmasq
             chk p910nd-bin  usr/sbin/p910nd usr/bin/p910nd
@@ -4515,7 +6129,7 @@ jobs:
             chk rule-refresh usr/bin/rule-refresh
             chk memguard    usr/bin/memguard
             chk quick-check usr/bin/quick-check
-            chk proxy-host  usr/share/passwall/rules/proxy_host
+            chk singbox-domains etc/singbox/proxy-domains.txt
             chk iface-hp    etc/hotplug.d/iface/90-relay-tune
             chk cfg-fstab   etc/config/fstab
             chk cfg-ksmbd   etc/config/ksmbd
@@ -4528,42 +6142,39 @@ jobs:
               echo "  广告域名: $_an 条"
               [ "$_an" -ge 50000 ] || echo "::warning::广告域名条数偏少($_an)，去广告基本不生效"
             fi
-                      # 分流名单条数：上游格式漂移或下载失败会退化成几十行，这里点名
-                      if [ -f "$ROOTFS/usr/share/passwall/rules/proxy_host" ]; then
-                        _pn=$(wc -l < "$ROOTFS/usr/share/passwall/rules/proxy_host" | tr -d " ")
+                      # 代理域名清单条数：上游格式漂移或下载失败会退化成几十行，这里点名
+                      if [ -f "$ROOTFS/etc/singbox/proxy-domains.txt" ]; then
+                        _pn=$(wc -l < "$ROOTFS/etc/singbox/proxy-domains.txt" | tr -d " ")
                         [ -n "$_pn" ] || _pn=0
-                        echo "  代理域名清单(proxy_host 覆盖层): $_pn 条"
-                        [ "$_pn" -ge 1000 ] || echo "::warning::proxy_host 只有 $_pn 行，覆盖层可能没盖过包内那份"
+                        echo "  代理域名清单(proxy-domains.txt): $_pn 条"
+                        [ "$_pn" -ge 1000 ] || echo "::warning::proxy-domains.txt 只有 $_pn 行"
                       fi
-                      # 包自带的规则：这两份是"绕过大陆"的地基，缺了等于全量走代理
-                      for _r in gfwlist chnroute; do
-                        _f="$ROOTFS/usr/share/passwall/rules/$_r"
-                        if [ -f "$_f" ]; then
-                          _rn=$(wc -l < "$_f" | tr -d " ")
-                          [ -n "$_rn" ] || _rn=0
-                          echo "  包内规则 $_r: $_rn 条"
-                          [ "$_rn" -ge 1000 ] || echo "::warning::$_r 只有 $_rn 行，分流基本失效"
-                        else
-                          echo "::warning::镜像里没有 /usr/share/passwall/rules/$_r"
-                        fi
-                      done
+                      # 国内 CIDR：绕过大陆的地基，缺了等于全量走代理
+                      if [ -f "$ROOTFS/etc/singbox/chnroute.txt" ]; then
+                        _rn=$(wc -l < "$ROOTFS/etc/singbox/chnroute.txt" | tr -d " ")
+                        [ -n "$_rn" ] || _rn=0
+                        echo "  国内 CIDR(chnroute.txt): $_rn 条"
+                        [ "$_rn" -ge 3000 ] || echo "::warning::chnroute.txt 只有 $_rn 行，分流基本失效"
+                      else
+                        echo "::warning::镜像里没有 /etc/singbox/chnroute.txt"
+                      fi
           else
             echo "::warning::未找到 root-ramips，跳过文件级检查"
           fi
 
-                    # ---- TPROXY 相关内核模块：PassWall 的透明代理靠它们 ----
+                    # ---- TPROXY 相关内核模块：sing-box 的透明代理靠它们 ----
           # config 里选了不等于编进了镜像（kmod 会随依赖变化被静默丢掉），
           # 所以拿 .manifest 复核一遍；缺 TProxy 的表现是"能连上、网页打不开"。
           for p in kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun; do
             if grep -q "^$p " "$MANIFEST"; then
               printf '  ✅ %s\n' "$p"
             else
-                        printf '::warning::镜像里没有 %s（PassWall 的 TProxy 或转发会失效）\n' "$p"
+                        printf '::warning::镜像里没有 %s（sing-box 的 TProxy 或转发会失效）\n' "$p"
             fi
           done
 
-                    # ---- 版本记录：PassWall 与 Xray 的版本要能对上，打进日志便于回溯 ----
-                    for _v in luci-app-passwall xray-core mosdns; do
+                    # ---- 版本记录：MosDNS 版本打进日志便于回溯（sing-box 版本另见 /etc/singbox-lite/version）----
+                    for _v in mosdns; do
                       _vv=$(grep -m1 "^$_v " "$MANIFEST" | awk '{print $3}')
                       [ -n "$_vv" ] && printf '  ✅ %-22s %s\n' "$_v" "$_vv"
                     done
@@ -4732,7 +6343,7 @@ jobs:
             echo "包总数   : ${PKG_COUNT}"
             echo ""
             echo "## 关键组件"
-            grep -E '^(luci-app-passwall|xray-core|chinadns-ng|mosdns|luci-app-turboacc|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap) ' \
+            grep -E '^(mosdns|dnsmasq-full|ksmbd-server|luci-app-ksmbd|p910nd|zram-swap|sqm-scripts) ' \
                  "$(ls -1 *.manifest | head -n1)" | sort
           } > versions.txt
           cat versions.txt
@@ -4758,7 +6369,7 @@ jobs:
             echo ""
             echo '```'
             echo "源码: openwrt-24.10 @ $(git -C ../../../.. log -1 --format='%h %cd' --date=format:'%Y-%m-%d')"
-            grep -E '^(luci-app-passwall|xray-core|chinadns-ng|mosdns|dnsmasq-full|luci-app-turboacc) ' \
+            grep -E '^(mosdns|dnsmasq-full|sqm-scripts) ' \
                  "$(ls -1 *.manifest | head -n1)" | sort
             echo '```'
             echo ""
@@ -4831,27 +6442,29 @@ jobs:
             - 历史 Release 一律不删，都是可回退点。
 
             ### 内置组件
-            - **PassWall + Xray**（服务 → PassWall）：官方前端，节点列表 / 节点订阅 / 规则列表 / 组件设置全在页面里；
-              xray-core 预编译二进制（feeds 提供，不需要 Go 工具链），nftables 透明代理（TPROXY），
-              UDP 代理默认关闭（浏览器自动回落 TCP，避免 QUIC 乱序与额外开销）
-            - **分流**：绕过大陆（`chn_list=direct` + 包自带 gfwlist/chnroute + 构建期补充的 proxy_host 高频域名），
-              规则随包发布、运行时不联网；无节点时直连，不会断网
-            - **去广告**：MosDNS 的域名集合由三源合并（anti-AD + oisd small + AdGuard DNS，
-              去重后约 22.7 万条域名 / 4.5 MB，命中返回 0.0.0.0）；含一份"绝不拦截"保护名单
-              （qq/taobao/apple/windowsupdate 等 48 个），构建期下载、运行时不联网
-            - **DNS**：客户端 53 → 系统 dnsmasq → chinadns-ng（15355，分流）→
-              国内走 MosDNS（5335，去广告 + DoH 到阿里/腾讯）、被墙走 Xray 内置 DNS
-              （DoH `https://1.1.1.1/dns-query`，**查询经节点隧道出去**，ISP 看不到）；
-              PassWall 不抢 53（`dns_redirect=0`）；不装 luci-app-mosdns、不编 geo 数据，省约 30MB 闪存
-            - **TurboACC**（流量分载 + BBR；全锥 NAT 视 `kmod-nft-fullcone` 可用性）
+            - **sing-box 1.14.4**（服务 → sing-box，自研面板）：节点列表 / 订阅导入（v2ray、Clash、
+              sing-box·Xray JSON、纯 URI 全格式）/ 节点测活 / 模式切换 / 一键测试 都在页面里；
+              内核为构建期交叉编译的 mipsle **softfloat** 二进制（`with_quic` + `with_utls`，
+              hysteria2 / Reality 可用），编译失败自动回退 OpenWrt 官方 tiny 1.12.22；
+              nftables 透明代理（独立 `table inet singbox`，TCP 走 TPROXY，UDP 默认关闭避免 QUIC 乱序）
+            - **分流**：rule 模式 = 私有网段直连 + 国内域名直连 + 国内 CIDR（chnroute 4.3k 条）直连
+              + 构建期写入的墙外域名清单（gfw.txt 归一化后 2 万+ 条）走代理；名单随固件发布、
+              运行时不联网；没有节点时全部直连，不会断网
+            - **去广告**：MosDNS 的域名集合由多源合并（anti-AD + oisd + AdGuard DNS + 手工补充，
+              去重后约 4.5 MB，命中返回 0.0.0.0），另含一份"绝不拦截"保护名单；构建期下载、运行时不联网
+            - **DNS**：客户端 53 → 系统 dnsmasq（缓存 2000 / 最小 TTL 600s）→ MosDNS 5335。
+              国内域名 → 腾讯 DoH 加密直连；墙外域名（复用代理分流名单）→ **经 sing-box 的 socks
+              隧道去问 1.1.1.1** —— 因为国内 DoH 对墙外域名一律返回投毒 IP（实测 google→Facebook 地址），
+              这正是"google / youtube 打不开"的根因；代理没起来时这些域名解析失败，国内域名不受影响
             - **Ksmbd**（`/mnt/sda1` 共享）· **p910nd**（`/dev/usb/lp0`）
             - **USB 网卡全家桶**：RNDIS / NCM / ECM / EEM / MBIM / QMI / IPheth / WWAN，热插拔自动挂 WAN
-            - 性能调优：BBR + `fq_codel`（本内核没编 sch_fq，写 `fq` 会让整份 sysctl 一行都不生效）+ `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
-              + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ dnsmasq 缓存 2000 条（最小 TTL 600s）
-            - **必要的本地自动化**（全部不联网）：每日释放页缓存、每 10 分钟的内存看门狗 `memguard`、
-              MosDNS 存活检查、每周截断超期日志；`/var/log/memguard.log` 可查它做过什么
+            - 性能调优：BBR + `fq_codel`（本内核没编 sch_fq，写 `fq` 会让整份 sysctl 一行都不生效）
+              + `rmem/wmem 8MB` + conntrack 32K + CPU 锁 `performance` + ZRAM
+              + `tcp_mtu_probing`（代理链路 MTU 黑洞自愈）+ SQM/cake（预置关闭，按实测带宽开）
+            - **必要的本地自动化**（全部不联网）：每日释放页缓存、`memguard` 内存看门狗、
+              MosDNS 存活检查、无线 / 中继看门狗、超期日志截断；`/var/log/memguard.log` 可查
             - **不预置 geo 数据**：`geoip.dat` / `geosite.dat` 约 25MB，32MB 闪存装不下；
-              只有使用「分流节点」时才需要，用到时在 PassWall → 规则列表里按需更新
+              本固件用自维护的 CIDR + 域名清单做分流，不需要它们
 
             ### 无线
             - 2.4G：`alon` @ 信道 13 · HT20 · 20 dBm（只在没有自定义信道时生效）· 5G：`alon-5G`
